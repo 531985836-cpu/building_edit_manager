@@ -1,0 +1,15 @@
+# 排除 VS 产生的临时文件
+.vs/
+out/
+build/
+*.obj
+*.exe
+*.pdb
+*.user
+
+# 排除 Python 缓存
+__pycache__/
+*.pyc
+
+# 排除 QGIS 临时文件
+.qgis2/
