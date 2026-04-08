@@ -37,8 +37,8 @@ class PointEdit : public QgsMapTool
     void saveAllEdits();
 
     // --- 空间探测逻辑 ---
-    bool findClosestVertex( const QgsPointXY &pt, QgsFeatureId &fid, int &vertexIndex, double tolerance );
-    bool findClosestEdge( const QgsPointXY &pt, QgsFeatureId &fid, int &startVertexIndex, double tolerance );
+    bool findClosestVertex( const QgsPointXY &pt, QgsFeatureId &fid, int &vertexIndex, double tolerance, const QgsFeatureIds &targetIds );
+    bool findClosestEdge( const QgsPointXY &pt, QgsFeatureId &fid, int &startVertexIndex, double tolerance, const QgsFeatureIds &targetIds );
     QgsFeatureId pointInFeature( const QgsPointXY &pt );
 
     // --- 新建要素逻辑 (Digitize) ---
