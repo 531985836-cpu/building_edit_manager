@@ -47,6 +47,7 @@ class CreateTool : public QgsMapTool
     void setupUi();
     void updateFields( int index );
     void refreshLayerCombos();
+    void snapTwoSelectedFeatures();
 
   private:
     QgsVectorLayer *mVectorLayer = nullptr;

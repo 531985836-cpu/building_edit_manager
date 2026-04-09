@@ -22,6 +22,7 @@
 #include <qgsmessagelog.h>
 #include <cmath>
 #include <QList>
+#include <QgsGeometryUtils.h>
 
 CreateTool::CreateTool( QgsMapCanvas *canvas )
   : QgsMapTool( canvas )
@@ -237,21 +238,71 @@ void CreateTool::canvasPressEvent( QgsMapMouseEvent *e )
 {
   QgsPointXY mapPt = toMapCoordinates( e->pos() );
 
+  // --- 1. 数字化状态逻辑 ---
+  if ( mIsDigitizing )
+  {
+    if ( e->button() == Qt::LeftButton )
+    {
+      mPoints.append( mapPt );
+      mRubberBand->addPoint( mapPt );
+    }
+    else if ( e->button() == Qt::RightButton )
+    {
+      finishCurrentFeatureWithHeight();
+    }
+    return;
+  }
+
+  // --- 2. 非数字化状态逻辑 ---
   if ( e->button() == Qt::LeftButton )
   {
-    if ( !mIsDigitizing )
+    if ( !mVectorLayer )
+      return;
+
+    double searchRadius = mCanvas->mapUnitsPerPixel() * 5.0;
+    QgsRectangle searchRect( mapPt.x() - searchRadius, mapPt.y() - searchRadius, mapPt.x() + searchRadius, mapPt.y() + searchRadius );
+
+    QgsFeatureIterator it = mVectorLayer->getFeatures( QgsFeatureRequest().setFilterRect( searchRect ) );
+    QgsFeature feat;
+
+    if ( it.nextFeature( feat ) )
     {
+      // --- 情况 A: 选中了要素 ---
+      QgsFeatureIds selectedIds = mVectorLayer->selectedFeatureIds();
+      bool shiftPressed = e->modifiers() & Qt::ShiftModifier;
+
+      if ( shiftPressed )
+      {
+        if ( selectedIds.contains( feat.id() ) )
+          mVectorLayer->deselect( feat.id() );
+        else
+          mVectorLayer->select( feat.id() );
+      }
+      else
+      {
+        mVectorLayer->removeSelection();
+        mVectorLayer->select( feat.id() );
+      }
+
+      mCanvas->refresh();
+
+      // 如果选中数量等于 2，触发自动吸附和重新计算高度
+      if ( mVectorLayer->selectedFeatureCount() == 2 )
+      {
+        snapTwoSelectedFeatures();
+      }
+    }
+    else
+    {
+      // --- 情况 B: 点击空白处，恢复新建逻辑 ---
+      mVectorLayer->removeSelection();
+      mCanvas->refresh();
+
       mIsDigitizing = true;
       mRubberBand->reset( Qgis::GeometryType::Polygon );
+      mPoints.append( mapPt );
+      mRubberBand->addPoint( mapPt );
     }
-
-    mPoints.append( mapPt );
-    mRubberBand->addPoint( mapPt );
-  }
-  else if ( e->button() == Qt::RightButton )
-  {
-    // 右键完成当前面要素，并计算高度
-    finishCurrentFeatureWithHeight();
   }
 }
 
@@ -592,14 +643,28 @@ void CreateTool::keyPressEvent( QKeyEvent *e )
   if ( e->key() == Qt::Key_Escape )
   {
     cancelDigitizing();
+    if ( mVectorLayer )
+      mVectorLayer->removeSelection();
+  }
+  else if ( e->key() == Qt::Key_Delete || e->key() == Qt::Key_Backspace )
+  {
+    // 删除选中的要素
+    if ( mVectorLayer && mVectorLayer->isEditable() && mVectorLayer->selectedFeatureCount() > 0 )
+    {
+      if ( QMessageBox::question( mCanvas, "确认删除", QString( "确定要删除选中的 %1 个要素吗？" ).arg( mVectorLayer->selectedFeatureCount() ) ) == QMessageBox::Yes )
+      {
+        mVectorLayer->deleteSelectedFeatures();
+        mVectorLayer->triggerRepaint();
+      }
+    }
   }
   else if ( e->key() == Qt::Key_Return || e->key() == Qt::Key_Enter )
   {
-    // 回车提交图层编辑，不再计算高度
     if ( mVectorLayer && mVectorLayer->isEditable() )
     {
       mVectorLayer->commitChanges();
-      qDebug() << "Vector layer changes committed.";
+      mVectorLayer->startEditing(); // 提交后继续保持编辑状态
+      qDebug() << "Changes committed.";
     }
   }
 
@@ -706,4 +771,167 @@ QgsVectorLayer *CreateTool::getOrCreateDebugLayer()
   mDebugLayer = new QgsVectorLayer( uri, layerName, "memory" );
   QgsProject::instance()->addMapLayer( mDebugLayer );
   return mDebugLayer;
+}
+
+void CreateTool::snapTwoSelectedFeatures()
+{
+  if ( !mVectorLayer || !mVectorLayer->isEditable() )
+    return;
+
+  // 1. 获取选中的两个要素
+  QgsFeatureIterator it = mVectorLayer->getSelectedFeatures();
+  QList<QgsFeature> selectedFeatures;
+  QgsFeature f;
+  while ( it.nextFeature( f ) )
+    selectedFeatures.append( f );
+
+  if ( selectedFeatures.size() != 2 )
+    return;
+
+  QgsFeature featA = selectedFeatures[0];
+  QgsFeature featB = selectedFeatures[1];
+  QgsGeometry geomA = featA.geometry();
+  QgsGeometry geomB = featB.geometry();
+
+  // 2. 初始化吸附阈值
+  double threshold = 2.0;
+  if ( mUI.mergecheckBox && mUI.mergecheckBox->isChecked() )
+  {
+    double t = mUI.mergelineEdit->text().toDouble();
+    if ( t > 0 )
+      threshold = t;
+  }
+  double thresholdSq = threshold * threshold;
+
+  const QgsAbstractGeometry *absGeomA = geomA.constGet();
+  const QgsAbstractGeometry *absGeomB = geomB.constGet();
+  int vertexCountA = absGeomA->vertexCount();
+
+  // 3. 定义结构记录每个顶点的移动状态与最小匹配距离（防止重复覆盖）
+  struct SnapResult
+  {
+      bool moved = false;
+      double minDistSq = 1e18;
+      QgsPoint pos;
+  };
+  QVector<SnapResult> results( vertexCountA );
+  for ( int i = 0; i < vertexCountA; ++i )
+    results[i].pos = absGeomA->vertexAt( QgsVertexId( 0, 0, i ) );
+
+  // 4. 遍历要素 A 的每一条边
+  for ( int i = 0; i < vertexCountA - 1; ++i )
+  {
+    QgsPoint pA1 = absGeomA->vertexAt( QgsVertexId( 0, 0, i ) );
+    QgsPoint pA2 = absGeomA->vertexAt( QgsVertexId( 0, 0, i + 1 ) );
+    QgsPointXY pA1XY( pA1.x(), pA1.y() ), pA2XY( pA2.x(), pA2.y() );
+
+    // 计算 A 边方位角用于平行度过滤
+    double angleA = std::atan2( pA2.y() - pA1.y(), pA2.x() - pA1.x() );
+    QgsPolylineXY lineA;
+    lineA << pA1XY << pA2XY;
+    QgsGeometry edgeA = QgsGeometry::fromPolylineXY( lineA );
+
+    // 5. 与要素 B 的每一条边进行比对
+    for ( int j = 0; j < absGeomB->vertexCount() - 1; ++j )
+    {
+      QgsPoint pB1 = absGeomB->vertexAt( QgsVertexId( 0, 0, j ) );
+      QgsPoint pB2 = absGeomB->vertexAt( QgsVertexId( 0, 0, j + 1 ) );
+      QgsPointXY pB1XY( pB1.x(), pB1.y() ), pB2XY( pB2.x(), pB2.y() );
+
+      // 平行度过滤：非平行边不进行吸附（阈值约 20 度）
+      double angleB = std::atan2( pB2.y() - pB1.y(), pB2.x() - pB1.x() );
+      double angleDiff = std::abs( angleA - angleB );
+      while ( angleDiff > M_PI )
+        angleDiff -= M_PI;
+      if ( angleDiff > 0.35 && angleDiff < ( M_PI - 0.35 ) )
+        continue;
+
+      QgsPolylineXY lineB;
+      lineB << pB1XY << pB2XY;
+      QgsGeometry edgeB = QgsGeometry::fromPolylineXY( lineB );
+      double currentEdgeDist = edgeA.distance( edgeB );
+
+      // 6. 执行距离内的点吸附逻辑
+      if ( currentEdgeDist < threshold )
+      {
+        QgsPointXY ptsToTest[2] = { pA1XY, pA2XY };
+        int indices[2] = { i, i + 1 };
+
+        for ( int k = 0; k < 2; ++k )
+        {
+          int idx = indices[k];
+          if ( currentEdgeDist > results[idx].minDistSq )
+            continue;
+
+          QgsPointXY currentPt = ptsToTest[k];
+          double d1Sq = currentPt.sqrDist( pB1XY );
+          double d2Sq = currentPt.sqrDist( pB2XY );
+
+          if ( d1Sq < thresholdSq || d2Sq < thresholdSq )
+          {
+            // 优先点点重合
+            QgsPointXY target = ( d1Sq < d2Sq ) ? pB1XY : pB2XY;
+            results[idx].pos = QgsPoint( target.x(), target.y() );
+            results[idx].moved = true;
+            results[idx].minDistSq = currentEdgeDist;
+          }
+          else
+          {
+            // 计算投影比例 r
+            double dx = pB2XY.x() - pB1XY.x();
+            double dy = pB2XY.y() - pB1XY.y();
+            double L2 = dx * dx + dy * dy;
+            if ( L2 > 1e-7 )
+            {
+              double r = ( ( currentPt.x() - pB1XY.x() ) * dx + ( currentPt.y() - pB1XY.y() ) * dy ) / L2;
+              QgsPoint targetPos;
+              // 投影限制与回退机制
+              if ( r < -3.0 || r > 4.0 )
+                targetPos = QgsPoint( ( r < 0 ? pB1XY.x() : pB2XY.x() ), ( r < 0 ? pB1XY.y() : pB2XY.y() ) );
+              else
+                targetPos = QgsPoint( pB1XY.x() + r * dx, pB1XY.y() + r * dy );
+
+              if ( currentPt.sqrDist( QgsPointXY( targetPos.x(), targetPos.y() ) ) < thresholdSq )
+              {
+                results[idx].pos = targetPos;
+                results[idx].moved = true;
+                results[idx].minDistSq = currentEdgeDist;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 7. 组装新几何体并更新图层
+  bool changed = false;
+  for ( const auto &r : results )
+    if ( r.moved )
+    {
+      changed = true;
+      break;
+    }
+
+  if ( changed )
+  {
+    // 维持多边形首尾闭合
+    if ( results[0].moved )
+      results[vertexCountA - 1] = results[0];
+    else if ( results[vertexCountA - 1].moved )
+      results[0] = results[vertexCountA - 1];
+
+    QgsPolylineXY newRing;
+    for ( const auto &r : results )
+      newRing << QgsPointXY( r.pos.x(), r.pos.y() );
+
+    QgsPolygonXY newPolygon;
+    newPolygon << newRing;
+    QgsGeometry finalGeom = QgsGeometry::fromPolygonXY( newPolygon );
+
+    mVectorLayer->beginEditCommand( "Advanced Edge Snap" );
+    mVectorLayer->changeGeometry( featA.id(), finalGeom );
+    mVectorLayer->endEditCommand();
+    mVectorLayer->triggerRepaint();
+  }
 }
