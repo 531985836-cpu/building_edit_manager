@@ -70,6 +70,14 @@ class CreateTool : public QgsMapTool
 
     // 建议增加一个成员变量记录调试图层，避免重复查找
     QgsVectorLayer *mDebugLayer = nullptr;
+
+// --- 新增：分割功能相关的状态变量 ---
+    QgsPointXY mSplitStartPoint;                     // 存储分割线的起始点
+    QgsFeatureId mTargetFeatureId = -1;              // 存储正在被分割的目标要素ID
+    bool mIsSplitting = false;                       // 分割状态锁
+    QgsRubberBand *mSplitLineBand = nullptr;         // 用于显示分割预览的橙色虚线
+    void performSplit( const QgsPointXY &endPoint ); // 执行分割的核心逻辑
+    QgsPointXY getSnappedPoint( const QgsGeometry &geom, const QgsPointXY &mapPt, double tolerance );
 };
 
 #endif

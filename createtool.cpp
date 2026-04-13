@@ -23,12 +23,19 @@
 #include <cmath>
 #include <QList>
 #include <QgsGeometryUtils.h>
+#include <qgis.h>
 
 CreateTool::CreateTool( QgsMapCanvas *canvas )
   : QgsMapTool( canvas )
 {
   setCursor( Qt::CrossCursor );
   mRubberBand = new QgsRubberBand( canvas, Qgis::GeometryType::Polygon );
+
+  // 初始化分割预览线（橙色虚线）
+  mSplitLineBand = new QgsRubberBand( canvas, Qgis::GeometryType::Line );
+  mSplitLineBand->setLineStyle( Qt::DashLine );
+  mSplitLineBand->setColor( QColor( 255, 165, 0 ) );
+  mSplitLineBand->setWidth( 2 );
 
   mSettingsWidget = nullptr;
 }
@@ -87,7 +94,7 @@ void CreateTool::setupUi()
   // --- 3. 其他原有逻辑 ---
   connect( mUI.vectorcombo, QOverload<int>::of( &QComboBox::currentIndexChanged ), this, &CreateTool::updateFields );
 
-// 确认按钮功能：保存、验证并复现设置内容
+  // 确认按钮功能：保存、验证并复现设置内容
   connect( mUI.setting, &QPushButton::clicked, this, [this]() {
     if ( !mUI.vectorcombo )
       return;
@@ -236,9 +243,33 @@ void CreateTool::updateFields( int index )
 
 void CreateTool::canvasPressEvent( QgsMapMouseEvent *e )
 {
-  QgsPointXY mapPt = toMapCoordinates( e->pos() );
+  if ( !mCanvas || !mVectorLayer )
+    return;
 
-  // --- 1. 数字化状态逻辑 ---
+  QgsPointXY mapPt = toMapCoordinates( e->pos() );
+  double pixelTolerance = mCanvas->mapUnitsPerPixel() * 8.0;
+  QgsFeatureIds selectedIds = mVectorLayer->selectedFeatureIds();
+
+  // 1. 分割模式：第二次点击（确定终点）
+  if ( mIsSplitting )
+  {
+    if ( e->button() == Qt::LeftButton )
+    {
+      // 注意：QGIS 3.x C++ 中 getFeature 只接收一个 ID 参数
+      QgsFeature targetFeat = mVectorLayer->getFeature( mTargetFeatureId );
+      if ( targetFeat.isValid() )
+      {
+        QgsPointXY snapEnd = getSnappedPoint( targetFeat.geometry(), mapPt, pixelTolerance );
+        performSplit( snapEnd );
+      }
+    }
+    mIsSplitting = false;
+    if ( mSplitLineBand )
+      mSplitLineBand->reset( Qgis::GeometryType::Line );
+    return;
+  }
+
+  // 2. 数字化模式：新建多边形
   if ( mIsDigitizing )
   {
     if ( e->button() == Qt::LeftButton )
@@ -249,37 +280,49 @@ void CreateTool::canvasPressEvent( QgsMapMouseEvent *e )
     else if ( e->button() == Qt::RightButton )
     {
       finishCurrentFeatureWithHeight();
+      mIsDigitizing = false;
     }
     return;
   }
 
-  // --- 2. 非数字化状态逻辑 ---
+  // 3. 基础点击判定
   if ( e->button() == Qt::LeftButton )
   {
-    if ( !mVectorLayer )
-      return;
+    QgsRectangle searchRect( mapPt.x() - pixelTolerance, mapPt.y() - pixelTolerance, mapPt.x() + pixelTolerance, mapPt.y() + pixelTolerance );
 
-    // 预筛选：矩形搜索（提高效率）
-    double searchRadius = mCanvas->mapUnitsPerPixel() * 5.0;
-    QgsRectangle searchRect( mapPt.x() - searchRadius, mapPt.y() - searchRadius, mapPt.x() + searchRadius, mapPt.y() + searchRadius );
+    // --- A. 优先判定：是否点击了“已选中要素”的边缘 ---
+    if ( !selectedIds.isEmpty() )
+    {
+      QgsFeatureIterator selIt = mVectorLayer->getFeatures( QgsFeatureRequest().setFilterRect( searchRect ).setFilterFids( selectedIds ) );
+      QgsFeature selFeat;
+      while ( selIt.nextFeature( selFeat ) )
+      {
+        QgsPointXY vNear = getSnappedPoint( selFeat.geometry(), mapPt, pixelTolerance );
+        if ( vNear.distance( mapPt ) < pixelTolerance )
+        {
+          mTargetFeatureId = selFeat.id();
+          mSplitStartPoint = vNear;
+          mIsSplitting = true;
+          if ( mSplitLineBand )
+          {
+            mSplitLineBand->reset( Qgis::GeometryType::Line );
+            mSplitLineBand->addPoint( mSplitStartPoint );
+            mSplitLineBand->addPoint( mSplitStartPoint );
+          }
+          return;
+        }
+      }
+    }
 
+    // --- B. 判定：是否选择面要素 ---
     QgsFeatureIterator it = mVectorLayer->getFeatures( QgsFeatureRequest().setFilterRect( searchRect ) );
     QgsFeature feat;
-    bool foundInside = false;
-
-    // 【关键】：将当前的点击点包装成 Geometry 对象
-    QgsGeometry clickGeom = QgsGeometry::fromPointXY( mapPt );
-
+    bool foundFace = false;
     while ( it.nextFeature( feat ) )
     {
-      // 核心修改：使用 clickGeom 进行包含判定
-      // 只有点在多边形内部（不含边界/顶点）时才会触发选中
-      if ( feat.geometry().contains( clickGeom ) )
+      if ( feat.geometry().contains( QgsGeometry::fromPointXY( mapPt ) ) )
       {
-        foundInside = true;
-        QgsFeatureIds selectedIds = mVectorLayer->selectedFeatureIds();
         bool shiftPressed = e->modifiers() & Qt::ShiftModifier;
-
         if ( shiftPressed )
         {
           if ( selectedIds.contains( feat.id() ) )
@@ -292,38 +335,47 @@ void CreateTool::canvasPressEvent( QgsMapMouseEvent *e )
           mVectorLayer->removeSelection();
           mVectorLayer->select( feat.id() );
         }
+        foundFace = true;
         break;
       }
     }
 
-    if ( foundInside )
+    // --- C. 判定：点击空白 ---
+    if ( !foundFace )
     {
-      mCanvas->refresh();
-      if ( mVectorLayer->selectedFeatureCount() == 2 )
+      if ( !selectedIds.isEmpty() )
       {
-        snapTwoSelectedFeatures();
+        mVectorLayer->removeSelection();
+      }
+      else
+      {
+        mIsDigitizing = true;
+        mPoints.clear();
+        mPoints.append( mapPt );
+        mRubberBand->reset( Qgis::GeometryType::Polygon );
+        mRubberBand->addPoint( mapPt );
       }
     }
-    else
-    {
-      // 情况 B: 点击空白处或边缘，重置状态并开启新建逻辑
-      mVectorLayer->removeSelection();
-      mCanvas->refresh();
-
-      mIsDigitizing = true;
-      mRubberBand->reset( Qgis::GeometryType::Polygon );
-      mPoints.append( mapPt );
-      mRubberBand->addPoint( mapPt );
-    }
+    mCanvas->refresh();
   }
 }
 
 void CreateTool::canvasMoveEvent( QgsMapMouseEvent *e )
 {
+  QgsPointXY mapPt = toMapCoordinates( e->pos() );
+
+  // 处理分割辅助线预览
+  if ( mIsSplitting && mSplitLineBand )
+  {
+    if ( mSplitLineBand->numberOfVertices() > 1 )
+      mSplitLineBand->removeLastPoint();
+    mSplitLineBand->addPoint( mapPt );
+    return;
+  }
+
+  // 处理原有数字化预览
   if ( !mIsDigitizing || mPoints.isEmpty() )
     return;
-
-  QgsPointXY mapPt = toMapCoordinates( e->pos() );
 
   if ( mRubberBand->numberOfVertices() > mPoints.size() )
     mRubberBand->removeLastPoint();
@@ -712,15 +764,14 @@ void CreateTool::keyPressEvent( QKeyEvent *e )
 
 // 清空当前正在绘制的顶点
 void CreateTool::cancelDigitizing( bool clearFinished )
-
 {
   mIsDigitizing = false;
+  mIsSplitting = false;
   mPoints.clear();
-
   if ( mRubberBand )
     mRubberBand->reset( Qgis::GeometryType::Polygon );
-
-  Q_UNUSED( clearFinished );
+  if ( mSplitLineBand )
+    mSplitLineBand->reset( Qgis::GeometryType::Line );
 }
 
 void CreateTool::clearDebugMarkers()
@@ -737,6 +788,9 @@ void CreateTool::clearDebugMarkers()
 // 在 deactivate() 和 cancelDigitizing() 中也调用一下
 void CreateTool::deactivate()
 {
+  if ( mSplitLineBand )
+    mSplitLineBand->reset( Qgis::GeometryType::Line );
+  mIsSplitting = false;
   clearDebugMarkers();
   cancelDigitizing();
   QgsMapTool::deactivate();
@@ -986,4 +1040,98 @@ void CreateTool::snapTwoSelectedFeatures()
     mVectorLayer->endEditCommand();
     mVectorLayer->triggerRepaint();
   }
+}
+
+void CreateTool::performSplit( const QgsPointXY &snapEnd )
+{
+  if ( !mVectorLayer || mTargetFeatureId == -1 )
+    return;
+
+  // 修正：C++ 中 getFeature 只有一个参数
+  QgsFeature targetFeat = mVectorLayer->getFeature( mTargetFeatureId );
+  if ( !targetFeat.isValid() )
+    return;
+
+  QgsGeometry targetGeom = targetFeat.geometry();
+
+  // 延伸逻辑：确保物理贯穿
+  double dx = snapEnd.x() - mSplitStartPoint.x();
+  double dy = snapEnd.y() - mSplitStartPoint.y();
+  double len = std::sqrt( dx * dx + dy * dy );
+  if ( len < 1e-6 )
+    return;
+
+  double offset = 0.001;
+  QgsPointXY p1( mSplitStartPoint.x() - ( dx / len ) * offset, mSplitStartPoint.y() - ( dy / len ) * offset );
+  QgsPointXY p2( snapEnd.x() + ( dx / len ) * offset, snapEnd.y() + ( dy / len ) * offset );
+
+  QVector<QgsPointXY> splitLine;
+  splitLine << p1 << p2;
+
+  QVector<QgsGeometry> newGeometries;
+  QVector<QgsPointXY> topoPoints;
+
+  // 修正：显式判定枚举返回值 Qgis::GeometryOperationResult
+  Qgis::GeometryOperationResult result = targetGeom.splitGeometry( splitLine, newGeometries, false, topoPoints );
+
+  if ( result == Qgis::GeometryOperationResult::Success )
+  {
+    mVectorLayer->beginEditCommand( QString( "分割要素 %1" ).arg( mTargetFeatureId ) );
+
+    // 更新原几何
+    mVectorLayer->changeGeometry( targetFeat.id(), targetGeom );
+
+    int fieldIdx = mVectorLayer->fields().indexOf( mTargetFieldName );
+    bool doHeight = mUI.heightcheckBox && mUI.heightcheckBox->isChecked() && mPCLayer && fieldIdx != -1;
+
+    if ( doHeight )
+    {
+      mVectorLayer->changeAttributeValue( targetFeat.id(), fieldIdx, calculateZFromPointCloud( targetGeom ) );
+    }
+
+    // 添加新切出的部分
+    for ( const QgsGeometry &part : newGeometries )
+    {
+      QgsFeature newFeat( targetFeat );
+      newFeat.setGeometry( part );
+      if ( doHeight )
+        newFeat.setAttribute( fieldIdx, calculateZFromPointCloud( part ) );
+      mVectorLayer->addFeature( newFeat );
+    }
+
+    mVectorLayer->endEditCommand();
+    mVectorLayer->triggerRepaint();
+  }
+  else
+  {
+    QMessageBox::warning( mCanvas, "分割失败", "请确保分割线完全贯穿要素。" );
+  }
+}
+
+QgsPointXY CreateTool::getSnappedPoint( const QgsGeometry &geom, const QgsPointXY &mapPt, double tolerance )
+{
+  if ( geom.isEmpty() )
+    return mapPt;
+
+  int vIdx, pIdx, rIdx;
+  double d2;
+
+  // 1. 获取最近的顶点
+  QgsPointXY snapPoint = geom.closestVertex( mapPt, vIdx, pIdx, rIdx, d2 );
+
+  // 2. 如果点击位置离顶点稍远，尝试吸附到边上的投影点
+  if ( std::sqrt( d2 ) > tolerance / 2.0 )
+  {
+    QgsPoint segmentPoint;
+    QgsVertexId vId;
+    // closestSegment 计算点到线段的最近投影点，返回的是实际的投影坐标
+    double distEdge = geom.constGet()->closestSegment( QgsPoint( mapPt ), segmentPoint, vId );
+
+    if ( distEdge < tolerance )
+    {
+      return QgsPointXY( segmentPoint.x(), segmentPoint.y() );
+    }
+  }
+
+  return snapPoint;
 }
