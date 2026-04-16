@@ -21,7 +21,7 @@ BuildingEditManager::BuildingEditManager( QgisInterface *iface )
   : QgisPlugin( sName, sDescription, sCategory, sPluginVersion, sPluginType )
   , mIface( iface )
 {
-  QString projPath = "D:/conda/envs/qgis/Library/share/proj"; // 你的 proj.db 所在目录
+  QString projPath = "D:/conda/envs/qgis/Library/share/proj";
   qputenv( "PROJ_LIB", projPath.toUtf8() );
 }
 
@@ -85,7 +85,7 @@ void BuildingEditManager::initGui()
   // =========================================================
   // 【新增】：新建/加点工具 (CreateTool)
   // =========================================================
-  mCreateToolAction = new QAction( tr( "新建/加点" ), this ); // 这里也可以换成 QIcon
+  mCreateToolAction = new QAction( tr( "新建/加点" ), this ); 
   mCreateToolAction->setCheckable( true );
   mMenu->addAction( mCreateToolAction );
 
@@ -128,6 +128,8 @@ void BuildingEditManager::activateHeightEdit( bool checked )
       mThreeDViewAction->setChecked( false );
     if ( mPointEditAction && mPointEditAction->isChecked() )
       mPointEditAction->setChecked( false );
+    if ( mCreateToolAction && mCreateToolAction->isChecked() )
+      mCreateToolAction->setChecked( false );
 
     if ( !mHeightEditTool )
       mHeightEditTool = new HeightEditTool( mIface->mapCanvas() );
@@ -158,6 +160,9 @@ void BuildingEditManager::activateThreeDView( bool checked )
       mHeightEditAction->setChecked( false );
     if ( mPointEditAction && mPointEditAction->isChecked() )
       mPointEditAction->setChecked( false );
+    if ( mCreateToolAction && mCreateToolAction->isChecked() )
+      mCreateToolAction->setChecked( false );
+
     if ( !mThreeDViewTool )
       mThreeDViewTool = new ThreeDViewTool( mIface->mapCanvas() );
 
@@ -187,6 +192,8 @@ void BuildingEditManager::activatePointEdit( bool checked )
       mHeightEditAction->setChecked( false );
     if ( mThreeDViewAction && mThreeDViewAction->isChecked() )
       mThreeDViewAction->setChecked( false );
+    if ( mCreateToolAction && mCreateToolAction->isChecked() )
+      mCreateToolAction->setChecked( false );
 
     if ( !mPointEditTool )
       mPointEditTool = new PointEdit( mIface->mapCanvas() );
@@ -215,7 +222,6 @@ void BuildingEditManager::activateCreateTool( bool checked )
 
   if ( checked )
   {
-    // 1. 与其他工具互斥：把所有别的工具按钮都弹起来
     if ( mHeightEditAction && mHeightEditAction->isChecked() )
       mHeightEditAction->setChecked( false );
     if ( mThreeDViewAction && mThreeDViewAction->isChecked() )
