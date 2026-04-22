@@ -9,8 +9,13 @@
 #include <QKeyEvent>
 
 // 基础几何
+<<<<<<< HEAD
 #include <qgspolygon.h>    // 解决“QgsPolygon 不完整类型”
 #include <qgslinestring.h> // 解决“QgsLineString 不完整类型”
+=======
+#include <qgspolygon.h>      // 解决“QgsPolygon 不完整类型”
+#include <qgslinestring.h>   // 解决“QgsLineString 不完整类型”
+>>>>>>> f644786332709f1cc37fdca583a1742748c8ba08
 #include <qgspoint.h>
 #include <qgsfeature.h>
 
@@ -121,7 +126,11 @@ void ThreeDViewTool::selectAtPoint( const QgsPointXY &point )
   }
   if ( hit != -1 )
     mActiveLayer->selectByIds( { hit } );
+<<<<<<< HEAD
   QTimer::singleShot( 0, canvas(), [this]() { canvas()->refresh(); } );
+=======
+  canvas()->refresh();
+>>>>>>> f644786332709f1cc37fdca583a1742748c8ba08
 }
 
 void ThreeDViewTool::selectByRectangle( const QgsRectangle &rect )
@@ -167,6 +176,7 @@ void ThreeDViewTool::showFieldSelectUI()
 
 void ThreeDViewTool::confirmSelection()
 {
+<<<<<<< HEAD
   if ( !mActiveLayer || !mWidget || !mIface )
     return;
 
@@ -258,6 +268,63 @@ void ThreeDViewTool::refreshMemoryData()
   mTempLayer->addFeatures( allTriangles );
   mTempLayer->commitChanges();
   mTempLayer->triggerRepaint();
+=======
+  if ( !mActiveLayer || !mWidget )
+    return;
+
+  QString selectedField = mUI.comboBox->currentText();
+  mWidget->hide();
+
+  // 1. 初始化变换矩阵 (参考代码中用于处理位置平移和旋转的 QMatrix4x4)
+  QMatrix4x4 mat;
+  mat.setToIdentity();
+
+  QgsFeatureList allTriangles;
+  QgsFeatureIterator it = mActiveLayer->getSelectedFeatures();
+  QgsFeature f;
+
+  while ( it.nextFeature( f ) )
+  {
+    // 获取用户在 UI 中选择的高度属性值
+    double h = f.attribute( selectedField ).toDouble();
+    if ( h <= 0 )
+      h = 10.0;
+
+    // 这里应当根据你的业务逻辑获取 MeshData
+    // 假设你有一个方法能根据拉伸逻辑生成 mesh (类似原代码中的 BuildMesh::build)
+    MeshData mesh;
+    // ... (此处为生成 mesh 的逻辑，如填充 mesh.vertices 和 mesh.indices)
+
+    // 调用刚才定义的构建函数
+    allTriangles.append( buildBuildingFromMesh( mesh, mat ) );
+  }
+
+  // 2. 创建内存图层并加载数据
+  QString uri = QString( "PolygonZ?crs=%1" ).arg( mActiveLayer->crs().authid() );
+  QgsVectorLayer *memLayer = new QgsVectorLayer( uri, tr( "3D_Building_Layer" ), "memory" );
+  memLayer->dataProvider()->addFeatures( allTriangles );
+
+  // 3. 核心 3D 渲染器设置 (完全复用参考代码中的渲染参数)
+  QgsPolygon3DSymbol *symbol = new QgsPolygon3DSymbol();
+  symbol->setAltitudeClamping( Qgis::AltitudeClamping::Absolute ); // 绝对高度
+  symbol->setAltitudeBinding( Qgis::AltitudeBinding::Vertex );     // 顶点绑定
+  symbol->setCullingMode( Qgs3DTypes::NoCulling );                 // 禁用剔除，保证内外可见
+
+// 1. 使用指针方式创建材质设置
+  QgsPhongMaterialSettings *matSettings = new QgsPhongMaterialSettings();
+  matSettings->setDiffuse( Qt::cyan );
+  matSettings->setAmbient( Qt::darkCyan ); // 建议增加环境光效果更好
+
+  // 2. 传入指针，QGIS 会接管该指针的生命周期（自动管理内存）
+  symbol->setMaterialSettings( matSettings );
+
+  QgsVectorLayer3DRenderer *renderer = new QgsVectorLayer3DRenderer();
+  renderer->setSymbol( symbol );
+  memLayer->setRenderer3D( renderer );
+
+  // 4. 添加到项目
+  QgsProject::instance()->addMapLayer( memLayer );
+>>>>>>> f644786332709f1cc37fdca583a1742748c8ba08
 }
 
 void ThreeDViewTool::cancelSelection()
@@ -320,6 +387,7 @@ void ThreeDViewTool::deactivate()
   QgsMapTool::deactivate();
 }
 
+<<<<<<< HEAD
 // ====================  ====================
 static double cross2D( const QgsPointXY &a, const QgsPointXY &b, const QgsPointXY &c )
 {
@@ -573,6 +641,41 @@ MeshData BuildMesh::build( const QgsGeometry &geom, double height )
 
   qDebug() << "[VS Debug] --- 构建结束 ---";
   return mesh;
+=======
+
+// ==================== 核心 ====================
+QgsFeatureList ThreeDViewTool::buildBuildingFromMesh( const MeshData &mesh, const QMatrix4x4 &mat )
+{
+  QgsFeatureList features;
+  if ( mesh.isEmpty() )
+    return features;
+
+  // 每一个三角形面作为一个 Feature
+  int triCount = mesh.indices.size() / 3;
+  for ( int i = 0; i < triCount; i++ )
+  {
+    // 1. 获取三角形的三个顶点索引，并应用位姿变换矩阵 (参考代码中的 mat.map 逻辑)
+    QVector3D v0 = mat.map( mesh.vertices[mesh.indices[i * 3]] );
+    QVector3D v1 = mat.map( mesh.vertices[mesh.indices[i * 3 + 1]] );
+    QVector3D v2 = mat.map( mesh.vertices[mesh.indices[i * 3 + 2]] );
+
+    // 2. 构建 QgsPolygon (使用 std::unique_ptr 确保内存安全，适配 QGIS 3)
+    std::unique_ptr<QgsPolygon> poly( new QgsPolygon() );
+    std::unique_ptr<QgsLineString> ring( new QgsLineString() );
+
+    // 3. 设置三角形的点（必须首尾相接闭合，共4个点）
+    ring->setPoints( QgsPointSequence() << QgsPoint( v0.x(), v0.y(), v0.z() ) << QgsPoint( v1.x(), v1.y(), v1.z() ) << QgsPoint( v2.x(), v2.y(), v2.z() ) << QgsPoint( v0.x(), v0.y(), v0.z() ) );
+
+    poly->setExteriorRing( ring.release() );
+
+    // 4. 封装为要素并添加到列表
+    QgsFeature feat;
+    feat.setGeometry( QgsGeometry( std::move( poly ) ) );
+    features.append( feat );
+  }
+
+  return features;
+>>>>>>> f644786332709f1cc37fdca583a1742748c8ba08
 }
 
 void ThreeDViewTool::updateFeature3D( const QgsFeature &originFeat )

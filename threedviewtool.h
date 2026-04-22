@@ -37,6 +37,16 @@ class BuildMesh
     static MeshData build( const QgsGeometry &geom, double height );
 };
 
+/**
+ * @brief 按照参考代码逻辑定义的网格数据结构
+ */
+struct MeshData
+{
+    QVector<QVector3D> vertices;
+    QVector<int> indices;
+    bool isEmpty() const { return vertices.isEmpty() || indices.isEmpty(); }
+};
+
 class ThreeDViewTool : public QgsMapTool
 {
     Q_OBJECT
@@ -69,6 +79,7 @@ class ThreeDViewTool : public QgsMapTool
     void confirmSelection(); // 对应保存操作
     void cancelSelection();  // 对应退出操作
 
+<<<<<<< HEAD
     void updateFeature3D( const QgsFeature &originFeat );
     void refreshMemoryData();
 
@@ -79,6 +90,9 @@ class ThreeDViewTool : public QgsMapTool
   private slots:
     void onFeatureUpdated( QgsFeatureId fid );           // 监听几何/属性修改
     void onFeaturesDeleted( const QgsFeatureIds &fids ); // 监听删除
+=======
+    QgsFeatureList buildBuildingFromMesh( const MeshData &mesh, const QMatrix4x4 &mat );
+>>>>>>> f644786332709f1cc37fdca583a1742748c8ba08
 
   private:
     // 核心数据
@@ -94,6 +108,9 @@ class ThreeDViewTool : public QgsMapTool
     // UI 成员
     QWidget *mWidget = nullptr;
     Ui::threedview mUI;
+<<<<<<< HEAD
 
     QgisInterface *mIface = nullptr;
+=======
+>>>>>>> f644786332709f1cc37fdca583a1742748c8ba08
 };

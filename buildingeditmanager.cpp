@@ -85,7 +85,11 @@ void BuildingEditManager::initGui()
   // =========================================================
   // 【新增】：新建/加点工具 (CreateTool)
   // =========================================================
+<<<<<<< HEAD
   mCreateToolAction = new QAction( tr( "新建/加点" ), this );
+=======
+  mCreateToolAction = new QAction( tr( "新建/加点" ), this ); 
+>>>>>>> f644786332709f1cc37fdca583a1742748c8ba08
   mCreateToolAction->setCheckable( true );
   mMenu->addAction( mCreateToolAction );
 
