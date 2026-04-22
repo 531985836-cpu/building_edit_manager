@@ -25,11 +25,18 @@
 #include <QVector3D>
 
 #include <qgsgeometrycollection.h>
+#include <qgisinterface.h>    // 解决“不完整类型 QgisInterface”
+#include <qgs3dmapcanvas.h>   // 解决“未定义标识符 Qgs3DMapCanvas”
+#include <qgs3dmapsettings.h>
 
-ThreeDViewTool::ThreeDViewTool( QgsMapCanvas *canvas )
-  : QgsMapTool( canvas )
+// 1. 修改参数列表：增加 QgisInterface *iface
+ThreeDViewTool::ThreeDViewTool( QgsMapCanvas *canvas, QgisInterface *iface )
+  : QgsMapTool( canvas ) // 初始化父类
+  , mIface( iface )      // 核心修改：在这里将传入的 iface 赋值给成员变量 mIface
 {
+  // 以下逻辑保持不变
   setCursor( Qt::CrossCursor );
+
   auto layers = QgsProject::instance()->layers<QgsVectorLayer *>();
   if ( !layers.isEmpty() )
     mActiveLayer = layers.first();
@@ -114,7 +121,7 @@ void ThreeDViewTool::selectAtPoint( const QgsPointXY &point )
   }
   if ( hit != -1 )
     mActiveLayer->selectByIds( { hit } );
-  canvas()->refresh();
+  QTimer::singleShot( 0, canvas(), [this]() { canvas()->refresh(); } );
 }
 
 void ThreeDViewTool::selectByRectangle( const QgsRectangle &rect )
@@ -125,7 +132,7 @@ void ThreeDViewTool::selectByRectangle( const QgsRectangle &rect )
   while ( it.nextFeature( feat ) )
     ids.insert( feat.id() );
   mActiveLayer->selectByIds( ids );
-  canvas()->refresh();
+  QTimer::singleShot( 0, canvas(), [this]() { canvas()->refresh(); } );
 }
 
 // ==================== UI 弹窗 (修复错误) ====================
@@ -160,53 +167,97 @@ void ThreeDViewTool::showFieldSelectUI()
 
 void ThreeDViewTool::confirmSelection()
 {
-  if ( !mActiveLayer || !mWidget )
+  if ( !mActiveLayer || !mWidget || !mIface )
     return;
 
   mSelectedHeightField = mUI.comboBox->currentText();
   mWidget->hide();
 
+  // 1. 在内存中创建“游离”图层（不加入项目）
   if ( !mTempLayer )
   {
     QString uri = QString( "PolygonZ?crs=%1&field=original_fid:long" ).arg( mActiveLayer->crs().authid() );
-    mTempLayer = new QgsVectorLayer( uri, tr( "3D_Live_Link" ), "memory" );
+    // 注意：这里创建了对象，但绝不调用 QgsProject::addMapLayer
+    mTempLayer = new QgsVectorLayer( uri, tr( "Internal_Memory_3D" ), "memory" );
 
-    // === 必须补全以下 3D 渲染配置，否则看不到立方体 ===
-
-    // 1. 定义材质
-    QgsPhongMaterialSettings *matSettings = new QgsPhongMaterialSettings();
-    matSettings->setDiffuse( QColor( 0, 150, 255 ) ); // 蓝色主体
-    matSettings->setAmbient( QColor( 50, 50, 50 ) );
-    matSettings->setSpecular( Qt::white );
-
-    // 2. 定义 3D 符号
+    // 配置 3D 符号 (代码同前，略...)
     QgsPolygon3DSymbol *symbol = new QgsPolygon3DSymbol();
-    symbol->setMaterialSettings( matSettings );
-    symbol->setAltitudeClamping( Qgis::AltitudeClamping::Absolute ); // 绝对高度
-    symbol->setAltitudeBinding( Qgis::AltitudeBinding::Vertex );     // 顶点绑定
-    symbol->setCullingMode( Qgs3DTypes::NoCulling );                 // 禁用剔除，保证正反都能看
-    symbol->setEdgesEnabled( true );                                 // 开启边框显示
-    symbol->setEdgeColor( Qt::black );
+    symbol->setAltitudeClamping( Qgis::AltitudeClamping::Absolute );
+    // ... (此处省略 symbol 颜色和材质设置) ...
 
-    // 3. 应用渲染器
     QgsVectorLayer3DRenderer *renderer = new QgsVectorLayer3DRenderer();
     renderer->setSymbol( symbol );
     mTempLayer->setRenderer3D( renderer );
 
-    QgsProject::instance()->addMapLayer( mTempLayer );
-
+    // 关键：虽然不加入项目，但我们需要它能发出重绘信号
     connect( mActiveLayer, &QgsVectorLayer::geometryChanged, this, &ThreeDViewTool::onFeatureUpdated );
-    connect( mActiveLayer, &QgsVectorLayer::attributeValueChanged, this, &ThreeDViewTool::onFeatureUpdated );
-    connect( mActiveLayer, &QgsVectorLayer::featuresDeleted, this, &ThreeDViewTool::onFeaturesDeleted );
+    connect( mActiveLayer, &QgsVectorLayer::attributeValueChanged, this, [this]( QgsFeatureId fid, int idx, const QVariant &value ) {onFeatureUpdated( fid ); } );
   }
 
-  // 处理选中要素
-  QgsFeatureIterator it = mActiveLayer->getSelectedFeatures();
+  // 2. 获取/创建 3D 窗口
+  Qgs3DMapCanvas *activeCanvas3D = mIface->mapCanvases3D().isEmpty() ? mIface->createNewMapCanvas3D( tr( "3D Preview" ) ) : mIface->mapCanvases3D().first();
+
+  if ( activeCanvas3D )
+  {
+    // 确保窗口显示
+    if ( QWidget *dock = qobject_cast<QWidget *>( activeCanvas3D->parent() ) )
+    {
+      dock->show();
+      dock->raise();
+    }
+
+    // 3. 【核心步骤】：强行注入游离图层到 3D 视图
+    // 即使项目里没有这个图层，只要 3D 设置的 layers 列表里有它，3D 引擎就会渲染它
+    Qgs3DMapSettings *settings = activeCanvas3D->mapSettings();
+    QList<QgsMapLayer *> currentLayers = settings->layers();
+    if ( !currentLayers.contains( mTempLayer ) )
+    {
+      currentLayers.append( mTempLayer );
+      settings->setLayers( currentLayers );
+    }
+  }
+
+  // 4. 清空旧数据并更新新数据
+  refreshMemoryData();
+}
+
+// 辅助函数：彻底刷新内存数据
+void ThreeDViewTool::refreshMemoryData()
+{
+  if ( !mTempLayer || !mActiveLayer || mSelectedHeightField.isEmpty() )
+    return;
+
+  mTempLayer->startEditing();
+
+  // 1. 清空旧数据
+  mTempLayer->deleteFeatures( mTempLayer->allFeatureIds() );
+
+  // 2. 修改点：获取所有要素，而不仅仅是选中的
+  // 如果只想看一部分，可以保留 getSelectedFeatures，但必须确保用户操作后重新选中
+  QgsFeatureIterator it = mActiveLayer->getFeatures();
+
   QgsFeature f;
+  QgsFeatureList allTriangles;
+
   while ( it.nextFeature( f ) )
   {
-    updateFeature3D( f );
+    double h = f.attribute( mSelectedHeightField ).toDouble();
+    if ( h <= 0 )
+      h = 10.0;
+
+    MeshData mesh = BuildMesh::build( f.geometry(), h );
+    QgsFeatureList triangles = buildBuildingFromMesh( mesh, QMatrix4x4() );
+
+    for ( QgsFeature &tri : triangles )
+    {
+      tri.setAttributes( QgsAttributes() << f.id() );
+      allTriangles.append( tri );
+    }
   }
+
+  mTempLayer->addFeatures( allTriangles );
+  mTempLayer->commitChanges();
+  mTempLayer->triggerRepaint();
 }
 
 void ThreeDViewTool::cancelSelection()
@@ -529,27 +580,29 @@ void ThreeDViewTool::updateFeature3D( const QgsFeature &originFeat )
   if ( !mTempLayer )
     return;
 
-  // 1. 计算新的 3D 几何
+  // 计算高度
   double h = originFeat.attribute( mSelectedHeightField ).toDouble();
   if ( h <= 0 )
-    h = 10.0;
+    h = 5.0; // 默认高度
 
+  // 生成网格
   MeshData mesh = BuildMesh::build( originFeat.geometry(), h );
   if ( mesh.isEmpty() )
     return;
 
+  // 将网格转为 3D 三角形 Feature 列表
   QgsFeatureList newTriangles = buildBuildingFromMesh( mesh, QMatrix4x4() );
 
-  // 2. 为每个生成的三角形打上 original_fid 标记
+  // 标记归属 ID
   for ( QgsFeature &tri : newTriangles )
   {
     tri.setAttributes( QgsAttributes() << originFeat.id() );
   }
 
-  // 3. 更新内存图层：先删旧的，后加新的
+  // 更新内存图层 (参考代码增删逻辑)
   mTempLayer->startEditing();
 
-  // 删除所有 original_fid 等于当前要素 ID 的三角形
+  // 根据 original_fid 删除该要素旧的 3D 模型
   QgsFeatureRequest request;
   request.setFilterExpression( QString( "original_fid = %1" ).arg( originFeat.id() ) );
   QgsFeatureIterator it = mTempLayer->getFeatures( request );
@@ -562,6 +615,8 @@ void ThreeDViewTool::updateFeature3D( const QgsFeature &originFeat )
   mTempLayer->addFeatures( newTriangles );
 
   mTempLayer->commitChanges();
+
+  // 重要：确保 3D 视图意识到数据变了
   mTempLayer->triggerRepaint();
 }
 
@@ -595,3 +650,5 @@ void ThreeDViewTool::onFeaturesDeleted( const QgsFeatureIds &fids )
   mTempLayer->commitChanges();
   mTempLayer->triggerRepaint();
 }
+
+

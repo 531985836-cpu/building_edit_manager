@@ -163,7 +163,7 @@ void BuildingEditManager::activateThreeDView( bool checked )
       mCreateToolAction->setChecked( false );
 
     if ( !mThreeDViewTool )
-      mThreeDViewTool = new ThreeDViewTool( mIface->mapCanvas() );
+      mThreeDViewTool = new ThreeDViewTool( mIface->mapCanvas(), mIface );
 
     mIface->mapCanvas()->setMapTool( mThreeDViewTool );
   }

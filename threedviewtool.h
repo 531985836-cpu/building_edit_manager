@@ -16,6 +16,7 @@
 class QgsVectorLayer;
 class QgsMapCanvas;
 class QgsMapMouseEvent;
+class QgisInterface;
 
 /**
  * @brief 按照参考代码逻辑定义的网格数据结构
@@ -41,7 +42,7 @@ class ThreeDViewTool : public QgsMapTool
     Q_OBJECT
 
   public:
-    explicit ThreeDViewTool( QgsMapCanvas *canvas );
+    explicit ThreeDViewTool( QgsMapCanvas *canvas, QgisInterface *iface );
     ~ThreeDViewTool() override;
 
     // 地图画布事件
@@ -69,6 +70,7 @@ class ThreeDViewTool : public QgsMapTool
     void cancelSelection();  // 对应退出操作
 
     void updateFeature3D( const QgsFeature &originFeat );
+    void refreshMemoryData();
 
     QgsVectorLayer *mTempLayer = nullptr; // 持久化存储 3D 内存图层
     QString mSelectedHeightField;         // 记录用户选择的高度字段
@@ -92,4 +94,6 @@ class ThreeDViewTool : public QgsMapTool
     // UI 成员
     QWidget *mWidget = nullptr;
     Ui::threedview mUI;
+
+    QgisInterface *mIface = nullptr;
 };
