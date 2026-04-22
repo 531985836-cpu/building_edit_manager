@@ -26,58 +26,60 @@ class CreateTool : public QgsMapTool
     explicit CreateTool( QgsMapCanvas *canvas );
     ~CreateTool() override;
 
+    // --- 地图工具核心生命周期 ---
     void activate() override;
-
-  protected:
+    void deactivate() override;
     void canvasPressEvent( QgsMapMouseEvent *e ) override;
     void canvasMoveEvent( QgsMapMouseEvent *e ) override;
     void keyPressEvent( QKeyEvent *e ) override;
-    void deactivate() override;
 
   private:
-    // 核心：手动递归收集节点 ID，使用 QGIS 3.44 原始 API
-    void collectNodes( const QgsPointCloudIndex &index, const QgsPointCloudNodeId &nodeId, const QgsRectangle &extent, QList<QgsPointCloudNodeId> &nodes );
-
-    double calculateZFromPointCloud( const QgsGeometry &geom );
+    // --- 要素数字化与几何编辑逻辑 ---
     void finishCurrentFeatureWithHeight();
     void cancelDigitizing( bool clearFinished = true );
-    void initLayer();
-    void updateWidgetInteractivity( bool heightEnabled, bool mergeEnabled );
+    void snapTwoSelectedFeatures();
 
+    // --- 点云处理与高度计算核心 ---
+    void collectNodes( const QgsPointCloudIndex &index, const QgsPointCloudNodeId &nodeId, const QgsRectangle &extent, QList<QgsPointCloudNodeId> &nodes );
+    double calculateZFromPointCloud( const QgsGeometry &geom );
+    QVector3D computeNormal( double xx, double xy, double xz, double yy, double yz, double zz );
+
+    // --- 分割功能逻辑 ---
+    void performSplit( const QgsPointXY &endPoint );
+    QgsPointXY getSnappedPoint( const QgsGeometry &geom, const QgsPointXY &mapPt, double tolerance );
+
+    // --- UI 管理与界面交互 ---
     void setupUi();
     void updateFields( int index );
     void refreshLayerCombos();
-    void snapTwoSelectedFeatures();
+    void updateWidgetInteractivity( bool heightEnabled, bool mergeEnabled );
+
+    // --- 调试辅助与 3D 渲染 ---
+    QgsVectorLayer *getOrCreateDebugLayer();
+    void clearDebugMarkers();
 
   private:
+    // --- 核心组件与数字化状态 ---
     QgsVectorLayer *mVectorLayer = nullptr;
     QgsPointCloudLayer *mPCLayer = nullptr;
     QgsRubberBand *mRubberBand = nullptr;
     QList<QgsPointXY> mPoints;
     bool mIsDigitizing = false;
 
+    // --- 分割功能状态变量 ---
+    QgsPointXY mSplitStartPoint;
+    QgsFeatureId mTargetFeatureId = -1;
+    bool mIsSplitting = false;
+    QgsRubberBand *mSplitLineBand = nullptr;
+
+    // --- UI 插件窗体与属性字段 ---
     Ui::Form mUI;
     QWidget *mSettingsWidget = nullptr;
     QString mTargetFieldName;
-    QVector3D computeNormal( double xx, double xy, double xz, double yy, double yz, double zz );
 
-    QList<QgsRubberBand *> mDebugMarkers;
-    void clearDebugMarkers();
-
-    // --- 新增：用于 3D 显示的辅助函数 ---
-    QgsVectorLayer *getOrCreateDebugLayer();
-    void setup3DRendering( QgsVectorLayer *layer );
-
-    // 建议增加一个成员变量记录调试图层，避免重复查找
+    // --- 调试相关对象 ---
     QgsVectorLayer *mDebugLayer = nullptr;
-
-// --- 新增：分割功能相关的状态变量 ---
-    QgsPointXY mSplitStartPoint;                     // 存储分割线的起始点
-    QgsFeatureId mTargetFeatureId = -1;              // 存储正在被分割的目标要素ID
-    bool mIsSplitting = false;                       // 分割状态锁
-    QgsRubberBand *mSplitLineBand = nullptr;         // 用于显示分割预览的橙色虚线
-    void performSplit( const QgsPointXY &endPoint ); // 执行分割的核心逻辑
-    QgsPointXY getSnappedPoint( const QgsGeometry &geom, const QgsPointXY &mapPt, double tolerance );
+    QList<QgsRubberBand *> mDebugMarkers;
 };
 
 #endif

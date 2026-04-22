@@ -73,6 +73,7 @@ include_directories(
 target_link_libraries(buildingeditmanager
     qgis_core
     qgis_gui
+    qgis_3d 
     Qt5::Core
     Qt5::Gui
     Qt5::Widgets

@@ -25,6 +25,8 @@
 #include <QgsGeometryUtils.h>
 #include <qgis.h>
 
+// ==================== 构造 / 析构 ====================
+
 CreateTool::CreateTool( QgsMapCanvas *canvas )
   : QgsMapTool( canvas )
 {
@@ -44,20 +46,17 @@ CreateTool::~CreateTool()
 {
 }
 
+// ==================== 激活 / 停用 ====================
+
 void CreateTool::activate()
 {
   QgsMapTool::activate();
 
-  // 1. 完全模仿例子逻辑：如果窗口没创建，则进行初始化
   if ( !mSettingsWidget )
-  {
     setupUi();
-  }
 
-  // 2. 勾选工具时刷新图层列表
   refreshLayerCombos();
 
-  // 3. 弹出窗口
   if ( mSettingsWidget )
   {
     mSettingsWidget->show();
@@ -66,40 +65,48 @@ void CreateTool::activate()
   }
 }
 
+void CreateTool::deactivate()
+{
+  if ( mSplitLineBand )
+    mSplitLineBand->reset( Qgis::GeometryType::Line );
+  mIsSplitting = false;
+  clearDebugMarkers();
+  cancelDigitizing();
+  QgsMapTool::deactivate();
+}
+
+// ==================== UI 初始化与配置 ====================
+
 void CreateTool::setupUi()
 {
   mSettingsWidget = new QWidget();
   mUI.setupUi( mSettingsWidget );
   mSettingsWidget->setWindowTitle( "设置" );
 
-  // --- 1. 初始化控件状态 (根据当前 CheckBox 状态设置) ---
+  // 初始化控件状态（根据 CheckBox 初始状态）
   updateWidgetInteractivity( mUI.heightcheckBox->isChecked(), mUI.mergecheckBox->isChecked() );
-
-  // --- 2. 绑定信号槽：点击 CheckBox 时自动切换下方控件的禁用/启用状态 ---
 
   // 高度模块联动
   connect( mUI.heightcheckBox, &QCheckBox::toggled, this, [this]( bool checked ) {
     mUI.fieldcombo->setEnabled( checked );
     mUI.pointcloudcombo->setEnabled( checked );
-    mUI.field->setEnabled( checked );      // 标签也变灰
-    mUI.pointcloud->setEnabled( checked ); // 标签也变灰
+    mUI.field->setEnabled( checked );
+    mUI.pointcloud->setEnabled( checked );
   } );
 
   // 融合模块联动
   connect( mUI.mergecheckBox, &QCheckBox::toggled, this, [this]( bool checked ) {
     mUI.mergelineEdit->setEnabled( checked );
-    mUI.merge->setEnabled( checked ); // 标签也变灰
+    mUI.merge->setEnabled( checked );
   } );
 
-  // --- 3. 其他原有逻辑 ---
   connect( mUI.vectorcombo, QOverload<int>::of( &QComboBox::currentIndexChanged ), this, &CreateTool::updateFields );
 
-  // 确认按钮功能：保存、验证并复现设置内容
+  // 确认按钮：保存设置并验证
   connect( mUI.setting, &QPushButton::clicked, this, [this]() {
     if ( !mUI.vectorcombo )
       return;
 
-    // 1. 获取基础矢量图层
     QString vId = mUI.vectorcombo->currentData().toString();
     mVectorLayer = qobject_cast<QgsVectorLayer *>( QgsProject::instance()->mapLayer( vId ) );
 
@@ -109,10 +116,9 @@ void CreateTool::setupUi()
       return;
     }
 
-    // 2. 构造复现内容字符串
     QString info = QString( "<b>基础配置：</b><br>目标图层：%1<br><br>" ).arg( mVectorLayer->name() );
 
-    // --- 高度初始化模块复现 ---
+    // 高度初始化模块
     if ( mUI.heightcheckBox->isChecked() )
     {
       QString pId = mUI.pointcloudcombo->currentData().toString();
@@ -136,10 +142,10 @@ void CreateTool::setupUi()
     else
     {
       info += "<font color='gray'>○ 高度初始化：未开启</font><br><br>";
-      mPCLayer = nullptr; // 确保关闭时不使用旧的点云指针
+      mPCLayer = nullptr;
     }
 
-    // --- 融合设置模块复现 ---
+    // 融合设置模块
     if ( mUI.mergecheckBox->isChecked() )
     {
       QString dist = mUI.mergelineEdit->text();
@@ -155,14 +161,10 @@ void CreateTool::setupUi()
       info += "<font color='gray'>○ 融合功能：未开启</font><br>";
     }
 
-    // 3. 确保图层处于编辑状态
     if ( !mVectorLayer->isEditable() )
       mVectorLayer->startEditing();
 
-    // 4. 弹出复现对话框
     QMessageBox::information( mSettingsWidget, "配置确认", info );
-
-    // 5. 隐藏设置窗口
     mSettingsWidget->hide();
   } );
 
@@ -192,7 +194,7 @@ void CreateTool::refreshLayerCombos()
   mUI.vectorcombo->clear();
   mUI.pointcloudcombo->clear();
 
-  // --- 关键修改：添加初始空选项 ---
+  // 添加空选项，强制用户手动选择
   mUI.vectorcombo->addItem( "请选择矢量图层...", QVariant() );
   mUI.pointcloudcombo->addItem( "请选择点云图层...", QVariant() );
 
@@ -205,14 +207,12 @@ void CreateTool::refreshLayerCombos()
       mUI.pointcloudcombo->addItem( layer->name(), layer->id() );
   }
 
-  // 将当前索引指向这个“请选择...”项（索引为0）
   mUI.vectorcombo->setCurrentIndex( 0 );
   mUI.pointcloudcombo->setCurrentIndex( 0 );
 
   mUI.vectorcombo->blockSignals( false );
   mUI.pointcloudcombo->blockSignals( false );
 
-  // 初始时清空字段列表，不要自动刷新
   mUI.fieldcombo->clear();
 }
 
@@ -223,7 +223,6 @@ void CreateTool::updateFields( int index )
 
   mUI.fieldcombo->clear();
 
-  // 如果 index 为 0 (即选中的是 "请选择...")，直接返回
   if ( index <= 0 )
     return;
 
@@ -232,14 +231,13 @@ void CreateTool::updateFields( int index )
 
   if ( vLayer )
   {
-    // 同样可以给字段下拉框加一个初始项
     mUI.fieldcombo->addItem( "请选择字段..." );
     for ( const QgsField &f : vLayer->fields() )
-    {
       mUI.fieldcombo->addItem( f.name() );
-    }
   }
 }
+
+// ==================== 地图交互事件 ====================
 
 void CreateTool::canvasPressEvent( QgsMapMouseEvent *e )
 {
@@ -247,19 +245,26 @@ void CreateTool::canvasPressEvent( QgsMapMouseEvent *e )
     return;
 
   QgsPointXY mapPt = toMapCoordinates( e->pos() );
-  double pixelTolerance = mCanvas->mapUnitsPerPixel() * 8.0;
+
+  double splitTol = mCanvas->mapUnitsPerPixel() * 3.0;
+  double sqrSplitTol = splitTol * splitTol;
+  double selectTol = mCanvas->mapUnitsPerPixel() * 10.0;
+
   QgsFeatureIds selectedIds = mVectorLayer->selectedFeatureIds();
 
-  // 1. 分割模式：第二次点击（确定终点）
+  // ==================== 1. 正在进行的模式处理（状态锁） ====================
+
   if ( mIsSplitting )
   {
     if ( e->button() == Qt::LeftButton )
     {
-      // 注意：QGIS 3.x C++ 中 getFeature 只接收一个 ID 参数
       QgsFeature targetFeat = mVectorLayer->getFeature( mTargetFeatureId );
       if ( targetFeat.isValid() )
       {
-        QgsPointXY snapEnd = getSnappedPoint( targetFeat.geometry(), mapPt, pixelTolerance );
+        QgsPointXY snapEnd;
+        int nextV = 0;
+        int lOf = 0;
+        targetFeat.geometry().closestSegmentWithContext( mapPt, snapEnd, nextV, &lOf );
         performSplit( snapEnd );
       }
     }
@@ -269,7 +274,6 @@ void CreateTool::canvasPressEvent( QgsMapMouseEvent *e )
     return;
   }
 
-  // 2. 数字化模式：新建多边形
   if ( mIsDigitizing )
   {
     if ( e->button() == Qt::LeftButton )
@@ -285,44 +289,58 @@ void CreateTool::canvasPressEvent( QgsMapMouseEvent *e )
     return;
   }
 
-  // 3. 基础点击判定
-  if ( e->button() == Qt::LeftButton )
+  // ==================== 2. 核心判定：分割起点捕捉（仅针对已选中的要素） ====================
+  if ( e->button() == Qt::LeftButton && !selectedIds.isEmpty() )
   {
-    QgsRectangle searchRect( mapPt.x() - pixelTolerance, mapPt.y() - pixelTolerance, mapPt.x() + pixelTolerance, mapPt.y() + pixelTolerance );
+    QgsRectangle searchRect( mapPt.x() - splitTol, mapPt.y() - splitTol, mapPt.x() + splitTol, mapPt.y() + splitTol );
 
-    // --- A. 优先判定：是否点击了“已选中要素”的边缘 ---
-    if ( !selectedIds.isEmpty() )
+    QgsFeatureIterator selIt = mVectorLayer->getFeatures(
+      QgsFeatureRequest().setFilterRect( searchRect ).setFilterFids( selectedIds )
+    );
+
+    QgsFeature selFeat;
+    while ( selIt.nextFeature( selFeat ) )
     {
-      QgsFeatureIterator selIt = mVectorLayer->getFeatures( QgsFeatureRequest().setFilterRect( searchRect ).setFilterFids( selectedIds ) );
-      QgsFeature selFeat;
-      while ( selIt.nextFeature( selFeat ) )
+      QgsGeometry geom = selFeat.geometry();
+      QgsPointXY snapPoint;
+      int nextVertexIndex = 0;
+      int leftOf = 0;
+
+      double sqrDist = geom.closestSegmentWithContext( mapPt, snapPoint, nextVertexIndex, &leftOf );
+
+      if ( sqrDist >= 0 && sqrDist < sqrSplitTol )
       {
-        QgsPointXY vNear = getSnappedPoint( selFeat.geometry(), mapPt, pixelTolerance );
-        if ( vNear.distance( mapPt ) < pixelTolerance )
+        mTargetFeatureId = selFeat.id();
+        mSplitStartPoint = snapPoint;
+        mIsSplitting = true;
+
+        if ( mSplitLineBand )
         {
-          mTargetFeatureId = selFeat.id();
-          mSplitStartPoint = vNear;
-          mIsSplitting = true;
-          if ( mSplitLineBand )
-          {
-            mSplitLineBand->reset( Qgis::GeometryType::Line );
-            mSplitLineBand->addPoint( mSplitStartPoint );
-            mSplitLineBand->addPoint( mSplitStartPoint );
-          }
-          return;
+          mSplitLineBand->reset( Qgis::GeometryType::Line );
+          mSplitLineBand->addPoint( mSplitStartPoint );
+          mSplitLineBand->addPoint( mSplitStartPoint );
         }
+        return;
       }
     }
+  }
 
-    // --- B. 判定：是否选择面要素 ---
-    QgsFeatureIterator it = mVectorLayer->getFeatures( QgsFeatureRequest().setFilterRect( searchRect ) );
+  // ==================== 3. 图层级交互：面选择、自动融合 ====================
+  if ( e->button() == Qt::LeftButton )
+  {
+    QgsRectangle selectRect( mapPt.x() - selectTol, mapPt.y() - selectTol, mapPt.x() + selectTol, mapPt.y() + selectTol );
+
+    QgsFeatureIterator it = mVectorLayer->getFeatures( QgsFeatureRequest().setFilterRect( selectRect ) );
     QgsFeature feat;
-    bool foundFace = false;
+    bool clickedOnFace = false;
+
     while ( it.nextFeature( feat ) )
     {
       if ( feat.geometry().contains( QgsGeometry::fromPointXY( mapPt ) ) )
       {
+        clickedOnFace = true;
         bool shiftPressed = e->modifiers() & Qt::ShiftModifier;
+
         if ( shiftPressed )
         {
           if ( selectedIds.contains( feat.id() ) )
@@ -332,16 +350,23 @@ void CreateTool::canvasPressEvent( QgsMapMouseEvent *e )
         }
         else
         {
-          mVectorLayer->removeSelection();
-          mVectorLayer->select( feat.id() );
+          if ( !selectedIds.contains( feat.id() ) )
+          {
+            mVectorLayer->removeSelection();
+            mVectorLayer->select( feat.id() );
+          }
         }
-        foundFace = true;
+
+        if ( mVectorLayer->selectedFeatureCount() == 2 )
+        {
+          snapTwoSelectedFeatures();
+        }
         break;
       }
     }
 
-    // --- C. 判定：点击空白 ---
-    if ( !foundFace )
+    // ==================== 4. 空白区域操作（新建多边形或清空选择） ====================
+    if ( !clickedOnFace )
     {
       if ( !selectedIds.isEmpty() )
       {
@@ -364,7 +389,7 @@ void CreateTool::canvasMoveEvent( QgsMapMouseEvent *e )
 {
   QgsPointXY mapPt = toMapCoordinates( e->pos() );
 
-  // 处理分割辅助线预览
+  // 分割辅助线预览
   if ( mIsSplitting && mSplitLineBand )
   {
     if ( mSplitLineBand->numberOfVertices() > 1 )
@@ -373,7 +398,7 @@ void CreateTool::canvasMoveEvent( QgsMapMouseEvent *e )
     return;
   }
 
-  // 处理原有数字化预览
+  // 数字化预览
   if ( !mIsDigitizing || mPoints.isEmpty() )
     return;
 
@@ -382,6 +407,40 @@ void CreateTool::canvasMoveEvent( QgsMapMouseEvent *e )
 
   mRubberBand->addPoint( mapPt );
 }
+
+void CreateTool::keyPressEvent( QKeyEvent *e )
+{
+  if ( e->key() == Qt::Key_Escape )
+  {
+    cancelDigitizing();
+    if ( mVectorLayer )
+      mVectorLayer->removeSelection();
+  }
+  else if ( e->key() == Qt::Key_Delete || e->key() == Qt::Key_Backspace )
+  {
+    if ( mVectorLayer && mVectorLayer->isEditable() && mVectorLayer->selectedFeatureCount() > 0 )
+    {
+      if ( QMessageBox::question( mCanvas, "确认删除", QString( "确定要删除选中的 %1 个要素吗？" ).arg( mVectorLayer->selectedFeatureCount() ) ) == QMessageBox::Yes )
+      {
+        mVectorLayer->deleteSelectedFeatures();
+        mVectorLayer->triggerRepaint();
+      }
+    }
+  }
+  else if ( e->key() == Qt::Key_Return || e->key() == Qt::Key_Enter )
+  {
+    if ( mVectorLayer && mVectorLayer->isEditable() )
+    {
+      mVectorLayer->commitChanges();
+      mVectorLayer->startEditing();
+      qDebug() << "Changes committed.";
+    }
+  }
+
+  QgsMapTool::keyPressEvent( e );
+}
+
+// ==================== 核心功能：高度计算 ====================
 
 double CreateTool::calculateZFromPointCloud( const QgsGeometry &geom )
 {
@@ -392,7 +451,7 @@ double CreateTool::calculateZFromPointCloud( const QgsGeometry &geom )
 
   clearDebugMarkers();
 
-  // --- 1. 准备点云数据 ---
+  // 准备点云数据
   QgsPointCloudIndex index = mPCLayer->dataProvider()->index();
   QgsRectangle extent = geom.boundingBox();
   QList<QgsPointCloudNodeId> nodeIds;
@@ -441,11 +500,8 @@ double CreateTool::calculateZFromPointCloud( const QgsGeometry &geom )
   if ( allPoints.isEmpty() )
     return 0.0;
 
-  // ==========================================================
-  // 【检查功能控制开关】
-  // 设置为 true 则生成 3D 法线碎线，设置为 false 则完全关闭该功能
-  // ==========================================================
-  bool showDebug = true;
+  // 调试开关（法线碎线）
+  bool showDebug = false;
   QgsVectorLayer *debugLayer = nullptr;
   int samplingCounter = 0;
 
@@ -460,7 +516,7 @@ double CreateTool::calculateZFromPointCloud( const QgsGeometry &geom )
   const double nzThreshold = 0.90;
   const int minNeighbors = 5;
 
-  // --- 2. 计算法线与高度 ---
+  // 计算法线并提取屋顶点高度
   for ( const QVector3D &currentPoint : allPoints )
   {
     if ( currentPoint.z() < minZ + 2.5 )
@@ -503,7 +559,6 @@ double CreateTool::calculateZFromPointCloud( const QgsGeometry &geom )
       {
         roofZValues.append( currentPoint.z() );
 
-        // --- 绘制法线碎线 ---
         if ( showDebug && debugLayer )
         {
           samplingCounter++;
@@ -512,7 +567,6 @@ double CreateTool::calculateZFromPointCloud( const QgsGeometry &geom )
             QgsPoint pStart( currentPoint.x(), currentPoint.y(), currentPoint.z() );
             double len = 5.0;
             QgsPoint pEnd( currentPoint.x() + normal.x() * len, currentPoint.y() + normal.y() * len, currentPoint.z() + normal.z() * len );
-
             QgsLineString *line = new QgsLineString();
             line->setPoints( QgsPointSequence() << pStart << pEnd );
             QgsFeature f( debugLayer->fields() );
@@ -524,7 +578,6 @@ double CreateTool::calculateZFromPointCloud( const QgsGeometry &geom )
     }
   }
 
-  // --- 3. 提交调试图层修改 ---
   if ( showDebug && debugLayer )
   {
     debugLayer->commitChanges();
@@ -536,7 +589,86 @@ double CreateTool::calculateZFromPointCloud( const QgsGeometry &geom )
   return std::accumulate( roofZValues.begin(), roofZValues.end(), 0.0 ) / roofZValues.size();
 }
 
-// --- 2. 修复 finishCurrentFeatureWithHeight 里的缝合逻辑 ---
+// ==================== 辅助函数：点云节点收集 ====================
+
+void CreateTool::collectNodes( const QgsPointCloudIndex &index, const QgsPointCloudNodeId &nodeId, const QgsRectangle &extent, QList<QgsPointCloudNodeId> &nodes )
+{
+  if ( !nodeId.isValid() )
+    return;
+
+  nodes.append( nodeId );
+
+  if ( nodeId.d() > 20 )
+    return;
+
+  for ( int i = 0; i < 8; ++i )
+  {
+    QgsPointCloudNodeId childId(
+      nodeId.d() + 1,
+      ( nodeId.x() << 1 ) + ( i & 1 ),
+      ( nodeId.y() << 1 ) + ( ( i >> 1 ) & 1 ),
+      ( nodeId.z() << 1 ) + ( ( i >> 2 ) & 1 )
+    );
+
+    if ( index.hasNode( childId ) )
+      collectNodes( index, childId, extent, nodes );
+  }
+}
+
+// ==================== 辅助函数：法线计算 ====================
+
+QVector3D CreateTool::computeNormal( double xx, double xy, double xz, double yy, double yz, double zz )
+{
+  double detX = yy * zz - yz * yz;
+  double detY = xx * zz - xz * xz;
+  double detZ = xx * yy - xy * xy;
+
+  double maxDet = std::max( { detX, detY, detZ } );
+
+  if ( maxDet <= 0 )
+    return QVector3D( 0, 0, 1 );
+
+  QVector3D normal;
+  if ( maxDet == detX )
+    normal = QVector3D( detX, xz * yz - xy * zz, xy * yz - xz * yy );
+  else if ( maxDet == detY )
+    normal = QVector3D( xz * yz - xy * zz, detY, xy * xz - yz * xx );
+  else
+    normal = QVector3D( xy * yz - xz * yy, xy * xz - yz * xx, detZ );
+
+  return normal.normalized();
+}
+
+// ==================== 调试辅助：法线可视化图层 ====================
+
+QgsVectorLayer *CreateTool::getOrCreateDebugLayer()
+{
+  QString layerName = "Normal_Lines_Debug";
+  QList<QgsMapLayer *> layers = QgsProject::instance()->mapLayersByName( layerName );
+  if ( !layers.isEmpty() )
+    return qobject_cast<QgsVectorLayer *>( layers.at( 0 ) );
+
+  QString uri = QString( "LineString?crs=%1&field=id:int&z=yes" )
+                  .arg( mCanvas->mapSettings().destinationCrs().authid() );
+
+  mDebugLayer = new QgsVectorLayer( uri, layerName, "memory" );
+  QgsProject::instance()->addMapLayer( mDebugLayer );
+  return mDebugLayer;
+}
+
+void CreateTool::clearDebugMarkers()
+{
+  for ( QgsRubberBand *rb : mDebugMarkers )
+  {
+    if ( mCanvas && mCanvas->scene() )
+      mCanvas->scene()->removeItem( rb );
+    delete rb;
+  }
+  mDebugMarkers.clear();
+}
+
+// ==================== 核心功能：新建多边形 ====================
+
 void CreateTool::finishCurrentFeatureWithHeight()
 {
   if ( mPoints.size() < 3 || !mVectorLayer )
@@ -546,7 +678,7 @@ void CreateTool::finishCurrentFeatureWithHeight()
 
   try
   {
-    // 1. 初始化原始点（首尾闭合）
+    // 1. 初始化原始点
     QVector<QgsPointXY> correctedPoints;
     for ( int i = 0; i < mPoints.size(); ++i )
       correctedPoints.append( mPoints[i] );
@@ -568,10 +700,9 @@ void CreateTool::finishCurrentFeatureWithHeight()
     };
     QVector<SnapInfo> snapLog( correctedPoints.size() );
 
-    // 用于存储所有被吸附到的邻近要素 ID (去重)
     QSet<QgsFeatureId> involvedFids;
 
-    // 3. 融合/吸附逻辑（计算修正后的坐标并记录受影响要素）
+    // 3. 融合/吸附逻辑
     if ( useMerge )
     {
       mVectorLayer->updateExtents();
@@ -680,7 +811,7 @@ void CreateTool::finishCurrentFeatureWithHeight()
     int fieldIdx = mVectorLayer->fields().indexOf( mTargetFieldName );
     bool doHeight = mUI.heightcheckBox && mUI.heightcheckBox->isChecked() && mPCLayer && fieldIdx != -1;
 
-    // A. 为新建要素设置高度
+    // 计算高度
     QgsFeature fNew( mVectorLayer->fields() );
     fNew.setGeometry( finalGeom );
     if ( doHeight )
@@ -689,13 +820,11 @@ void CreateTool::finishCurrentFeatureWithHeight()
       fNew.setAttribute( fieldIdx, zNew );
     }
 
-    // B. 关键修改：为所有参与融合的邻近要素更新高度
     if ( doHeight )
     {
       for ( QgsFeatureId fid : involvedFids )
       {
         QgsFeature adjFeat;
-        // 重新获取最新的要素几何（以防万一）
         if ( mVectorLayer->getFeatures( QgsFeatureRequest( fid ) ).nextFeature( adjFeat ) )
         {
           double zAdj = calculateZFromPointCloud( adjFeat.geometry() );
@@ -729,40 +858,6 @@ void CreateTool::finishCurrentFeatureWithHeight()
   cancelDigitizing();
 }
 
-void CreateTool::keyPressEvent( QKeyEvent *e )
-{
-  if ( e->key() == Qt::Key_Escape )
-  {
-    cancelDigitizing();
-    if ( mVectorLayer )
-      mVectorLayer->removeSelection();
-  }
-  else if ( e->key() == Qt::Key_Delete || e->key() == Qt::Key_Backspace )
-  {
-    // 删除选中的要素
-    if ( mVectorLayer && mVectorLayer->isEditable() && mVectorLayer->selectedFeatureCount() > 0 )
-    {
-      if ( QMessageBox::question( mCanvas, "确认删除", QString( "确定要删除选中的 %1 个要素吗？" ).arg( mVectorLayer->selectedFeatureCount() ) ) == QMessageBox::Yes )
-      {
-        mVectorLayer->deleteSelectedFeatures();
-        mVectorLayer->triggerRepaint();
-      }
-    }
-  }
-  else if ( e->key() == Qt::Key_Return || e->key() == Qt::Key_Enter )
-  {
-    if ( mVectorLayer && mVectorLayer->isEditable() )
-    {
-      mVectorLayer->commitChanges();
-      mVectorLayer->startEditing(); // 提交后继续保持编辑状态
-      qDebug() << "Changes committed.";
-    }
-  }
-
-  QgsMapTool::keyPressEvent( e );
-}
-
-// 清空当前正在绘制的顶点
 void CreateTool::cancelDigitizing( bool clearFinished )
 {
   mIsDigitizing = false;
@@ -774,98 +869,7 @@ void CreateTool::cancelDigitizing( bool clearFinished )
     mSplitLineBand->reset( Qgis::GeometryType::Line );
 }
 
-void CreateTool::clearDebugMarkers()
-{
-  for ( QgsRubberBand *rb : mDebugMarkers )
-  {
-    if ( mCanvas && mCanvas->scene() )
-      mCanvas->scene()->removeItem( rb );
-    delete rb;
-  }
-  mDebugMarkers.clear();
-}
-
-// 在 deactivate() 和 cancelDigitizing() 中也调用一下
-void CreateTool::deactivate()
-{
-  if ( mSplitLineBand )
-    mSplitLineBand->reset( Qgis::GeometryType::Line );
-  mIsSplitting = false;
-  clearDebugMarkers();
-  cancelDigitizing();
-  QgsMapTool::deactivate();
-}
-
-void CreateTool::collectNodes( const QgsPointCloudIndex &index, const QgsPointCloudNodeId &nodeId, const QgsRectangle &extent, QList<QgsPointCloudNodeId> &nodes )
-{
-  // 如果当前节点 ID 无效，直接返回
-  if ( !nodeId.isValid() )
-    return;
-
-  // 1. 将当前节点加入列表（QgsPointCloudBlock 在读取时会根据 request.filterRect 自动过滤掉不在范围内的点）
-  nodes.append( nodeId );
-
-  // 2. 递归深度限制：QGIS 默认最大深度通常为 18-20，这里我们检查所有存在的子节点
-  // 如果当前节点没有点或者超深，就不再往下搜，但通常只要 hasNode 为真就应该搜寻
-  if ( nodeId.d() > 20 )
-    return;
-
-  for ( int i = 0; i < 8; ++i )
-  {
-    QgsPointCloudNodeId childId(
-      nodeId.d() + 1,
-      ( nodeId.x() << 1 ) + ( i & 1 ),
-      ( nodeId.y() << 1 ) + ( ( i >> 1 ) & 1 ),
-      ( nodeId.z() << 1 ) + ( ( i >> 2 ) & 1 )
-    );
-
-    if ( index.hasNode( childId ) )
-    {
-      // 注意：这里为了解决你搜不到点的问题，我们先减少空间剔除的干扰
-      // 让 index.nodeData 内置的裁剪逻辑去处理
-      collectNodes( index, childId, extent, nodes );
-    }
-  }
-}
-
-QVector3D CreateTool::computeNormal( double xx, double xy, double xz, double yy, double yz, double zz )
-{
-  double detX = yy * zz - yz * yz;
-  double detY = xx * zz - xz * xz;
-  double detZ = xx * yy - xy * xy;
-
-  double maxDet = std::max( { detX, detY, detZ } );
-
-  if ( maxDet <= 0 )
-    return QVector3D( 0, 0, 1 );
-
-  QVector3D normal;
-  if ( maxDet == detX )
-    normal = QVector3D( detX, xz * yz - xy * zz, xy * yz - xz * yy );
-  else if ( maxDet == detY )
-    normal = QVector3D( xz * yz - xy * zz, detY, xy * xz - yz * xx );
-  else
-    normal = QVector3D( xy * yz - xz * yy, xy * xz - yz * xx, detZ );
-
-  return normal.normalized();
-}
-
-QgsVectorLayer *CreateTool::getOrCreateDebugLayer()
-{
-  QString layerName = "Normal_Lines_Debug";
-  QList<QgsMapLayer *> layers = QgsProject::instance()->mapLayersByName( layerName );
-  if ( !layers.isEmpty() )
-    return qobject_cast<QgsVectorLayer *>( layers.at( 0 ) );
-
-  // 关键点：使用 LineString 并添加 z=yes 开启三维坐标支持
-  QString uri = QString( "LineString?crs=%1&field=id:int&z=yes" )
-                  .arg( mCanvas->mapSettings().destinationCrs().authid() );
-
-  mDebugLayer = new QgsVectorLayer( uri, layerName, "memory" );
-  QgsProject::instance()->addMapLayer( mDebugLayer );
-  return mDebugLayer;
-}
-
+// ==================== 核心功能：两要素融合吸附 ====================
 void CreateTool::snapTwoSelectedFeatures()
 {
   if ( !mVectorLayer || !mVectorLayer->isEditable() )
@@ -972,7 +976,17 @@ void CreateTool::snapTwoSelectedFeatures()
             if ( L2 > 1e-7 )
             {
               double r = ( ( currentPt.x() - pB1.x() ) * dx + ( currentPt.y() - pB1.y() ) * dy ) / L2;
-              QgsPoint targetPos = ( r < 0 ) ? pB1 : ( r > 1 ? pB2 : QgsPoint( pB1.x() + r * dx, pB1.y() + r * dy ) );
+              QgsPoint targetPos;
+
+              if ( r < -3.0 || r > 4.0 )
+              {
+                targetPos = ( r < 0 ) ? pB1 : pB2;
+              }
+              else
+              {
+                targetPos = QgsPoint( pB1.x() + r * dx, pB1.y() + r * dy );
+              }
+
               if ( currentPt.sqrDist( QgsPointXY( targetPos.x(), targetPos.y() ) ) < thresholdSq )
               {
                 resultsA[idx].pos = targetPos;
@@ -986,7 +1000,7 @@ void CreateTool::snapTwoSelectedFeatures()
     }
   }
 
-  // 5. 应用修改并【重新计算两个要素的高度】
+  // 5. 应用修改并重新计算两个要素的高度
   bool changed = false;
   for ( const auto &r : resultsA )
     if ( r.moved )
@@ -1028,8 +1042,6 @@ void CreateTool::snapTwoSelectedFeatures()
         mVectorLayer->changeAttributeValue( featA.id(), fieldIdx, newZA );
 
         // 计算并更新 B 的高度 (基于 B 的当前几何)
-        // 注意：即使 B 几何没变，吸附可能导致 A 的边界侵入或让开，
-        // 为了绝对准确，对 B 也重新采样一次
         double newZB = calculateZFromPointCloud( geomB );
         mVectorLayer->changeAttributeValue( featB.id(), fieldIdx, newZB );
 
@@ -1042,54 +1054,52 @@ void CreateTool::snapTwoSelectedFeatures()
   }
 }
 
+// ==================== 核心功能：分割要素 ====================
+
 void CreateTool::performSplit( const QgsPointXY &snapEnd )
 {
   if ( !mVectorLayer || mTargetFeatureId == -1 )
     return;
 
-  // 修正：C++ 中 getFeature 只有一个参数
   QgsFeature targetFeat = mVectorLayer->getFeature( mTargetFeatureId );
   if ( !targetFeat.isValid() )
     return;
 
   QgsGeometry targetGeom = targetFeat.geometry();
 
-  // 延伸逻辑：确保物理贯穿
   double dx = snapEnd.x() - mSplitStartPoint.x();
   double dy = snapEnd.y() - mSplitStartPoint.y();
   double len = std::sqrt( dx * dx + dy * dy );
   if ( len < 1e-6 )
     return;
 
-  double offset = 0.001;
+  // 动态延伸量
+  double pixelOffset = mCanvas->mapUnitsPerPixel() * 50.0;
+  double offset = std::max( pixelOffset, 0.1 );
+
   QgsPointXY p1( mSplitStartPoint.x() - ( dx / len ) * offset, mSplitStartPoint.y() - ( dy / len ) * offset );
   QgsPointXY p2( snapEnd.x() + ( dx / len ) * offset, snapEnd.y() + ( dy / len ) * offset );
 
-  QVector<QgsPointXY> splitLine;
-  splitLine << p1 << p2;
+  QVector<QgsPointXY> splitLinePoints;
+  splitLinePoints << p1 << p2;
 
   QVector<QgsGeometry> newGeometries;
   QVector<QgsPointXY> topoPoints;
 
-  // 修正：显式判定枚举返回值 Qgis::GeometryOperationResult
-  Qgis::GeometryOperationResult result = targetGeom.splitGeometry( splitLine, newGeometries, false, topoPoints );
+  Qgis::GeometryOperationResult result = targetGeom.splitGeometry( splitLinePoints, newGeometries, false, topoPoints );
 
   if ( result == Qgis::GeometryOperationResult::Success )
   {
     mVectorLayer->beginEditCommand( QString( "分割要素 %1" ).arg( mTargetFeatureId ) );
 
-    // 更新原几何
     mVectorLayer->changeGeometry( targetFeat.id(), targetGeom );
 
     int fieldIdx = mVectorLayer->fields().indexOf( mTargetFieldName );
     bool doHeight = mUI.heightcheckBox && mUI.heightcheckBox->isChecked() && mPCLayer && fieldIdx != -1;
 
     if ( doHeight )
-    {
       mVectorLayer->changeAttributeValue( targetFeat.id(), fieldIdx, calculateZFromPointCloud( targetGeom ) );
-    }
 
-    // 添加新切出的部分
     for ( const QgsGeometry &part : newGeometries )
     {
       QgsFeature newFeat( targetFeat );
@@ -1104,9 +1114,18 @@ void CreateTool::performSplit( const QgsPointXY &snapEnd )
   }
   else
   {
-    QMessageBox::warning( mCanvas, "分割失败", "请确保分割线完全贯穿要素。" );
+    QString errorDetail;
+    if ( result == Qgis::GeometryOperationResult::GeometryEngineError )
+      errorDetail = "(几何引擎错误)";
+    else if ( result == Qgis::GeometryOperationResult::InvalidInputGeometryType )
+      errorDetail = "(无效的几何类型)";
+
+    QMessageBox::warning( mCanvas, "分割失败", "切割线未完全贯穿要素 " + errorDetail );
+    qDebug() << "Split Result Code:" << static_cast<int>( result );
   }
 }
+
+// ==================== 辅助函数：吸附到几何最近点 ====================
 
 QgsPointXY CreateTool::getSnappedPoint( const QgsGeometry &geom, const QgsPointXY &mapPt, double tolerance )
 {
@@ -1116,22 +1135,26 @@ QgsPointXY CreateTool::getSnappedPoint( const QgsGeometry &geom, const QgsPointX
   int vIdx, pIdx, rIdx;
   double d2;
 
-  // 1. 获取最近的顶点
+  // 1. 获取最近顶点
   QgsPointXY snapPoint = geom.closestVertex( mapPt, vIdx, pIdx, rIdx, d2 );
+  double distToVertex = std::sqrt( d2 );
 
-  // 2. 如果点击位置离顶点稍远，尝试吸附到边上的投影点
-  if ( std::sqrt( d2 ) > tolerance / 2.0 )
+  // 顶点优先：只要在容差范围内，直接锁定顶点
+  if ( distToVertex < tolerance )
   {
-    QgsPoint segmentPoint;
-    QgsVertexId vId;
-    // closestSegment 计算点到线段的最近投影点，返回的是实际的投影坐标
-    double distEdge = geom.constGet()->closestSegment( QgsPoint( mapPt ), segmentPoint, vId );
-
-    if ( distEdge < tolerance )
-    {
-      return QgsPointXY( segmentPoint.x(), segmentPoint.y() );
-    }
+    return snapPoint;
   }
 
-  return snapPoint;
+  // 2. 只有离顶点较远时，才尝试吸附到边上的投影点
+  QgsPoint segmentPoint;
+  QgsVertexId vId;
+  double distEdge = geom.constGet()->closestSegment( QgsPoint( mapPt ), segmentPoint, vId );
+
+  // 稍微放宽边的感应范围 (1.5倍)，增强吸附感
+  if ( distEdge < tolerance * 2.0 )
+  {
+    return QgsPointXY( segmentPoint.x(), segmentPoint.y() );
+  }
+
+  return mapPt;
 }
