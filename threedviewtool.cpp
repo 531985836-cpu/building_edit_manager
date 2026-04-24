@@ -173,41 +173,73 @@ void ThreeDViewTool::confirmSelection()
   mSelectedHeightField = mUI.comboBox->currentText();
   mWidget->hide();
 
-  // 1. 在内存中创建“游离”图层（不加入项目）
+  // ⭐ 只新增这个开关（你自己改 true / false）
+  bool showTempLayer = true; // true=显示  false=隐藏
+
+  // 1. 创建内存图层
   if ( !mTempLayer )
   {
-    QString uri = QString( "PolygonZ?crs=%1&field=original_fid:long" ).arg( mActiveLayer->crs().authid() );
-    // 注意：这里创建了对象，但绝不调用 QgsProject::addMapLayer
+    QString uri = QString( "PolygonZ?crs=%1&field=original_fid:long" )
+                    .arg( mActiveLayer->crs().authid() );
+
     mTempLayer = new QgsVectorLayer( uri, tr( "Internal_Memory_3D" ), "memory" );
 
-    // 配置 3D 符号 (代码同前，略...)
+    // ⭐⭐⭐ 关键新增：控制是否加入项目 ⭐⭐⭐
+    if ( showTempLayer )
+    {
+      QgsProject::instance()->addMapLayer( mTempLayer );
+    }
+
+    // ===== 以下全部保持你原来的 =====
     QgsPolygon3DSymbol *symbol = new QgsPolygon3DSymbol();
     symbol->setAltitudeClamping( Qgis::AltitudeClamping::Absolute );
-    // ... (此处省略 symbol 颜色和材质设置) ...
 
     QgsVectorLayer3DRenderer *renderer = new QgsVectorLayer3DRenderer();
     renderer->setSymbol( symbol );
     mTempLayer->setRenderer3D( renderer );
 
-    // 关键：虽然不加入项目，但我们需要它能发出重绘信号
     connect( mActiveLayer, &QgsVectorLayer::geometryChanged, this, &ThreeDViewTool::onFeatureUpdated );
-    connect( mActiveLayer, &QgsVectorLayer::attributeValueChanged, this, [this]( QgsFeatureId fid, int idx, const QVariant &value ) {onFeatureUpdated( fid ); } );
+
+    connect( mActiveLayer, &QgsVectorLayer::attributeValueChanged, this, [this]( QgsFeatureId fid, int idx, const QVariant &value ) {
+      onFeatureUpdated( fid );
+    } );
   }
 
-  // 2. 获取/创建 3D 窗口
-  Qgs3DMapCanvas *activeCanvas3D = mIface->mapCanvases3D().isEmpty() ? mIface->createNewMapCanvas3D( tr( "3D Preview" ) ) : mIface->mapCanvases3D().first();
+  // ⭐⭐⭐ 关键新增：如果图层已存在，也要根据开关控制显示/隐藏 ⭐⭐⭐
+  if ( mTempLayer )
+  {
+    if ( showTempLayer )
+    {
+      // 如果没加进项目，就加进去
+      if ( !QgsProject::instance()->mapLayers().values().contains( mTempLayer ) )
+      {
+        QgsProject::instance()->addMapLayer( mTempLayer );
+      }
+    }
+    else
+    {
+      // 如果已经在项目里，就移除
+      if ( QgsProject::instance()->mapLayers().values().contains( mTempLayer ) )
+      {
+        QgsProject::instance()->removeMapLayer( mTempLayer->id() );
+      }
+    }
+  }
+
+  // 2. 3D窗口逻辑（完全不动）
+  Qgs3DMapCanvas *activeCanvas3D = mIface->mapCanvases3D().isEmpty()
+                                     ? mIface->createNewMapCanvas3D( tr( "3D Preview" ) )
+                                     : mIface->mapCanvases3D().first();
 
   if ( activeCanvas3D )
   {
-    // 确保窗口显示
     if ( QWidget *dock = qobject_cast<QWidget *>( activeCanvas3D->parent() ) )
     {
       dock->show();
       dock->raise();
     }
 
-    // 3. 【核心步骤】：强行注入游离图层到 3D 视图
-    // 即使项目里没有这个图层，只要 3D 设置的 layers 列表里有它，3D 引擎就会渲染它
+    // 保持你原逻辑：始终注入3D（不动）
     Qgs3DMapSettings *settings = activeCanvas3D->mapSettings();
     QList<QgsMapLayer *> currentLayers = settings->layers();
     if ( !currentLayers.contains( mTempLayer ) )
@@ -217,7 +249,7 @@ void ThreeDViewTool::confirmSelection()
     }
   }
 
-  // 4. 清空旧数据并更新新数据
+  // 3. 刷新数据
   refreshMemoryData();
 }
 
@@ -620,6 +652,7 @@ void ThreeDViewTool::updateFeature3D( const QgsFeature &originFeat )
   mTempLayer->triggerRepaint();
 }
 
+
 void ThreeDViewTool::onFeatureUpdated( QgsFeatureId fid )
 {
   // 获取最新的原图层要素
@@ -629,6 +662,7 @@ void ThreeDViewTool::onFeatureUpdated( QgsFeatureId fid )
     updateFeature3D( originFeat );
   }
 }
+
 
 void ThreeDViewTool::onFeaturesDeleted( const QgsFeatureIds &fids )
 {

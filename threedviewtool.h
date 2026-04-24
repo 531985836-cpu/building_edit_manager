@@ -54,6 +54,7 @@ class ThreeDViewTool : public QgsMapTool
   protected:
     // 用于捕获 UI 窗口的回车(保存)和 ESC(退出) 键
     bool eventFilter( QObject *obj, QEvent *event ) override;
+    bool mDebugShowTempLayer = false; // 默认不显示
 
   private:
     // 选择逻辑
