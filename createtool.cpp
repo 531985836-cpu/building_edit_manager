@@ -24,7 +24,7 @@
 #include <QList>
 #include <QgsGeometryUtils.h>
 #include <qgis.h>
-
+#include <qgslayertree.h>
 // ==================== 构造 / 析构 ====================
 
 CreateTool::CreateTool( QgsMapCanvas *canvas )
@@ -839,6 +839,7 @@ void CreateTool::finishCurrentFeatureWithHeight()
     {
       mVectorLayer->endEditCommand();
       mVectorLayer->triggerRepaint();
+      refresh3DView();
       qDebug() << "Success: New feature and neighbors updated.";
     }
     else
@@ -1051,6 +1052,7 @@ void CreateTool::snapTwoSelectedFeatures()
 
     mVectorLayer->endEditCommand();
     mVectorLayer->triggerRepaint();
+    refresh3DView();
   }
 }
 
@@ -1111,6 +1113,7 @@ void CreateTool::performSplit( const QgsPointXY &snapEnd )
 
     mVectorLayer->endEditCommand();
     mVectorLayer->triggerRepaint();
+    refresh3DView();
   }
   else
   {
@@ -1157,4 +1160,14 @@ QgsPointXY CreateTool::getSnappedPoint( const QgsGeometry &geom, const QgsPointX
   }
 
   return mapPt;
+}
+
+void CreateTool::refresh3DView()
+{
+  if ( mVectorLayer )
+  {
+    mVectorLayer->triggerRepaint();
+  }
+
+QgsProject::instance()->layerTreeRoot()->findLayer( mVectorLayer->id() )->setItemVisibilityChecked( true );
 }

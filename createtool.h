@@ -43,6 +43,7 @@ class CreateTool : public QgsMapTool
     void collectNodes( const QgsPointCloudIndex &index, const QgsPointCloudNodeId &nodeId, const QgsRectangle &extent, QList<QgsPointCloudNodeId> &nodes );
     double calculateZFromPointCloud( const QgsGeometry &geom );
     QVector3D computeNormal( double xx, double xy, double xz, double yy, double yz, double zz );
+    void refresh3DView();
 
     // --- 分割功能逻辑 ---
     void performSplit( const QgsPointXY &endPoint );

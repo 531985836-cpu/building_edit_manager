@@ -19,11 +19,26 @@ PointEdit::PointEdit( QgsMapCanvas *canvas )
   createRubberBand();
 
   auto layers = QgsProject::instance()->layers<QgsVectorLayer *>();
-  if ( !layers.isEmpty() )
-    mActiveLayer = layers.first();
 
-  if ( mActiveLayer )
-    startEditingLayer( mActiveLayer );
+  // =========================
+  // 只选择“正在编辑”的图层
+  // =========================
+  mActiveLayer = nullptr;
+
+  for ( QgsVectorLayer *layer : layers )
+  {
+    if ( layer && layer->isEditable() )
+    {
+      mActiveLayer = layer;
+      break;
+    }
+  }
+
+  // 如果没有编辑图层，则不允许进入编辑工具
+  if ( !mActiveLayer )
+    return;
+
+  startEditingLayer( mActiveLayer );
 }
 
 PointEdit::~PointEdit() {}
@@ -77,7 +92,6 @@ void PointEdit::clearRubberBand()
 // 工具卸载时取消新建操作
 void PointEdit::deactivate()
 {
-  cancelNewFace();
   QgsMapTool::deactivate();
 }
 
@@ -89,28 +103,27 @@ void PointEdit::canvasPressEvent( QgsMapMouseEvent *e )
   if ( !mActiveLayer )
     return;
 
+  if ( !mActiveLayer->isEditable() )
+    return;
+
   QgsPointXY pos = toMapCoordinates( e->pos() );
   double tol = 10.0 * canvas()->mapUnitsPerPixel();
   QgsFeatureIds selectedIds = mActiveLayer->selectedFeatureIds();
 
-  // --- 处理右键逻辑 ---
+  // 右键取消状态
   if ( e->button() == Qt::RightButton )
   {
-    if ( mCurrentMode == DigitizeMode )
-    {
-      finishNewFace();
-      return;
-    }
+    mCurrentMode = NoneMode;
+    mTempRubber->hide();
+    return;
   }
+
   if ( e->button() != Qt::LeftButton )
     return;
 
-  // --- 处理正在进行的模式 ---
-  if ( mCurrentMode == DigitizeMode )
-  {
-    addPointToNewFace( pos );
-    return;
-  }
+  // =========================
+  // 1. 正在编辑状态
+  // =========================
   if ( mCurrentMode == VertexMode )
   {
     finishEditVertex( pos );
@@ -118,6 +131,7 @@ void PointEdit::canvasPressEvent( QgsMapMouseEvent *e )
     mTempRubber->hide();
     return;
   }
+
   if ( mCurrentMode == EdgeMode )
   {
     finishEditEdge( pos );
@@ -125,6 +139,7 @@ void PointEdit::canvasPressEvent( QgsMapMouseEvent *e )
     mTempRubber->hide();
     return;
   }
+
   if ( mCurrentMode == FaceMode )
   {
     finishFaceMove( pos );
@@ -133,55 +148,59 @@ void PointEdit::canvasPressEvent( QgsMapMouseEvent *e )
     return;
   }
 
-  // --- 核心改动：仅针对选中要素进行探测 ---
+  // =========================
+  // 2. 已选要素：进入编辑模式
+  // =========================
   if ( !selectedIds.isEmpty() )
   {
-    // 1. 探测选中要素的节点
     if ( findClosestVertex( pos, mDraggingFeatureId, mDraggingVertexIndex, tol, selectedIds ) )
     {
       mCurrentMode = VertexMode;
       return;
     }
-    // 2. 探测选中要素的边
+
     if ( findClosestEdge( pos, mEditingFeatureId, mEditingEdgeStartIndex, tol, selectedIds ) )
     {
       mCurrentMode = EdgeMode;
       return;
     }
-    // 3. 探测选中要素的面（平移）
+
     QgsFeature feat;
-    // 简单起见取第一个选中要素，或遍历 selectedIds 探测 pointInFeature
-    mActiveLayer->getFeatures( QgsFeatureRequest( *selectedIds.begin() ) ).nextFeature( feat );
+    mActiveLayer->getFeatures(
+                  QgsFeatureRequest( *selectedIds.begin() )
+    )
+      .nextFeature( feat );
+
     if ( feat.geometry().contains( QgsGeometry::fromPointXY( pos ) ) )
     {
       mMovingFeatureId = feat.id();
       mInitialClickPoint = pos;
       mCurrentMode = FaceMode;
       getGeometryPoints( feat.geometry(), mOriginalFacePts );
-      // ... (此处省略 rubberband 初始化代码)
       return;
     }
   }
 
-  // --- 如果没点中任何选中要素的组件，则处理图层交互 ---
+  // =========================
+  // 3. ⭐核心修复：选中逻辑必须存在
+  // =========================
+
   QgsFeatureId foundId = pointInFeature( pos );
-  if ( foundId == FID_NULL )
+
+  if ( foundId != FID_NULL )
   {
-    if ( selectedIds.isEmpty() )
-    {
-      mCurrentMode = DigitizeMode;
-      addPointToNewFace( pos );
-    }
-    else
-    {
-      mActiveLayer->removeSelection();
-      canvas()->refresh();
-    }
-  }
-  else
-  {
-    // 如果点中了某个要素，但它之前没被选中，则选中它（这样下次点击就能编辑它了）
+    // 点击到要素 → 选中
     selectAtPoint( pos, mShiftPressed );
+    return;
+  }
+
+  // =========================
+  // 4. 空白点击：清选择
+  // =========================
+  if ( !selectedIds.isEmpty() )
+  {
+    mActiveLayer->removeSelection();
+    canvas()->refresh();
   }
 }
 
@@ -237,11 +256,6 @@ void PointEdit::canvasMoveEvent( QgsMapMouseEvent *e )
       mTempRubber->addPoint( *( mTempRubber->getPoint( 0, 0 ) ) );
     mTempRubber->show();
   }
-  else if ( mCurrentMode == DigitizeMode && !mNewFacePoints.isEmpty() )
-  {
-    mDigitizeRubber->removeLastPoint();
-    mDigitizeRubber->addPoint( mousePos );
-  }
 }
 
 // 双击事件
@@ -264,7 +278,6 @@ void PointEdit::keyPressEvent( QKeyEvent *e )
   // 1. Esc 键取消当前预览/新建状态
   if ( e->key() == Qt::Key_Escape )
   {
-    cancelNewFace();
     mCurrentMode = NoneMode;
     mTempRubber->hide();
   }
@@ -288,43 +301,6 @@ void PointEdit::keyPressEvent( QKeyEvent *e )
 void PointEdit::canvasReleaseEvent( QgsMapMouseEvent *e ) { Q_UNUSED( e ); }
 
 // =========================核心功能实现===================================
-
-// 向新建要素列表中添加点
-void PointEdit::addPointToNewFace( const QgsPointXY &pt )
-{
-  mNewFacePoints.append( pt );
-  mDigitizeRubber->reset( Qgis::GeometryType::Polygon );
-  for ( const auto &p : mNewFacePoints )
-    mDigitizeRubber->addPoint( p );
-  mDigitizeRubber->addPoint( pt );
-  mDigitizeRubber->show();
-}
-
-// 提交新建的面要素到图层
-void PointEdit::finishNewFace()
-{
-  if ( mNewFacePoints.size() >= 3 )
-  {
-    mActiveLayer->beginEditCommand( "Create Building" );
-    QgsFeature f( mActiveLayer->fields() );
-    QgsPolygonXY poly;
-    poly.append( QVector<QgsPointXY>::fromList( mNewFacePoints ) );
-    f.setGeometry( QgsGeometry::fromPolygonXY( poly ) );
-    mActiveLayer->addFeature( f );
-    mActiveLayer->endEditCommand();
-    mActiveLayer->triggerRepaint();
-  }
-  cancelNewFace();
-}
-
-// 取消当前新建面操作
-void PointEdit::cancelNewFace()
-{
-  mNewFacePoints.clear();
-  mDigitizeRubber->reset();
-  mDigitizeRubber->hide();
-  mCurrentMode = NoneMode;
-}
 
 // 提交节点移动结果
 void PointEdit::finishEditVertex( const QgsPointXY &newPos )
@@ -503,13 +479,30 @@ void PointEdit::saveAllEdits()
 // 执行矩形范围内的点选操作
 void PointEdit::selectAtPoint( const QgsPointXY &pt, bool add )
 {
+  if ( !mActiveLayer )
+    return;
+
   double r = 5.0 * canvas()->mapUnitsPerPixel();
-  QgsRectangle rect( pt.x() - r, pt.y() - r, pt.x() + r, pt.y() + r );
-  QgsFeatureIds ids = add ? mActiveLayer->selectedFeatureIds() : QgsFeatureIds();
-  QgsFeatureIterator it( mActiveLayer->getFeatures( QgsFeatureRequest( rect ) ) );
+
+  QgsRectangle rect(
+    pt.x() - r, pt.y() - r,
+    pt.x() + r, pt.y() + r
+  );
+
+  QgsFeatureIds ids = add
+                        ? mActiveLayer->selectedFeatureIds()
+                        : QgsFeatureIds();
+
+  QgsFeatureIterator it(
+    mActiveLayer->getFeatures(
+      QgsFeatureRequest( rect )
+    )
+  );
+
   QgsFeature feat;
   while ( it.nextFeature( feat ) )
     ids.insert( feat.id() );
+
   mActiveLayer->selectByIds( ids );
   canvas()->refresh();
 }
@@ -517,10 +510,22 @@ void PointEdit::selectAtPoint( const QgsPointXY &pt, bool add )
 // 探测指定坐标下的要素ID
 QgsFeatureId PointEdit::pointInFeature( const QgsPointXY &pt )
 {
+  if ( !mActiveLayer )
+    return FID_NULL;
+
   double r = 5.0 * canvas()->mapUnitsPerPixel();
+
   QgsFeatureRequest req;
-  req.setFilterRect( QgsRectangle( pt.x() - r, pt.y() - r, pt.x() + r, pt.y() + r ) ).setLimit( 1 );
+  req.setFilterRect(
+       QgsRectangle(
+         pt.x() - r, pt.y() - r,
+         pt.x() + r, pt.y() + r
+       )
+  )
+    .setLimit( 1 );
+
   QgsFeatureIterator it = mActiveLayer->getFeatures( req );
+
   QgsFeature f;
   return it.nextFeature( f ) ? f.id() : FID_NULL;
 }

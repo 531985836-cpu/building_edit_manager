@@ -41,11 +41,6 @@ class PointEdit : public QgsMapTool
     bool findClosestEdge( const QgsPointXY &pt, QgsFeatureId &fid, int &startVertexIndex, double tolerance, const QgsFeatureIds &targetIds );
     QgsFeatureId pointInFeature( const QgsPointXY &pt );
 
-    // --- 新建要素逻辑 (Digitize) ---
-    void addPointToNewFace( const QgsPointXY &pt );
-    void finishNewFace();
-    void cancelNewFace();
-
     // --- 编辑交互逻辑 (Edit) ---
     void selectAtPoint( const QgsPointXY &pt, bool add );
     void finishEditVertex( const QgsPointXY &newPos );
@@ -69,7 +64,6 @@ class PointEdit : public QgsMapTool
       VertexMode,
       EdgeMode,
       FaceMode,
-      DigitizeMode
     };
     EditMode mCurrentMode = NoneMode;
 
@@ -86,7 +80,6 @@ class PointEdit : public QgsMapTool
     QgsFeatureId mMovingFeatureId = -1;
 
     QList<QgsPointXY> mOriginalFacePts;
-    QList<QgsPointXY> mNewFacePoints;
     QgsPointXY mInitialClickPoint;
     bool mShiftPressed = false;
 };

@@ -15,11 +15,26 @@ HeightEditTool::HeightEditTool( QgsMapCanvas *canvas )
   setCursor( Qt::CrossCursor );
   createRubberBand();
 
-  auto layers = QgsProject::instance()->layers<QgsVectorLayer *>();
-  if ( !layers.isEmpty() )
-    mActiveLayer = layers.first();
+  mActiveLayer = nullptr;
 
-  startEditingLayer( mActiveLayer );
+  const auto layers = QgsProject::instance()->layers<QgsVectorLayer *>();
+
+  for ( QgsVectorLayer *layer : layers )
+  {
+    if ( layer && layer->isEditable() )
+    {
+      mActiveLayer = layer;
+      break;
+    }
+  }
+
+  // 没有编辑图层 → 工具不可用
+  if ( !mActiveLayer )
+  {
+    qDebug() << "[HeightEditTool] No editable layer found.";
+    return;
+  }
+
 }
 
 HeightEditTool::~HeightEditTool()
@@ -95,6 +110,8 @@ void HeightEditTool::keyReleaseEvent( QKeyEvent *e )
 // ---------------- 选择逻辑 ----------------
 void HeightEditTool::selectAtPoint( const QgsPointXY &point, bool add )
 {
+  if ( !mActiveLayer || !mActiveLayer->isEditable() )
+    return;
   double r = searchRadiusMU( canvas() );
   QgsRectangle rect( point.x() - r, point.y() - r, point.x() + r, point.y() + r );
 
@@ -143,6 +160,8 @@ void HeightEditTool::toggleSelectionAtPoint( const QgsPointXY &p )
 
 void HeightEditTool::selectByRectangle( const QgsRectangle &rect, bool add )
 {
+  if ( !mActiveLayer || !mActiveLayer->isEditable() )
+    return;
   QgsFeatureIds ids = add ? mActiveLayer->selectedFeatureIds() : QgsFeatureIds();
   QgsFeatureIterator it = mActiveLayer->getFeatures( QgsFeatureRequest( rect ) );
   QgsFeature feat;
@@ -177,7 +196,7 @@ void HeightEditTool::clearRubberBand()
 // ---------------- 弹出属性表 ----------------
 void HeightEditTool::showSelectedAttributes()
 {
-  if ( !mActiveLayer )
+  if ( !mActiveLayer || !mActiveLayer->isEditable() )
     return;
 
   const QgsFeatureIds &fids = mActiveLayer->selectedFeatureIds();
@@ -254,7 +273,7 @@ void HeightEditTool::showSelectedAttributes()
 // ---------------- 初始化滑块缓存 ----------------
 void HeightEditTool::initSliderCache()
 {
-  if ( !mActiveLayer )
+  if ( !mActiveLayer || !mActiveLayer->isEditable() )
     return;
 
   const QgsFeatureIds &fids = mActiveLayer->selectedFeatureIds();
@@ -301,7 +320,7 @@ void HeightEditTool::initSliderCache()
 // ---------------- 滑块修改 ----------------
 void HeightEditTool::onSliderChanged( int value )
 {
-  if ( !mActiveLayer || mInitialFieldValues.isEmpty() )
+  if ( !mActiveLayer || !mActiveLayer->isEditable() || mInitialFieldValues.isEmpty() )
     return;
 
   double heightValue = value / SLIDER_SCALE;
@@ -335,7 +354,7 @@ void HeightEditTool::onSliderChanged( int value )
 // ---------------- 属性表修改立即保存 ----------------
 void HeightEditTool::onCellChanged( int row, int column )
 {
-  if ( row < 0 || column < 0 || !mActiveLayer )
+  if ( row < 0 || column < 0 || !mActiveLayer || !mActiveLayer->isEditable() )
     return;
 
   auto fidIt = mInitialFieldValues.begin();
@@ -359,12 +378,4 @@ bool HeightEditTool::eventFilter( QObject *obj, QEvent *event )
 
   // 不处理 ESC，其他事件交给父类
   return QgsMapTool::eventFilter( obj, event );
-}
-// ---------------- 退出工具 ----------------
-void HeightEditTool::startEditingLayer( QgsVectorLayer *layer )
-{
-  if ( !layer )
-    return;
-  if ( !layer->isEditable() )
-    layer->startEditing();
 }

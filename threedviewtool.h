@@ -4,11 +4,11 @@
 #include <qgsrubberband.h>
 #include <qgsrectangle.h>
 #include <qgsfields.h>
-#include <qgsfeature.h> // 必须包含以识别 QgsFeatureList
+#include <qgsfeature.h>
 #include <QWidget>
 #include <QPoint>
-#include <QMatrix4x4> // 必须包含以识别 QMatrix4x4
-#include <QVector3D>  // 必须包含以识别 QVector3D
+#include <QMatrix4x4>
+#include <QVector3D>
 
 // 引入 UI 头文件
 #include "ui_threedview.h"
@@ -21,19 +21,16 @@ class QgisInterface;
 /**
  * @brief 按照参考代码逻辑定义的网格数据结构
  */
-// 1. 定义数据结构（必须在类使用它之前定义）
 struct MeshData
 {
-    QVector<QgsPoint> vertices; // 修改为 QgsPoint 以保持双精度
+    QVector<QgsPoint> vertices;
     QVector<int> indices;
     bool isEmpty() const { return vertices.isEmpty(); }
 };
 
-// 2. 定义 BuildMesh 类
 class BuildMesh
 {
   public:
-    // 设为 static 方便直接调用
     static MeshData build( const QgsGeometry &geom, double height );
 };
 
@@ -45,56 +42,52 @@ class ThreeDViewTool : public QgsMapTool
     explicit ThreeDViewTool( QgsMapCanvas *canvas, QgisInterface *iface );
     ~ThreeDViewTool() override;
 
-    // 地图画布事件
-    void canvasPressEvent( QgsMapMouseEvent *e ) override;
-    void canvasMoveEvent( QgsMapMouseEvent *e ) override;
-    void canvasReleaseEvent( QgsMapMouseEvent *e ) override;
     void deactivate() override;
+    void activate() override;
 
   protected:
-    // 用于捕获 UI 窗口的回车(保存)和 ESC(退出) 键
     bool eventFilter( QObject *obj, QEvent *event ) override;
-    bool mDebugShowTempLayer = false; // 默认不显示
+    bool mDebugShowTempLayer = false;
 
   private:
-    // 选择逻辑
-    void selectAtPoint( const QgsPointXY &point );
-    void selectByRectangle( const QgsRectangle &rect );
-
-    // 橡皮筋辅助线
-    void createRubberBand();
-    void clearRubberBand();
-
-    // UI 交互逻辑
+    // ===== UI 交互与逻辑控制 =====
     void showFieldSelectUI();
-    void confirmSelection(); // 对应保存操作
-    void cancelSelection();  // 对应退出操作
+    void setupUI();           // UI 信号初始化
+    void refreshLayerList();  // 刷新图层 ComboBox (参考 CreateTool)
+    void updateFieldsCombo(); // 刷新字段 ComboBox (参考 CreateTool)
+    void confirmSelection();  // 执行后续计算
+    void cancelSelection();
 
+    // ===== 3D 数据处理 =====
     void updateFeature3D( const QgsFeature &originFeat );
     void refreshMemoryData();
-
-    QgsVectorLayer *mTempLayer = nullptr; // 持久化存储 3D 内存图层
-    QString mSelectedHeightField;         // 记录用户选择的高度字段
     QgsFeatureList buildBuildingFromMesh( const MeshData &mesh, const QMatrix4x4 &mat );
 
   private slots:
-    void onFeatureUpdated( QgsFeatureId fid );           // 监听几何/属性修改
-    void onFeaturesDeleted( const QgsFeatureIds &fids ); // 监听删除
+    void onFeatureUpdated( QgsFeatureId fid );
+    void onFeaturesDeleted( const QgsFeatureIds &fids );
+    void onLayerChanged( int index ); // 图层切换联动槽函数
 
   private:
-    // 核心数据
-    QgsVectorLayer *mActiveLayer = nullptr;
-    QgsRubberBand *mRubberBand = nullptr;
+    // ===== UI 成员 =====
+    QWidget *mWidget = nullptr;
+    Ui::threedview mUI;
 
-    // 鼠标交互状态
+    // ===== 核心数据与状态 =====
+    QgsMapCanvas *mCanvas = nullptr;
+    QgisInterface *mIface = nullptr;
+
+    QgsVectorLayer *mActiveLayer = nullptr; // 选中的目标矢量图层
+    QgsVectorLayer *mTempLayer = nullptr;   // 3D 内存图层
+    QString mSelectedHeightField;           // 选中的高度字段名
+
+    // ===== 鼠标交互状态 (保持不动) =====
+    QgsRubberBand *mRubberBand = nullptr;
     bool mDragging = false;
     bool mIsBoxSelecting = false;
     QgsPointXY mStartPoint;
     QPoint mStartScreenPoint;
 
-    // UI 成员
-    QWidget *mWidget = nullptr;
-    Ui::threedview mUI;
-
-    QgisInterface *mIface = nullptr;
+    // 存储 原始图层ID -> 对应的内存Mesh图层
+    QMap<QString, QgsVectorLayer *> mTempLayersMap;
 };
