@@ -9,61 +9,59 @@
 #include <QKeyEvent>
 
 // 基础几何
-#include <qgspolygon.h>    // 解决“QgsPolygon 不完整类型”
-#include <qgslinestring.h> // 解决“QgsLineString 不完整类型”
+#include <qgspolygon.h>
+#include <qgslinestring.h>
 #include <qgspoint.h>
-#include <qgsfeature.h>
 
-// 3D 渲染模块 (解决渲染器、符号、材质未定义)
+// 3D 渲染模块
 #include <qgspolygon3dsymbol.h>
 #include <qgsvectorlayer3drenderer.h>
 #include <qgsphongmaterialsettings.h>
 #include <qgs3dtypes.h>
 
-// Qt 相关
-#include <QMatrix4x4>
-#include <QVector3D>
-
 #include <qgsgeometrycollection.h>
-#include <qgisinterface.h>    // 解决“不完整类型 QgisInterface”
-#include <qgs3dmapcanvas.h>   // 解决“未定义标识符 Qgs3DMapCanvas”
+#include <qgisinterface.h>
+#include <qgs3dmapcanvas.h>
 #include <qgs3dmapsettings.h>
-#include <qgsmaptool.h>
-#include <QMap>
 #include <qgsnullsymbolrenderer.h>
 #include <qgslayertreelayer.h>
 #include <qgslayertree.h>
 #include <qgslayertreeview.h>
-// 1. 修改参数列表：增加 QgisInterface *iface
-ThreeDViewTool::ThreeDViewTool( QgsMapCanvas *canvas, QgisInterface *iface )
-  : QgsMapTool( canvas ) // 初始化父类
-  , mIface( iface )      // 核心修改：在这里将传入的 iface 赋值给成员变量 mIface
-{
-  // 以下逻辑保持不变
-  setCursor( Qt::CrossCursor );
+#include <QMap>
 
+// ==================== 构造与析构 ====================
+ThreeDViewTool::ThreeDViewTool( QgsMapCanvas *canvas, QgisInterface *iface )
+  : QgsMapTool( canvas )
+  , mIface( iface )
+{
+  setCursor( Qt::CrossCursor );
   auto layers = QgsProject::instance()->layers<QgsVectorLayer *>();
   if ( !layers.isEmpty() )
     mActiveLayer = layers.first();
-
 }
 
 ThreeDViewTool::~ThreeDViewTool()
 {
   if ( mWidget )
-  {
     mWidget->deleteLater();
-  }
 }
 
+// ==================== 激活与停用 ====================
 void ThreeDViewTool::activate()
 {
   QgsMapTool::activate();
   setupUI();
 }
 
+void ThreeDViewTool::deactivate()
+{
+  if ( mWidget )
+    mWidget->hide();
+  QgsMapTool::deactivate();
+}
 
-// ==================== UI 弹窗 (修复错误) ====================
+// ==================== UI 交互 ====================
+// 显示字段选择弹窗（旧版）
 void ThreeDViewTool::showFieldSelectUI()
 {
   if ( !mWidget )
@@ -72,14 +70,6 @@ void ThreeDViewTool::showFieldSelectUI()
     mUI.setupUi( mWidget );
     mWidget->setWindowTitle( tr( "设置选项" ) );
     mWidget->installEventFilter( this );
-
-    // 修复：如果 UI 里没有 buttonBox，请检查你的 UI 对象名。
-    // 如果你用的是 QPushButton，请改为 connect(mUI.yourButtonName, ...)
-    // 这里暂时注释掉或改为通用的按钮逻辑
-    /*
-        connect( mUI.buttonBox, &QDialogButtonBox::accepted, this, &ThreeDViewTool::confirmSelection );
-        connect( mUI.buttonBox, &QDialogButtonBox::rejected, this, &ThreeDViewTool::cancelSelection );
-        */
   }
 
   mUI.comboBox->clear();
@@ -93,70 +83,37 @@ void ThreeDViewTool::showFieldSelectUI()
   mWidget->show();
 }
 
+// 确认选择：创建内存图层、配置 3D 渲染、绑定信号
 void ThreeDViewTool::confirmSelection()
 {
   if ( !mActiveLayer || !mWidget || !mIface )
     return;
 
   mSelectedHeightField = mUI.comboBox->currentText();
-
   mWidget->hide();
 
-  // =========================
-  // 自动开启原始图层编辑
-  // =========================
   if ( !mActiveLayer->isEditable() )
-  {
     mActiveLayer->startEditing();
-  }
 
-  // =========================
-  // 创建并初始化内存图层
-  // =========================
   if ( !mTempLayer )
   {
-    QString uri = QString(
-                    "PolygonZ?crs=%1&field=original_fid:long"
-    )
-                    .arg(
-                      mActiveLayer->crs().authid()
-                    );
+    QString uri = QString( "PolygonZ?crs=%1&field=original_fid:long" )
+                    .arg( mActiveLayer->crs().authid() );
+    QString tempLayerName = QString( "%1_3Dbuilding" ).arg( mActiveLayer->name() );
+    mTempLayer = new QgsVectorLayer( uri, tempLayerName, "memory" );
 
-    mTempLayer = new QgsVectorLayer(
-      uri,
-      tr( "Internal_Memory_3D" ),
-      "memory"
-    );
+    QgsProject::instance()->addMapLayer( mTempLayer, false );
 
-    // =========================
-    // 注册到工程（但不自动加入图层树）
-    // =========================
-    QgsProject::instance()->addMapLayer(
-      mTempLayer,
-      false
-    );
-
-    // =========================
-    // 插入到原图层下面
-    // =========================
     QgsLayerTree *root = QgsProject::instance()->layerTreeRoot();
-
     QgsLayerTreeLayer *activeNode = root->findLayer( mActiveLayer->id() );
 
     if ( activeNode )
     {
-      QgsLayerTreeGroup *parentGroup = qobject_cast<QgsLayerTreeGroup *>(activeNode->parent());
-
+      QgsLayerTreeGroup *parentGroup = qobject_cast<QgsLayerTreeGroup *>( activeNode->parent() );
       if ( parentGroup )
       {
-        int index = parentGroup->children().indexOf(
-          activeNode
-        );
-
-        parentGroup->insertLayer(
-          index + 1,
-          mTempLayer
-        );
+        int index = parentGroup->children().indexOf( activeNode );
+        parentGroup->insertLayer( index + 1, mTempLayer );
       }
       else
       {
@@ -168,223 +125,83 @@ void ThreeDViewTool::confirmSelection()
       root->addLayer( mTempLayer );
     }
 
-    // =========================
-    // 隐藏图层树节点
-    // =========================
     QgsLayerTreeLayer *treeLayer = root->findLayer( mTempLayer->id() );
-
     if ( treeLayer )
-    {
-      treeLayer->setItemVisibilityChecked( false );
+      treeLayer->setCustomProperty( "nodeHidden", true );
 
-      treeLayer->setCustomProperty(
-        "nodeHidden",
-        true
-      );
-    }
-
-    // =========================
-    // 禁止2D交互
-    // =========================
-    mTempLayer->setFlags(
-      mTempLayer->flags()
-      & ~QgsMapLayer::Identifiable
-    );
-
-    mTempLayer->setFlags(
-      mTempLayer->flags()
-      & ~QgsMapLayer::Searchable
-    );
-
-    // =========================
-    // 禁止2D渲染
-    // =========================
-    mTempLayer->setRenderer(
-      new QgsNullSymbolRenderer()
-    );
-
-    // 完全透明
+    // 禁止 2D 交互与渲染
+    mTempLayer->setFlags( mTempLayer->flags() & ~QgsMapLayer::Identifiable );
+    mTempLayer->setFlags( mTempLayer->flags() & ~QgsMapLayer::Searchable );
+    mTempLayer->setRenderer( new QgsNullSymbolRenderer() );
     mTempLayer->setOpacity( 0.0 );
 
-    // =========================
-    // 3D Renderer
-    // =========================
+    // 配置 3D 渲染器
     QgsPolygon3DSymbol *symbol = new QgsPolygon3DSymbol();
-
-    symbol->setAltitudeClamping(
-      Qgis::AltitudeClamping::Absolute
-    );
-
+    symbol->setAltitudeClamping( Qgis::AltitudeClamping::Absolute );
     QgsVectorLayer3DRenderer *renderer = new QgsVectorLayer3DRenderer();
-
     renderer->setSymbol( symbol );
-
     mTempLayer->setRenderer3D( renderer );
 
-    // =========================
-    // 信号绑定
-    // =========================
-
-    // 几何更新
-    connect(
-      mActiveLayer,
-      &QgsVectorLayer::geometryChanged,
-      this,
-      &ThreeDViewTool::onFeatureUpdated,
-      Qt::UniqueConnection
-    );
-
-    // 属性更新
-    connect(
-      mActiveLayer,
-      &QgsVectorLayer::attributeValueChanged,
-      this,
-      [this](
-        QgsFeatureId fid,
-        int idx,
-        const QVariant &value
-      ) {
-        Q_UNUSED( idx )
-        Q_UNUSED( value )
-
-        onFeatureUpdated( fid );
-      },
-      Qt::UniqueConnection
-    );
-
-    // 删除同步
-    connect(
-      mActiveLayer,
-      &QgsVectorLayer::featuresDeleted,
-      this,
-      &ThreeDViewTool::onFeaturesDeleted,
-      Qt::UniqueConnection
-    );
+    // 绑定同步信号
+    connect( mActiveLayer, &QgsVectorLayer::geometryChanged, this, &ThreeDViewTool::onFeatureUpdated, Qt::UniqueConnection );
+    connect( mActiveLayer, &QgsVectorLayer::attributeValueChanged, this, [this]( QgsFeatureId fid, int idx, const QVariant &value ) {
+                    Q_UNUSED(idx)
+                    Q_UNUSED(value)
+                    onFeatureUpdated(fid); }, Qt::UniqueConnection );
+    connect( mActiveLayer, &QgsVectorLayer::featuresDeleted, this, &ThreeDViewTool::onFeaturesDeleted, Qt::UniqueConnection );
+    connect( mActiveLayer, &QgsVectorLayer::featureAdded, this, &ThreeDViewTool::onFeatureAdded, Qt::UniqueConnection );
   }
 
-  // =========================
-  // 获取或创建3D视图
-  // =========================
+  // 获取或创建 3D 视图
   Qgs3DMapCanvas *activeCanvas3D = mIface->mapCanvases3D().isEmpty()
-                                     ? mIface->createNewMapCanvas3D(
-                                         tr( "3D Preview" )
-                                       )
+                                     ? mIface->createNewMapCanvas3D( tr( "3D Preview" ) )
                                      : mIface->mapCanvases3D().first();
 
   if ( activeCanvas3D )
   {
-    // 显示窗口
-    if ( QWidget *dock = qobject_cast<QWidget *>(
-           activeCanvas3D->parent()
-         ) )
+    if ( QWidget *dock = qobject_cast<QWidget *>( activeCanvas3D->parent() ) )
     {
       dock->show();
       dock->raise();
     }
 
-    // 获取当前3D图层
     Qgs3DMapSettings *settings = activeCanvas3D->mapSettings();
-
     QList<QgsMapLayer *> current3DLayers = settings->layers();
-
-    // 注入临时图层
     if ( !current3DLayers.contains( mTempLayer ) )
     {
       current3DLayers.append( mTempLayer );
-
-      settings->setLayers(
-        current3DLayers
-      );
+      settings->setLayers( current3DLayers );
     }
 
-    // 刷新3D
     if ( QWidget *cv = qobject_cast<QWidget *>( activeCanvas3D ) )
-    {
       cv->update();
-    }
   }
 
-  // =========================
-  // 刷新三维数据
-  // =========================
   refreshMemoryData();
-
-  // =========================
-  // 恢复原始图层为当前图层
-  // =========================
   mIface->setActiveLayer( mActiveLayer );
 }
-// 辅助函数：彻底刷新内存数据
-void ThreeDViewTool::refreshMemoryData()
-{
-  if ( !mTempLayer || !mActiveLayer || mSelectedHeightField.isEmpty() )
-    return;
 
-  mTempLayer->startEditing();
-  mTempLayer->deleteFeatures( mTempLayer->allFeatureIds() );
-
-  QgsFeatureIterator it = mActiveLayer->getFeatures();
-  QgsFeature f;
-  QgsFeatureList allTriangles;
-
-  while ( it.nextFeature( f ) )
-  {
-    double h = f.attribute( mSelectedHeightField ).toDouble();
-    if ( h <= 0 )
-      h = 10.0;
-
-    MeshData mesh = BuildMesh::build( f.geometry(), h );
-    QgsFeatureList triangles = buildBuildingFromMesh( mesh, QMatrix4x4() );
-
-    for ( QgsFeature &tri : triangles )
-    {
-      tri.setAttributes( QgsAttributes() << f.id() ); // 绑定原始 ID
-      allTriangles.append( tri );
-    }
-  }
-
-  mTempLayer->addFeatures( allTriangles );
-  mTempLayer->commitChanges();
-
-  // --- 核心：强制刷新 3D 渲染 ---
-  mTempLayer->triggerRepaint(); // 触发信号
-
-  // 某些版本下 triggerRepaint 对 3D 引擎响应较慢，通过重设图层列表强制刷新
-  for ( Qgs3DMapCanvas *canvas3D : mIface->mapCanvases3D() )
-  {
-    if ( canvas3D && canvas3D->mapSettings() )
-    {
-      QList<QgsMapLayer *> layers = canvas3D->mapSettings()->layers();
-      canvas3D->mapSettings()->setLayers( layers );
-    }
-  }
-}
-
+// 取消选择并提示
 void ThreeDViewTool::cancelSelection()
 {
   if ( mWidget )
   {
-    // 弹出退出提示
     QMessageBox::warning( mWidget, tr( "提示" ), tr( "已取消设置并退出。" ) );
-
     mWidget->hide();
   }
 }
 
+// 事件过滤器：回车确认，ESC取消
 bool ThreeDViewTool::eventFilter( QObject *obj, QEvent *event )
 {
   if ( obj == mWidget && event->type() == QEvent::KeyPress )
   {
     QKeyEvent *ke = static_cast<QKeyEvent *>( event );
-
-    // 回车键 -> 保存并提示
     if ( ke->key() == Qt::Key_Return || ke->key() == Qt::Key_Enter )
     {
       confirmSelection();
       return true;
     }
-
-    // ESC 键 -> 退出并提示 (对应你要求的退出功能)
     if ( ke->key() == Qt::Key_Escape )
     {
       cancelSelection();
@@ -394,40 +211,29 @@ bool ThreeDViewTool::eventFilter( QObject *obj, QEvent *event )
   return QgsMapTool::eventFilter( obj, event );
 }
 
-void ThreeDViewTool::deactivate()
-{
-  if ( mWidget )
-    mWidget->hide();
-  QgsMapTool::deactivate();
-}
-
-// ====================  ====================
+// ==================== 新版 UI（图层 + 字段选择） ====================
+// 初始化设置界面
 void ThreeDViewTool::setupUI()
 {
   if ( !mWidget )
   {
     mWidget = new QWidget();
     mUI.setupUi( mWidget );
-
-    // 信号槽连接：切换图层时自动刷新字段
     connect( mUI.layercomboBox, QOverload<int>::of( &QComboBox::currentIndexChanged ), this, &ThreeDViewTool::onLayerChanged );
-
-    // 事件过滤器：捕获回车键执行后续计算
     mWidget->installEventFilter( this );
   }
 
-  // 填充图层列表
   refreshLayerList();
   mWidget->show();
 }
 
+// 刷新图层列表（仅显示面图层）
 void ThreeDViewTool::refreshLayerList()
 {
   mUI.layercomboBox->blockSignals( true );
   mUI.layercomboBox->clear();
   mUI.layercomboBox->addItem( "请选择矢量图层...", QVariant() );
 
-  // 遍历项目图层，只添加面图层
   auto layers = QgsProject::instance()->mapLayers().values();
   for ( QgsMapLayer *layer : layers )
   {
@@ -435,14 +241,13 @@ void ThreeDViewTool::refreshLayerList()
     {
       QgsVectorLayer *vlyr = qobject_cast<QgsVectorLayer *>( layer );
       if ( vlyr && vlyr->geometryType() == Qgis::GeometryType::Polygon )
-      {
         mUI.layercomboBox->addItem( vlyr->name(), vlyr->id() );
-      }
     }
   }
   mUI.layercomboBox->blockSignals( false );
 }
 
+// 图层切换时刷新字段列表
 void ThreeDViewTool::onLayerChanged( int index )
 {
   if ( index <= 0 )
@@ -452,14 +257,12 @@ void ThreeDViewTool::onLayerChanged( int index )
     return;
   }
 
-  // 获取选中的图层 ID
   QString layerId = mUI.layercomboBox->currentData().toString();
   mActiveLayer = qobject_cast<QgsVectorLayer *>( QgsProject::instance()->mapLayer( layerId ) );
-
-  // 刷新字段 ComboBox
   updateFieldsCombo();
 }
 
+// 更新高度字段下拉（仅数值字段）
 void ThreeDViewTool::updateFieldsCombo()
 {
   mUI.comboBox->clear();
@@ -467,31 +270,25 @@ void ThreeDViewTool::updateFieldsCombo()
     return;
 
   mUI.comboBox->addItem( "请选择高度字段..." );
-
-  // 获取图层的所有字段
   const QgsFields &fields = mActiveLayer->fields();
   for ( const QgsField &field : fields )
   {
-    // 只添加数值类型的字段作为高度源
     if ( field.isNumeric() )
-    {
       mUI.comboBox->addItem( field.name() );
-    }
   }
 }
-// ====================  ====================
+
+// ==================== 几何辅助函数 ====================
 static double cross2D( const QgsPointXY &a, const QgsPointXY &b, const QgsPointXY &c )
 {
   return ( b.x() - a.x() ) * ( c.y() - a.y() ) - ( b.y() - a.y() ) * ( c.x() - a.x() );
 }
 
-static bool pointInTriangle(const QgsPointXY &p,const QgsPointXY &a,const QgsPointXY &b,const QgsPointXY &c)
+static bool pointInTriangle( const QgsPointXY &p, const QgsPointXY &a, const QgsPointXY &b, const QgsPointXY &c )
 {
   double c1 = cross2D( a, b, p );
   double c2 = cross2D( b, c, p );
   double c3 = cross2D( c, a, p );
-
-  // ⚠️ 必须严格 > 0
   return ( c1 > 0 && c2 > 0 && c3 > 0 );
 }
 
@@ -500,7 +297,7 @@ static bool isConvex( const QgsPointXY &prev, const QgsPointXY &curr, const QgsP
   return cross2D( prev, curr, next ) > 0;
 }
 
-// ⭐ 核心：增强版耳切法
+// 耳切法三角剖分
 static QVector<int> earClipping( const QVector<QgsPointXY> &pts )
 {
   QVector<int> result;
@@ -510,51 +307,43 @@ static QVector<int> earClipping( const QVector<QgsPointXY> &pts )
 
   QVector<int> V;
   V.reserve( n );
-
   for ( int i = 0; i < n; ++i )
     V.push_back( i );
 
   while ( V.size() > 3 )
   {
     bool earFound = false;
-
     for ( int i = 0; i < V.size(); ++i )
     {
       int prev = V[( i - 1 + V.size() ) % V.size()];
       int curr = V[i];
       int next = V[( i + 1 ) % V.size()];
 
-      // 1. 必须是凸点
       if ( !isConvex( pts[prev], pts[curr], pts[next] ) )
         continue;
 
-      // 2. 检查是否有点在三角形内
       bool hasInside = false;
       for ( int j = 0; j < V.size(); ++j )
       {
         int vi = V[j];
         if ( vi == prev || vi == curr || vi == next )
           continue;
-
         if ( pointInTriangle( pts[vi], pts[prev], pts[curr], pts[next] ) )
         {
           hasInside = true;
           break;
         }
       }
-
       if ( hasInside )
         continue;
 
-      // ✔ 找到耳朵
       result << prev << curr << next;
       V.removeAt( i );
       earFound = true;
       break;
     }
-
     if ( !earFound )
-      break; // 防死循环
+      break;
   }
 
   if ( V.size() == 3 )
@@ -563,7 +352,8 @@ static QVector<int> earClipping( const QVector<QgsPointXY> &pts )
   return result;
 }
 
-// ==================== 核心 ====================
+// ==================== 3D 模型构建 ====================
+// 将网格数据转换为 QgsFeature 列表
 QgsFeatureList ThreeDViewTool::buildBuildingFromMesh( const MeshData &mesh, const QMatrix4x4 &mat )
 {
   QgsFeatureList features;
@@ -571,14 +361,10 @@ QgsFeatureList ThreeDViewTool::buildBuildingFromMesh( const MeshData &mesh, cons
 
   for ( int i = 0; i < triCount; i++ )
   {
-    // 从 mesh 中获取双精度点
     QgsPoint p0 = mesh.vertices[mesh.indices[i * 3]];
     QgsPoint p1 = mesh.vertices[mesh.indices[i * 3 + 1]];
     QgsPoint p2 = mesh.vertices[mesh.indices[i * 3 + 2]];
 
-    // 如果需要应用矩阵变换 (注意：QMatrix4x4 内部也是 float)
-    // 如果只是平移/旋转地理坐标，建议手动处理 double 变换
-    // 这里演示直接构建，保持最高精度
     std::unique_ptr<QgsPolygon> poly( new QgsPolygon() );
     std::unique_ptr<QgsLineString> ring( new QgsLineString() );
 
@@ -595,6 +381,7 @@ QgsFeatureList ThreeDViewTool::buildBuildingFromMesh( const MeshData &mesh, cons
   return features;
 }
 
+// 备用三角测试函数（使用 QVector3D）
 static bool isPointInTriangle( const QVector3D &a, const QVector3D &b, const QVector3D &c, const QVector3D &p )
 {
   float v0x = c.x() - a.x(), v0y = c.y() - a.y();
@@ -611,6 +398,8 @@ static bool isPointInTriangle( const QVector3D &a, const QVector3D &b, const QVe
   return ( u >= 0 ) && ( v >= 0 ) && ( u + v < 1 );
 }
 
+// ==================== BuildMesh::build ====================
+// 根据多边形构建带高度的立体网格
 MeshData BuildMesh::build( const QgsGeometry &geom, double height )
 {
   MeshData mesh;
@@ -619,7 +408,6 @@ MeshData BuildMesh::build( const QgsGeometry &geom, double height )
 
   double h = ( height <= 0 ? 3.0 : height );
 
-  // 1. 获取并清理几何体
   QgsGeometry inputGeom = geom.convertToType( Qgis::GeometryType::Polygon );
   const QgsPolygon *poly = qgsgeometry_cast<const QgsPolygon *>( inputGeom.constGet() );
   if ( !poly || !poly->exteriorRing() )
@@ -628,8 +416,6 @@ MeshData BuildMesh::build( const QgsGeometry &geom, double height )
   const QgsCurve *ring = poly->exteriorRing();
   QVector<QgsPointXY> polyPts;
 
-
-  // 2. 提取点：直接使用 double 存储
   for ( int i = 0; i < ring->numPoints() - 1; ++i )
   {
     QgsPoint p;
@@ -638,7 +424,7 @@ MeshData BuildMesh::build( const QgsGeometry &geom, double height )
     polyPts.push_back( QgsPointXY( p.x(), p.y() ) );
   }
 
-  // 3. 保证 CCW
+  // 保证逆时针顺序
   double area = 0;
   for ( int i = 0; i < polyPts.size(); ++i )
   {
@@ -651,15 +437,14 @@ MeshData BuildMesh::build( const QgsGeometry &geom, double height )
 
   int base = polyPts.size();
 
-  // 4. 顶点生成：使用 QgsPoint(x, y, z) 保持 double 精度
-  // 这样就不会像 QVector3D (float) 那样产生微小偏移
+  // 顶点生成（底面 0 + 顶面 h）
   for ( const QgsPointXY &p : polyPts )
   {
-    mesh.vertices.append( QgsPoint( p.x(), p.y(), 0.0 ) ); // 底点
-    mesh.vertices.append( QgsPoint( p.x(), p.y(), h ) );   // 顶点
+    mesh.vertices.append( QgsPoint( p.x(), p.y(), 0.0 ) );
+    mesh.vertices.append( QgsPoint( p.x(), p.y(), h ) );
   }
 
-  // 5. 侧面索引生成
+  // 侧面索引
   for ( int i = 0; i < base; ++i )
   {
     int next = ( i + 1 ) % base;
@@ -667,7 +452,7 @@ MeshData BuildMesh::build( const QgsGeometry &geom, double height )
     mesh.indices << 2 * i + 1 << 2 * next << 2 * next + 1;
   }
 
-  // 6. Ear Clipping
+  // 耳切法剖分顶面和底面
   auto pointInTri = [&]( const QgsPointXY &p, const QgsPointXY &a, const QgsPointXY &b, const QgsPointXY &c ) {
     double c1 = ( b.x() - a.x() ) * ( p.y() - a.y() ) - ( b.y() - a.y() ) * ( p.x() - a.x() );
     double c2 = ( c.x() - b.x() ) * ( p.y() - b.y() ) - ( c.y() - b.y() ) * ( p.x() - b.x() );
@@ -684,12 +469,14 @@ MeshData BuildMesh::build( const QgsGeometry &geom, double height )
     bool earFound = false;
     for ( int i = 0; i < V.size(); ++i )
     {
-      int p_idx = V[( i - 1 + V.size() ) % V.size()], c_idx = V[i], n_idx = V[( i + 1 ) % V.size()];
+      int p_idx = V[( i - 1 + V.size() ) % V.size()];
+      int c_idx = V[i];
+      int n_idx = V[( i + 1 ) % V.size()];
       const QgsPointXY &p1 = polyPts[p_idx], &p2 = polyPts[c_idx], &p3 = polyPts[n_idx];
 
       double cp = ( p2.x() - p1.x() ) * ( p3.y() - p1.y() ) - ( p2.y() - p1.y() ) * ( p3.x() - p1.x() );
       if ( cp <= 0 )
-        continue; // 凹点跳过
+        continue;
 
       bool hasInside = false;
       for ( int j = 0; j < V.size(); ++j )
@@ -725,34 +512,28 @@ MeshData BuildMesh::build( const QgsGeometry &geom, double height )
   return mesh;
 }
 
+// ==================== 数据同步 ====================
+// 根据原始要素更新其对应的 3D 模型
 void ThreeDViewTool::updateFeature3D( const QgsFeature &originFeat )
 {
   if ( !mTempLayer )
     return;
 
-  // 计算高度
   double h = originFeat.attribute( mSelectedHeightField ).toDouble();
   if ( h <= 0 )
-    h = 5.0; // 默认高度
+    h = 5.0;
 
-  // 生成网格
   MeshData mesh = BuildMesh::build( originFeat.geometry(), h );
   if ( mesh.isEmpty() )
     return;
 
-  // 将网格转为 3D 三角形 Feature 列表
   QgsFeatureList newTriangles = buildBuildingFromMesh( mesh, QMatrix4x4() );
-
-  // 标记归属 ID
   for ( QgsFeature &tri : newTriangles )
-  {
     tri.setAttributes( QgsAttributes() << originFeat.id() );
-  }
 
-  // 更新内存图层 (参考代码增删逻辑)
   mTempLayer->startEditing();
 
-  // 根据 original_fid 删除该要素旧的 3D 模型
+  // 删除该要素旧三角形
   QgsFeatureRequest request;
   request.setFilterExpression( QString( "original_fid = %1" ).arg( originFeat.id() ) );
   QgsFeatureIterator it = mTempLayer->getFeatures( request );
@@ -760,28 +541,22 @@ void ThreeDViewTool::updateFeature3D( const QgsFeature &originFeat )
   QgsFeatureIds toDelete;
   while ( it.nextFeature( f ) )
     toDelete << f.id();
-
   mTempLayer->deleteFeatures( toDelete );
+
   mTempLayer->addFeatures( newTriangles );
-
   mTempLayer->commitChanges();
-
-  // 重要：确保 3D 视图意识到数据变了
   mTempLayer->triggerRepaint();
 }
 
-
+// 响应要素几何/属性变更
 void ThreeDViewTool::onFeatureUpdated( QgsFeatureId fid )
 {
-  // 获取最新的原图层要素
   QgsFeature originFeat;
   if ( mActiveLayer->getFeatures( QgsFeatureRequest( fid ) ).nextFeature( originFeat ) )
-  {
     updateFeature3D( originFeat );
-  }
 }
 
-
+// 响应要素删除
 void ThreeDViewTool::onFeaturesDeleted( const QgsFeatureIds &fids )
 {
   if ( !mTempLayer )
@@ -803,4 +578,57 @@ void ThreeDViewTool::onFeaturesDeleted( const QgsFeatureIds &fids )
   mTempLayer->triggerRepaint();
 }
 
+// 响应新增要素
+void ThreeDViewTool::onFeatureAdded( QgsFeatureId fid )
+{
+  if ( !mActiveLayer )
+    return;
 
+  QgsFeature feat;
+  if ( mActiveLayer->getFeatures( QgsFeatureRequest( fid ) ).nextFeature( feat ) )
+    updateFeature3D( feat );
+}
+
+// 完全重建内存图层数据
+void ThreeDViewTool::refreshMemoryData()
+{
+  if ( !mTempLayer || !mActiveLayer || mSelectedHeightField.isEmpty() )
+    return;
+
+  mTempLayer->startEditing();
+  mTempLayer->deleteFeatures( mTempLayer->allFeatureIds() );
+
+  QgsFeatureIterator it = mActiveLayer->getFeatures();
+  QgsFeature f;
+  QgsFeatureList allTriangles;
+
+  while ( it.nextFeature( f ) )
+  {
+    double h = f.attribute( mSelectedHeightField ).toDouble();
+    if ( h <= 0 )
+      h = 10.0;
+
+    MeshData mesh = BuildMesh::build( f.geometry(), h );
+    QgsFeatureList triangles = buildBuildingFromMesh( mesh, QMatrix4x4() );
+
+    for ( QgsFeature &tri : triangles )
+    {
+      tri.setAttributes( QgsAttributes() << f.id() );
+      allTriangles.append( tri );
+    }
+  }
+
+  mTempLayer->addFeatures( allTriangles );
+  mTempLayer->commitChanges();
+  mTempLayer->triggerRepaint();
+
+  // 强制刷新 3D 视图
+  for ( Qgs3DMapCanvas *canvas3D : mIface->mapCanvases3D() )
+  {
+    if ( canvas3D && canvas3D->mapSettings() )
+    {
+      QList<QgsMapLayer *> layers = canvas3D->mapSettings()->layers();
+      canvas3D->mapSettings()->setLayers( layers );
+    }
+  }
+}

@@ -221,7 +221,6 @@ void HeightEditTool::showSelectedAttributes()
 
     mUI.horizontalSlider->setMinimum( 0 );
     mUI.horizontalSlider->setMaximum( 5000 );
-    mUI.horizontalSlider->setValue( 2500 );
   }
 
   // 填充 comboBox 字段
@@ -262,12 +261,13 @@ void HeightEditTool::showSelectedAttributes()
   }
 
   table->blockSignals( false );
+  initSliderCache();
   mWidget->show();
   mWidget->raise();
   mWidget->activateWindow();
 
   // ---------------- cellChanged 连接槽 ----------------
-  connect( table, &QTableWidget::cellChanged, this, &HeightEditTool::onCellChanged );
+  connect(table,&QTableWidget::cellChanged,this,&HeightEditTool::onCellChanged,Qt::UniqueConnection);
 }
 
 // ---------------- 初始化滑块缓存 ----------------
