@@ -3,6 +3,7 @@
 #include "threedviewtool.h"
 #include "pointedit.h"
 #include "createtool.h"
+#include "view.h"
 
 #include <QIcon>
 #include <QMenu>
@@ -66,8 +67,6 @@ void BuildingEditManager::initGui()
   );
 
   // =========================================================
-
-  // =========================================================
   // 【新增】点编辑工具
   // =========================================================
   mPointEditAction = new QAction( tr( "点编辑" ), this );
@@ -85,11 +84,7 @@ void BuildingEditManager::initGui()
   // =========================================================
   // 【新增】：新建/加点工具 (CreateTool)
   // =========================================================
-<<<<<<< HEAD
   mCreateToolAction = new QAction( tr( "新建/加点" ), this );
-=======
-  mCreateToolAction = new QAction( tr( "新建/加点" ), this ); 
->>>>>>> f644786332709f1cc37fdca583a1742748c8ba08
   mCreateToolAction->setCheckable( true );
   mMenu->addAction( mCreateToolAction );
 
@@ -102,6 +97,22 @@ void BuildingEditManager::initGui()
 
   mIface->addToolBarIcon( mMainAction );
   mIface->addPluginToMenu( tr( "Building Edit Manager" ), mMainAction );
+
+  // =========================================================
+  // 【新增】：侧视图工具
+  // =========================================================
+
+  mViewAction = new QAction( tr( "侧视图" ), this );
+  mViewAction->setCheckable( true );
+
+  mMenu->addAction( mViewAction );
+
+  connect(
+    mViewAction,
+    &QAction::toggled,
+    this,
+    &BuildingEditManager::activateView
+  );
 }
 
 void BuildingEditManager::unload()
@@ -251,6 +262,53 @@ void BuildingEditManager::activateCreateTool( bool checked )
   mInternalSwitch = false;
 }
 
+// ========================================================================
+// 激活侧视图工具
+// ========================================================================
+
+void BuildingEditManager::activateView( bool checked )
+{
+  if ( mInternalSwitch )
+    return;
+
+  mInternalSwitch = true;
+
+  if ( checked )
+  {
+    if ( mHeightEditAction && mHeightEditAction->isChecked() )
+      mHeightEditAction->setChecked( false );
+
+    if ( mThreeDViewAction && mThreeDViewAction->isChecked() )
+      mThreeDViewAction->setChecked( false );
+
+    if ( mPointEditAction && mPointEditAction->isChecked() )
+      mPointEditAction->setChecked( false );
+
+    if ( mCreateToolAction && mCreateToolAction->isChecked() )
+      mCreateToolAction->setChecked( false );
+
+    if ( !mViewTool )
+    {
+      mViewTool = new View(
+        mIface->mapCanvas(),
+        mIface
+      );
+    }
+
+    mIface->mapCanvas()->setMapTool(
+      mViewTool
+    );
+  }
+  else
+  {
+    if ( mViewTool )
+      mIface->mapCanvas()->unsetMapTool(
+        mViewTool
+      );
+  }
+
+  mInternalSwitch = false;
+}
 // ========================================================================
 // C 接口导出
 // ========================================================================

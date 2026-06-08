@@ -12,6 +12,7 @@ set(buildingeditmanager_SRCS
   threedviewtool.cpp
   pointedit.cpp
   createtool.cpp
+  view.cpp
 )
 
 ########################################################

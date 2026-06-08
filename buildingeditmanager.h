@@ -12,6 +12,7 @@ class HeightEditTool;
 class ThreeDViewTool;
 class PointEdit;
 class CreateTool;
+class View;
 class BuildingEditManager : public QObject, public QgisPlugin
 {
     Q_OBJECT
@@ -28,6 +29,7 @@ class BuildingEditManager : public QObject, public QgisPlugin
     void activateThreeDView( bool checked );
     void activatePointEdit( bool checked );
     void activateCreateTool( bool checked );
+    void activateView( bool checked );
 
   private:
     QgisInterface *mIface = nullptr;
@@ -46,6 +48,9 @@ class BuildingEditManager : public QObject, public QgisPlugin
 
     QAction *mCreateToolAction = nullptr;
     CreateTool *mCreateTool = nullptr;
+
+    QAction *mViewAction = nullptr;
+    View *mViewTool = nullptr;
 
     bool mInternalSwitch = false;
 };

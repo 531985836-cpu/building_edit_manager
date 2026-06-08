@@ -1,16 +1,18 @@
 #pragma once
 
 #include <qgsmaptool.h>
-#include <qgsrubberband.h> 
-#include <qgsfeature.h> 
+#include <qgsrubberband.h>
+#include <qgsfeature.h>
 #include <QWidget>
-#include <QPoint> 
+#include <QPoint>
 #include <QMatrix4x4>
 
 #include "ui_threedview.h"
 
 class QgsVectorLayer;
+class QgsMapLayer;
 class QgsMapCanvas;
+class QgsPointCloudLayer;
 class QgisInterface;
 
 struct MeshData
@@ -24,16 +26,6 @@ class BuildMesh
 {
   public:
     static MeshData build( const QgsGeometry &geom, double height );
-};
-
-/**
- * @brief 按照参考代码逻辑定义的网格数据结构
- */
-struct MeshData
-{
-    QVector<QVector3D> vertices;
-    QVector<int> indices;
-    bool isEmpty() const { return vertices.isEmpty() || indices.isEmpty(); }
 };
 
 class ThreeDViewTool : public QgsMapTool
@@ -60,28 +52,21 @@ class ThreeDViewTool : public QgsMapTool
     void confirmSelection();
     void cancelSelection();
 
-<<<<<<< HEAD
     // 3D 构建与同步
-=======
-<<<<<<< HEAD
->>>>>>> 63dd1b9f77ae99b3223420186805982d8863bfd5
     void updateFeature3D( const QgsFeature &originFeat );
     void refreshMemoryData();
     QgsFeatureList buildBuildingFromMesh( const MeshData &mesh, const QMatrix4x4 &mat );
+    void ensureLayerIn3DView( QgsMapLayer *layer );
+    void addLoadedPointCloudLayersTo3DView();
+    void configurePointCloud3DRenderer( QgsPointCloudLayer *layer );
 
   private slots:
-<<<<<<< HEAD
+    void addVectorData();
+    void addPointCloudData();
     void onFeatureUpdated( QgsFeatureId fid );
     void onFeaturesDeleted( const QgsFeatureIds &fids );
     void onLayerChanged( int index );
     void onFeatureAdded( QgsFeatureId fid );
-=======
-    void onFeatureUpdated( QgsFeatureId fid );           // 监听几何/属性修改
-    void onFeaturesDeleted( const QgsFeatureIds &fids ); // 监听删除
-=======
-    QgsFeatureList buildBuildingFromMesh( const MeshData &mesh, const QMatrix4x4 &mat );
->>>>>>> f644786332709f1cc37fdca583a1742748c8ba08
->>>>>>> 63dd1b9f77ae99b3223420186805982d8863bfd5
 
   private:
     // UI 成员
@@ -103,17 +88,6 @@ class ThreeDViewTool : public QgsMapTool
     QgsPointXY mStartPoint;
     QPoint mStartScreenPoint;
 
-<<<<<<< HEAD
     // 存储映射
     QMap<QString, QgsVectorLayer *> mTempLayersMap;
-=======
-    // UI 成员
-    QWidget *mWidget = nullptr;
-    Ui::threedview mUI;
-<<<<<<< HEAD
-
-    QgisInterface *mIface = nullptr;
-=======
->>>>>>> f644786332709f1cc37fdca583a1742748c8ba08
->>>>>>> 63dd1b9f77ae99b3223420186805982d8863bfd5
 };

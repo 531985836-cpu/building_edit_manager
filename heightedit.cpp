@@ -34,7 +34,6 @@ HeightEditTool::HeightEditTool( QgsMapCanvas *canvas )
     qDebug() << "[HeightEditTool] No editable layer found.";
     return;
   }
-
 }
 
 HeightEditTool::~HeightEditTool()
@@ -267,7 +266,7 @@ void HeightEditTool::showSelectedAttributes()
   mWidget->activateWindow();
 
   // ---------------- cellChanged 连接槽 ----------------
-  connect(table,&QTableWidget::cellChanged,this,&HeightEditTool::onCellChanged,Qt::UniqueConnection);
+  connect( table, &QTableWidget::cellChanged, this, &HeightEditTool::onCellChanged, Qt::UniqueConnection );
 }
 
 // ---------------- 初始化滑块缓存 ----------------

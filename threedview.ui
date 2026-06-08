@@ -6,58 +6,82 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>456</width>
-    <height>261</height>
+    <width>233</width>
+    <height>175</height>
    </rect>
   </property>
   <property name="windowTitle">
-   <string>选择字段</string>
+   <string>三维视图</string>
   </property>
   <layout class="QVBoxLayout" name="verticalLayout">
    <item>
-    <spacer name="verticalSpacer">
-     <property name="orientation">
-      <enum>Qt::Vertical</enum>
+    <widget class="QGroupBox" name="adddata">
+     <property name="title">
+      <string>加载数据</string>
      </property>
-     <property name="sizeHint" stdset="0">
-      <size>
-       <width>20</width>
-       <height>82</height>
-      </size>
-     </property>
-    </spacer>
-   </item>
-   <item>
-    <widget class="QComboBox" name="layercomboBox"/>
-   </item>
-   <item>
-    <widget class="QComboBox" name="comboBox"/>
-   </item>
-   <item>
-    <widget class="QLabel" name="labelTip">
-     <property name="styleSheet">
-      <string notr="true">color: gray; font-style: italic;</string>
-     </property>
-     <property name="lineWidth">
-      <number>1</number>
-     </property>
-     <property name="text">
-      <string>提示：请选择图层以及作为高度渲染的字段，选择完成后回车构建三维视图</string>
-     </property>
+     <layout class="QFormLayout" name="formLayout">
+      <item row="0" column="0">
+       <layout class="QHBoxLayout" name="horizontalLayout">
+        <item>
+         <widget class="QPushButton" name="addvector">
+          <property name="text">
+           <string>加载矢量数据</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QPushButton" name="addpointwould">
+          <property name="text">
+           <string>加载点云数据</string>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+     </layout>
     </widget>
    </item>
    <item>
-    <spacer name="verticalSpacer_2">
-     <property name="orientation">
-      <enum>Qt::Vertical</enum>
+    <widget class="QGroupBox" name="threeview">
+     <property name="title">
+      <string>三维视图</string>
      </property>
-     <property name="sizeHint" stdset="0">
-      <size>
-       <width>20</width>
-       <height>81</height>
-      </size>
-     </property>
-    </spacer>
+     <layout class="QFormLayout" name="formLayout_2">
+      <item row="0" column="0">
+       <widget class="QLabel" name="layerlabel">
+        <property name="text">
+         <string>图层</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1">
+       <widget class="QComboBox" name="layercomboBox"/>
+      </item>
+      <item row="1" column="0">
+       <widget class="QLabel" name="label">
+        <property name="text">
+         <string>渲染字段</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1">
+       <widget class="QComboBox" name="comboBox"/>
+      </item>
+      <item row="2" column="0" colspan="2">
+       <widget class="QLabel" name="labelTip">
+        <property name="styleSheet">
+         <string notr="true">color: gray; font-style: italic;</string>
+        </property>
+        <property name="lineWidth">
+         <number>1</number>
+        </property>
+        <property name="text">
+         <string>提示：选择完成后回车构建三维视图</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
    </item>
   </layout>
  </widget>

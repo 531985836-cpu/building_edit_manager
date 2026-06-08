@@ -311,11 +311,7 @@ void CreateTool::canvasPressEvent( QgsMapMouseEvent *e )
       if ( sqrDist >= 0 && sqrDist < sqrSplitTol )
       {
         mTargetFeatureId = selFeat.id();
-<<<<<<< HEAD
         mSplitStartPoint = snapPoint;
-=======
-        mSplitStartPoint = snapPoint; 
->>>>>>> f644786332709f1cc37fdca583a1742748c8ba08
         mIsSplitting = true;
 
         if ( mSplitLineBand )
@@ -324,11 +320,7 @@ void CreateTool::canvasPressEvent( QgsMapMouseEvent *e )
           mSplitLineBand->addPoint( mSplitStartPoint );
           mSplitLineBand->addPoint( mSplitStartPoint );
         }
-<<<<<<< HEAD
         return;
-=======
-        return; 
->>>>>>> f644786332709f1cc37fdca583a1742748c8ba08
       }
     }
   }
@@ -1083,11 +1075,7 @@ void CreateTool::performSplit( const QgsPointXY &snapEnd )
   if ( len < 1e-6 )
     return;
 
-<<<<<<< HEAD
   // 动态延伸量
-=======
-// 动态延伸量
->>>>>>> f644786332709f1cc37fdca583a1742748c8ba08
   double pixelOffset = mCanvas->mapUnitsPerPixel() * 50.0;
   double offset = std::max( pixelOffset, 0.1 );
 
@@ -1181,5 +1169,5 @@ void CreateTool::refresh3DView()
     mVectorLayer->triggerRepaint();
   }
 
-QgsProject::instance()->layerTreeRoot()->findLayer( mVectorLayer->id() )->setItemVisibilityChecked( true );
+  QgsProject::instance()->layerTreeRoot()->findLayer( mVectorLayer->id() )->setItemVisibilityChecked( true );
 }
