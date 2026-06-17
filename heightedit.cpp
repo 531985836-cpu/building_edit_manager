@@ -1,4 +1,5 @@
 #include "heightedit.h"
+#include "buildingeditpreviewbus.h"
 #include <qgsvectorlayer.h>
 #include <qgsproject.h>
 #include <qgsfeatureiterator.h>
@@ -8,12 +9,22 @@
 #include <qgsmapmouseevent.h>
 #include <QDebug>
 #include <QMessageBox>
+#include <QWheelEvent>
+#include <QApplication>
+#include <algorithm>
+#include <cmath>
 
 HeightEditTool::HeightEditTool( QgsMapCanvas *canvas )
   : QgsMapTool( canvas )
 {
   setCursor( Qt::CrossCursor );
   createRubberBand();
+
+  mSliderUpdateTimer = new QTimer( this );
+  mSliderUpdateTimer->setSingleShot( true );
+  mSliderUpdateTimer->setInterval( 33 );
+  connect( mSliderUpdateTimer, &QTimer::timeout, this, &HeightEditTool::flushPendingSliderValue );
+  qApp->installEventFilter( this );
 
   mActiveLayer = nullptr;
 
@@ -24,6 +35,13 @@ HeightEditTool::HeightEditTool( QgsMapCanvas *canvas )
     if ( layer && layer->isEditable() )
     {
       mActiveLayer = layer;
+      connect( layer, &QObject::destroyed, this, [this]() {
+        mActiveLayer = nullptr;
+        mInitialFieldValues.clear();
+        mHasPendingSliderValue = false;
+        if ( mWidget )
+          mWidget->hide();
+      } );
       break;
     }
   }
@@ -38,7 +56,23 @@ HeightEditTool::HeightEditTool( QgsMapCanvas *canvas )
 
 HeightEditTool::~HeightEditTool()
 {
+  cancelHeightPreview();
+  if ( mWidget )
+  {
+    mWidget->removeEventFilter( this );
+    mWidget->deleteLater();
+    mWidget = nullptr;
+  }
+  qApp->removeEventFilter( this );
   clearRubberBand();
+}
+
+void HeightEditTool::deactivate()
+{
+  cancelHeightPreview();
+  if ( mWidget )
+    mWidget->hide();
+  QgsMapTool::deactivate();
 }
 
 // ---------------- 鼠标选择 ----------------
@@ -104,6 +138,14 @@ void HeightEditTool::keyReleaseEvent( QKeyEvent *e )
   if ( e->key() == Qt::Key_Shift )
     mShiftPressed = false;
   QgsMapTool::keyReleaseEvent( e );
+}
+
+void HeightEditTool::wheelEvent( QWheelEvent *e )
+{
+  if ( adjustHeightByWheel( e ) )
+    return;
+
+  QgsMapTool::wheelEvent( e );
 }
 
 // ---------------- 选择逻辑 ----------------
@@ -198,6 +240,9 @@ void HeightEditTool::showSelectedAttributes()
   if ( !mActiveLayer || !mActiveLayer->isEditable() )
     return;
 
+  if ( mHasPreviewHeight )
+    cancelHeightPreview();
+
   const QgsFeatureIds &fids = mActiveLayer->selectedFeatureIds();
   if ( fids.isEmpty() )
     return;
@@ -211,9 +256,26 @@ void HeightEditTool::showSelectedAttributes()
 
     // 滑块实时修改
     connect( mUI.horizontalSlider, &QSlider::valueChanged, this, &HeightEditTool::onSliderChanged );
+    connect( mUI.saveButton, &QPushButton::clicked, this, &HeightEditTool::saveHeightPreview );
+
+    mUI.radioButton01x->setAutoExclusive( false );
+    mUI.radioButton1x->setAutoExclusive( false );
+    mUI.radioButton_3->setAutoExclusive( false );
+
+    connect( mUI.radioButton01x, &QRadioButton::clicked, this, [this]( bool checked ) {
+      setWheelStep( checked ? 0.1 : 0.0 );
+    } );
+    connect( mUI.radioButton1x, &QRadioButton::clicked, this, [this]( bool checked ) {
+      setWheelStep( checked ? 1.0 : 0.0 );
+    } );
+    connect( mUI.radioButton_3, &QRadioButton::clicked, this, [this]( bool checked ) {
+      setWheelStep( checked ? 5.0 : 0.0 );
+    } );
 
     // comboBox字段选择
     connect( mUI.comboBox, &QComboBox::currentTextChanged, this, [this]( const QString &field ) {
+      if ( mHasPreviewHeight )
+        cancelHeightPreview();
       mHeightFieldName = field;
       initSliderCache(); // 重新缓存选中要素
     } );
@@ -319,10 +381,16 @@ void HeightEditTool::initSliderCache()
 // ---------------- 滑块修改 ----------------
 void HeightEditTool::onSliderChanged( int value )
 {
-  if ( !mActiveLayer || !mActiveLayer->isEditable() || mInitialFieldValues.isEmpty() )
+  if ( !mWidget || !mActiveLayer || !mActiveLayer->isEditable() || mInitialFieldValues.isEmpty() )
     return;
 
-  double heightValue = value / SLIDER_SCALE;
+  previewHeightValue( value / SLIDER_SCALE );
+}
+
+void HeightEditTool::updateHeightColumnText( double heightValue )
+{
+  if ( !mWidget || !mActiveLayer || mInitialFieldValues.isEmpty() )
+    return;
 
   int idx = mActiveLayer->fields().indexOf( mHeightFieldName );
   if ( idx < 0 )
@@ -333,15 +401,6 @@ void HeightEditTool::onSliderChanged( int value )
   int row = 0;
   for ( auto it = mInitialFieldValues.begin(); it != mInitialFieldValues.end(); ++it, ++row )
   {
-    QgsFeatureId fid = it.key();
-
-    QgsFeature feat;
-    if ( mActiveLayer->getFeatures( QgsFeatureRequest( fid ) ).nextFeature( feat ) )
-    {
-      feat.setAttribute( idx, heightValue );
-      mActiveLayer->updateFeature( feat );
-    }
-
     auto *item = mUI.tableProperties->item( row, idx );
     if ( item )
       item->setText( QString::number( heightValue, 'f', 1 ) );
@@ -350,17 +409,154 @@ void HeightEditTool::onSliderChanged( int value )
   mUI.tableProperties->blockSignals( false );
 }
 
+void HeightEditTool::previewHeightValue( double heightValue )
+{
+  if ( !mWidget || !mActiveLayer || !mActiveLayer->isEditable() || mInitialFieldValues.isEmpty() )
+    return;
+
+  mPreviewHeight = heightValue;
+  mHasPreviewHeight = true;
+  mPendingSliderValue = static_cast<int>( std::round( heightValue * SLIDER_SCALE ) );
+  mHasPendingSliderValue = true;
+
+  updateHeightColumnText( heightValue );
+
+  emit BuildingEditPreviewBus::instance()->heightPreviewChanged(
+    mActiveLayer.data(),
+    mInitialFieldValues.keys().toSet(),
+    mHeightFieldName,
+    heightValue
+  );
+}
+
+void HeightEditTool::applySliderValueToLayer( double heightValue )
+{
+  if ( !mActiveLayer || !mActiveLayer->isEditable() || mInitialFieldValues.isEmpty() )
+    return;
+
+  const int idx = mActiveLayer->fields().indexOf( mHeightFieldName );
+  if ( idx < 0 )
+    return;
+
+  for ( auto it = mInitialFieldValues.begin(); it != mInitialFieldValues.end(); ++it )
+  {
+    QgsFeature feat;
+    if ( mActiveLayer->getFeatures( QgsFeatureRequest( it.key() ) ).nextFeature( feat ) )
+    {
+      feat.setAttribute( idx, heightValue );
+      mActiveLayer->updateFeature( feat );
+    }
+  }
+
+  mActiveLayer->triggerRepaint();
+}
+
+void HeightEditTool::flushPendingSliderValue()
+{
+  mHasPendingSliderValue = false;
+  if ( mSliderUpdateTimer )
+    mSliderUpdateTimer->stop();
+}
+
+void HeightEditTool::saveHeightPreview()
+{
+  if ( !mHasPreviewHeight || !mActiveLayer || !mActiveLayer->isEditable() || mInitialFieldValues.isEmpty() )
+    return;
+
+  const double heightValue = mPreviewHeight;
+  applySliderValueToLayer( heightValue );
+  emit BuildingEditPreviewBus::instance()->heightPreviewFinished(
+    mActiveLayer.data(),
+    mInitialFieldValues.keys().toSet(),
+    mHeightFieldName,
+    heightValue
+  );
+
+  mHasPreviewHeight = false;
+  mHasPendingSliderValue = false;
+  mInitialFieldValues.clear();
+  initSliderCache();
+}
+
+void HeightEditTool::cancelHeightPreview()
+{
+  flushPendingSliderValue();
+  if ( mHasPreviewHeight && mActiveLayer && !mInitialFieldValues.isEmpty() )
+  {
+    emit BuildingEditPreviewBus::instance()->heightPreviewFinished(
+      mActiveLayer.data(),
+      mInitialFieldValues.keys().toSet(),
+      mHeightFieldName,
+      mPreviewHeight
+    );
+  }
+
+  mHasPreviewHeight = false;
+  mHasPendingSliderValue = false;
+}
+
+void HeightEditTool::setWheelStep( double step )
+{
+  mWheelStep = step;
+
+  if ( !mWidget )
+    return;
+
+  mUI.radioButton01x->blockSignals( true );
+  mUI.radioButton1x->blockSignals( true );
+  mUI.radioButton_3->blockSignals( true );
+  mUI.radioButton01x->setChecked( std::abs( step - 0.1 ) < 0.000001 );
+  mUI.radioButton1x->setChecked( std::abs( step - 1.0 ) < 0.000001 );
+  mUI.radioButton_3->setChecked( std::abs( step - 5.0 ) < 0.000001 );
+  mUI.radioButton01x->blockSignals( false );
+  mUI.radioButton1x->blockSignals( false );
+  mUI.radioButton_3->blockSignals( false );
+}
+
+bool HeightEditTool::adjustHeightByWheel( QWheelEvent *event )
+{
+  if ( !event || !isActive() || mWheelStep <= 0.0 || !mWidget || !mWidget->isVisible() || !mActiveLayer || !mActiveLayer->isEditable() || mInitialFieldValues.isEmpty() )
+    return false;
+
+  const int wheelSteps = event->angleDelta().y() / 120;
+  if ( wheelSteps == 0 )
+    return false;
+
+  const double currentHeight = mHasPreviewHeight ? mPreviewHeight : mUI.horizontalSlider->value() / SLIDER_SCALE;
+  const double maxHeight = mUI.horizontalSlider->maximum() / SLIDER_SCALE;
+  const double nextHeight = std::clamp( currentHeight + wheelSteps * mWheelStep, 0.0, maxHeight );
+
+  mUI.horizontalSlider->setValue( static_cast<int>( std::round( nextHeight * SLIDER_SCALE ) ) );
+  previewHeightValue( nextHeight );
+  event->accept();
+  return true;
+}
+
 // ---------------- 属性表修改立即保存 ----------------
 void HeightEditTool::onCellChanged( int row, int column )
 {
   if ( row < 0 || column < 0 || !mActiveLayer || !mActiveLayer->isEditable() )
     return;
+  if ( row >= mInitialFieldValues.size() )
+    return;
+  if ( !mUI.tableProperties->item( row, column ) )
+    return;
+
+  double newValue = mUI.tableProperties->item( row, column )->text().toDouble();
+  const int heightIdx = mActiveLayer->fields().indexOf( mHeightFieldName );
+  if ( column == heightIdx )
+  {
+    mUI.horizontalSlider->blockSignals( true );
+    mUI.horizontalSlider->setValue( static_cast<int>( std::round( newValue * SLIDER_SCALE ) ) );
+    mUI.horizontalSlider->blockSignals( false );
+    previewHeightValue( newValue );
+    return;
+  }
 
   auto fidIt = mInitialFieldValues.begin();
   std::advance( fidIt, row );
   QgsFeatureId fid = fidIt.key();
 
-  double newValue = mUI.tableProperties->item( row, column )->text().toDouble();
   QgsFeature feat;
   if ( mActiveLayer->getFeatures( QgsFeatureRequest( fid ) ).nextFeature( feat ) )
   {
@@ -371,6 +567,12 @@ void HeightEditTool::onCellChanged( int row, int column )
 // ---------------- 退出工具 ----------------
 bool HeightEditTool::eventFilter( QObject *obj, QEvent *event )
 {
+  if ( event && event->type() == QEvent::Wheel )
+  {
+    if ( adjustHeightByWheel( static_cast<QWheelEvent *>( event ) ) )
+      return true;
+  }
+
   // 如果窗口不存在，交给父类处理
   if ( !mWidget )
     return QgsMapTool::eventFilter( obj, event );

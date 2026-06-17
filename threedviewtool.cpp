@@ -1,4 +1,5 @@
 #include "threedviewtool.h"
+#include "buildingeditpreviewbus.h"
 #include <qgsvectorlayer.h>
 #include <qgspointcloudlayer.h>
 #include <qgsproject.h>
@@ -6,6 +7,7 @@
 #include <qgsfeatureiterator.h>
 #include <qgsgeometry.h>
 #include <qgsmapcanvas.h>
+#include <qgscoordinatetransform.h>
 #include <qgsprovidermetadata.h>
 #include <qgsproviderregistry.h>
 #include <QMessageBox>
@@ -33,18 +35,37 @@
 #include <qgisinterface.h>
 #include <qgs3dmapcanvas.h>
 #include <qgs3dmapsettings.h>
+#include <qgs3dmapscene.h>
+#include <qgsvector3d.h>
 #include <qgsnullsymbolrenderer.h>
 #include <qgslayertreelayer.h>
 #include <qgslayertree.h>
 #include <qgslayertreeview.h>
 #include <QMap>
+#include <QVector3D>
+#include <cstring>
+#include <Qt3DCore/QEntity>
+#include <Qt3DRender/QAttribute>
+#include <Qt3DRender/QBuffer>
+#include <Qt3DRender/QGeometry>
+#include <Qt3DRender/QGeometryRenderer>
+#include <Qt3DExtras/QPhongMaterial>
 
 // ==================== 构造与析构 ====================
 ThreeDViewTool::ThreeDViewTool( QgsMapCanvas *canvas, QgisInterface *iface )
   : QgsMapTool( canvas )
+  , mCanvas( canvas )
   , mIface( iface )
 {
   setCursor( Qt::CrossCursor );
+
+  mFeatureUpdateTimer = new QTimer( this );
+  mFeatureUpdateTimer->setSingleShot( true );
+  mFeatureUpdateTimer->setInterval( 33 );
+  connect( mFeatureUpdateTimer, &QTimer::timeout, this, &ThreeDViewTool::flushPendingFeatureUpdates );
+  connect( BuildingEditPreviewBus::instance(), &BuildingEditPreviewBus::heightPreviewChanged, this, &ThreeDViewTool::onHeightPreviewChanged );
+  connect( BuildingEditPreviewBus::instance(), &BuildingEditPreviewBus::heightPreviewFinished, this, &ThreeDViewTool::onHeightPreviewFinished );
+
   auto layers = QgsProject::instance()->layers<QgsVectorLayer *>();
   if ( !layers.isEmpty() )
     mActiveLayer = layers.first();
@@ -52,8 +73,258 @@ ThreeDViewTool::ThreeDViewTool( QgsMapCanvas *canvas, QgisInterface *iface )
 
 ThreeDViewTool::~ThreeDViewTool()
 {
+  cleanup3DState();
+
   if ( mWidget )
+  {
+    mWidget->removeEventFilter( this );
     mWidget->deleteLater();
+    mWidget = nullptr;
+  }
+}
+
+void ThreeDViewTool::cleanup3DState()
+{
+  clearPreviewEntity();
+
+  if ( mActiveLayer )
+    disconnect( mActiveLayer, nullptr, this, nullptr );
+
+  if ( mTempLayer )
+  {
+    for ( Qgs3DMapCanvas *canvas3D : mIface ? mIface->mapCanvases3D() : QList<Qgs3DMapCanvas *>() )
+    {
+      if ( !canvas3D || !canvas3D->mapSettings() )
+        continue;
+
+      QList<QgsMapLayer *> layers = canvas3D->mapSettings()->layers();
+      if ( layers.removeAll( mTempLayer ) > 0 )
+        canvas3D->mapSettings()->setLayers( layers );
+    }
+
+    const QString tempLayerId = mTempLayer->id();
+    mTempLayer = nullptr;
+    QgsProject::instance()->removeMapLayer( tempLayerId );
+  }
+
+  refresh3DCanvases();
+}
+
+void ThreeDViewTool::refresh3DCanvases()
+{
+  if ( !mIface )
+    return;
+
+  for ( Qgs3DMapCanvas *canvas3D : mIface->mapCanvases3D() )
+  {
+    if ( canvas3D && canvas3D->mapSettings() )
+    {
+      const QList<QgsMapLayer *> layers = canvas3D->mapSettings()->layers();
+      canvas3D->mapSettings()->setLayers( layers );
+    }
+  }
+}
+
+void ThreeDViewTool::removeTempFeatures( const QgsFeatureIds &fids )
+{
+  if ( !mTempLayer || fids.isEmpty() )
+    return;
+
+  mTempLayer->startEditing();
+  for ( QgsFeatureId fid : fids )
+  {
+    QgsFeatureRequest request;
+    request.setFilterExpression( QString( "original_fid = %1" ).arg( fid ) );
+    QgsFeatureIterator it = mTempLayer->getFeatures( request );
+    QgsFeature f;
+    QgsFeatureIds toDelete;
+    while ( it.nextFeature( f ) )
+      toDelete << f.id();
+    mTempLayer->deleteFeatures( toDelete );
+  }
+  mTempLayer->commitChanges();
+  mTempLayer->triggerRepaint();
+}
+
+void ThreeDViewTool::ensurePreviewEntity()
+{
+  if ( mPreviewEntity )
+    return;
+  if ( !mIface )
+    return;
+
+  Qgs3DMapCanvas *activeCanvas3D = mIface->mapCanvases3D().isEmpty()
+                                     ? mIface->createNewMapCanvas3D( tr( "3D Preview" ) )
+                                     : mIface->mapCanvases3D().first();
+  if ( !activeCanvas3D || !activeCanvas3D->scene() )
+    return;
+
+  Qgs3DMapScene *scene = activeCanvas3D->scene();
+  connect( scene, &QObject::destroyed, this, [this]() {
+    mPreviewEntity = nullptr;
+    mPreviewRenderer = nullptr;
+    mPreviewGeometry = nullptr;
+    mPreviewVertexBuffer = nullptr;
+    mPreviewPositionAttribute = nullptr;
+    mPreviewNormalAttribute = nullptr;
+    mPreviewMaterial = nullptr;
+    mPreviewFids.clear();
+  }, Qt::UniqueConnection );
+
+  mPreviewEntity = new Qt3DCore::QEntity( scene );
+  mPreviewRenderer = new Qt3DRender::QGeometryRenderer( mPreviewEntity );
+  mPreviewGeometry = new Qt3DRender::QGeometry( mPreviewRenderer );
+  mPreviewVertexBuffer = new Qt3DRender::QBuffer( mPreviewGeometry );
+  mPreviewPositionAttribute = new Qt3DRender::QAttribute( mPreviewGeometry );
+  mPreviewNormalAttribute = new Qt3DRender::QAttribute( mPreviewGeometry );
+
+  constexpr int stride = 6 * sizeof( float );
+
+  mPreviewPositionAttribute->setName( Qt3DRender::QAttribute::defaultPositionAttributeName() );
+  mPreviewPositionAttribute->setVertexBaseType( Qt3DRender::QAttribute::Float );
+  mPreviewPositionAttribute->setVertexSize( 3 );
+  mPreviewPositionAttribute->setAttributeType( Qt3DRender::QAttribute::VertexAttribute );
+  mPreviewPositionAttribute->setBuffer( mPreviewVertexBuffer );
+  mPreviewPositionAttribute->setByteStride( stride );
+  mPreviewPositionAttribute->setByteOffset( 0 );
+
+  mPreviewNormalAttribute->setName( Qt3DRender::QAttribute::defaultNormalAttributeName() );
+  mPreviewNormalAttribute->setVertexBaseType( Qt3DRender::QAttribute::Float );
+  mPreviewNormalAttribute->setVertexSize( 3 );
+  mPreviewNormalAttribute->setAttributeType( Qt3DRender::QAttribute::VertexAttribute );
+  mPreviewNormalAttribute->setBuffer( mPreviewVertexBuffer );
+  mPreviewNormalAttribute->setByteStride( stride );
+  mPreviewNormalAttribute->setByteOffset( 3 * sizeof( float ) );
+
+  mPreviewGeometry->addAttribute( mPreviewPositionAttribute );
+  mPreviewGeometry->addAttribute( mPreviewNormalAttribute );
+
+  mPreviewRenderer->setGeometry( mPreviewGeometry );
+  mPreviewRenderer->setPrimitiveType( Qt3DRender::QGeometryRenderer::Triangles );
+
+  mPreviewMaterial = new Qt3DExtras::QPhongMaterial( mPreviewEntity );
+  mPreviewMaterial->setDiffuse( QColor( 255, 180, 60, 230 ) );
+  mPreviewMaterial->setAmbient( QColor( 90, 70, 35 ) );
+  mPreviewMaterial->setSpecular( QColor( 80, 80, 80 ) );
+  mPreviewMaterial->setShininess( 18.0f );
+
+  mPreviewEntity->addComponent( mPreviewRenderer );
+  mPreviewEntity->addComponent( mPreviewMaterial );
+}
+
+void ThreeDViewTool::updatePreviewEntity( QgsVectorLayer *layer, const QgsFeatureIds &fids, const QString &heightFieldName, double height )
+{
+  if ( !layer || !mIface || fids.isEmpty() )
+    return;
+
+  Qgs3DMapCanvas *activeCanvas3D = mIface->mapCanvases3D().isEmpty()
+                                     ? mIface->createNewMapCanvas3D( tr( "3D Preview" ) )
+                                     : mIface->mapCanvases3D().first();
+  if ( !activeCanvas3D || !activeCanvas3D->mapSettings() )
+    return;
+
+  ensurePreviewEntity();
+  if ( !mPreviewEntity || !mPreviewRenderer || !mPreviewVertexBuffer || !mPreviewPositionAttribute || !mPreviewNormalAttribute )
+    return;
+
+  if ( mPreviewFids != fids )
+  {
+    if ( !mPreviewFids.isEmpty() )
+      refreshMemoryData();
+    mPreviewFids = fids;
+    removeTempFeatures( fids );
+  }
+
+  Qgs3DMapSettings *settings = activeCanvas3D->mapSettings();
+  QgsCoordinateTransform layerToSceneTransform;
+  const bool transformLayerCoordinates = layer->crs().isValid() && settings->crs().isValid() && layer->crs() != settings->crs();
+  if ( transformLayerCoordinates )
+    layerToSceneTransform = QgsCoordinateTransform( layer->crs(), settings->crs(), settings->transformContext() );
+
+  QByteArray vertexBufferData;
+  QVector<float> raw;
+
+  for ( QgsFeatureId fid : fids )
+  {
+    QgsFeature feat;
+    if ( !layer->getFeatures( QgsFeatureRequest( fid ) ).nextFeature( feat ) )
+      continue;
+
+    MeshData mesh = BuildMesh::build( feat.geometry(), height );
+    if ( mesh.isEmpty() )
+      continue;
+
+    for ( int i = 0; i + 2 < mesh.indices.size(); i += 3 )
+    {
+      QVector3D tri[3];
+      bool skipTriangle = false;
+      for ( int j = 0; j < 3; ++j )
+      {
+        const QgsPoint &p = mesh.vertices[mesh.indices[i + j]];
+        QgsPointXY mapPoint( p.x(), p.y() );
+        if ( transformLayerCoordinates )
+        {
+          try
+          {
+            mapPoint = layerToSceneTransform.transform( mapPoint );
+          }
+          catch ( ... )
+          {
+            skipTriangle = true;
+            break;
+          }
+        }
+        QgsVector3D world = settings->mapToWorldCoordinates( QgsVector3D( mapPoint.x(), mapPoint.y(), p.z() ) );
+        tri[j] = QVector3D( static_cast<float>( world.x() ), static_cast<float>( world.y() ), static_cast<float>( world.z() ) );
+      }
+      if ( skipTriangle )
+        continue;
+
+      QVector3D normal = QVector3D::crossProduct( tri[1] - tri[0], tri[2] - tri[0] ).normalized();
+      if ( normal.isNull() )
+        normal = QVector3D( 0.0f, 0.0f, 1.0f );
+
+      for ( int j = 0; j < 3; ++j )
+      {
+        raw << tri[j].x() << tri[j].y() << tri[j].z()
+            << normal.x() << normal.y() << normal.z();
+      }
+    }
+  }
+
+  vertexBufferData.resize( raw.size() * static_cast<int>( sizeof( float ) ) );
+  memcpy( vertexBufferData.data(), raw.constData(), vertexBufferData.size() );
+  const int vertexCount = raw.size() / 6;
+
+  if ( !mPreviewEntity || !mPreviewRenderer || !mPreviewVertexBuffer || !mPreviewPositionAttribute || !mPreviewNormalAttribute )
+    return;
+
+  mPreviewVertexBuffer->setData( vertexBufferData );
+  mPreviewPositionAttribute->setCount( vertexCount );
+  mPreviewNormalAttribute->setCount( vertexCount );
+  mPreviewRenderer->setVertexCount( vertexCount );
+  mPreviewEntity->setEnabled( vertexCount > 0 );
+}
+
+void ThreeDViewTool::clearPreviewEntity()
+{
+  QPointer<Qt3DCore::QEntity> entityToDelete = mPreviewEntity;
+
+  mPreviewRenderer = nullptr;
+  mPreviewGeometry = nullptr;
+  mPreviewVertexBuffer = nullptr;
+  mPreviewPositionAttribute = nullptr;
+  mPreviewNormalAttribute = nullptr;
+  mPreviewMaterial = nullptr;
+  mPreviewEntity = nullptr;
+  mPreviewFids.clear();
+
+  if ( entityToDelete )
+  {
+    entityToDelete->setEnabled( false );
+    entityToDelete->setParent( static_cast<Qt3DCore::QNode *>( nullptr ) );
+    entityToDelete->deleteLater();
+  }
 }
 
 // ==================== 激活与停用 ====================
@@ -149,6 +420,7 @@ void ThreeDViewTool::confirmSelection()
     QgsPolygon3DSymbol *symbol = new QgsPolygon3DSymbol();
     symbol->setAltitudeClamping( Qgis::AltitudeClamping::Absolute );
     QgsVectorLayer3DRenderer *renderer = new QgsVectorLayer3DRenderer();
+    renderer->setLayer( mTempLayer );
     renderer->setSymbol( symbol );
     mTempLayer->setRenderer3D( renderer );
 
@@ -361,19 +633,15 @@ void ThreeDViewTool::addPointCloudData()
     }
 
     configurePointCloud3DRenderer( layer );
-    connect( layer, &QgsPointCloudLayer::statisticsCalculationStateChanged, this, [this, layer]( QgsPointCloudLayer::PointCloudStatisticsCalculationState state ) {
+    QPointer<QgsPointCloudLayer> safeLayer = layer;
+    connect( layer, &QgsPointCloudLayer::statisticsCalculationStateChanged, this, [this, safeLayer]( QgsPointCloudLayer::PointCloudStatisticsCalculationState state ) {
       if ( state != QgsPointCloudLayer::PointCloudStatisticsCalculationState::Calculated )
         return;
+      if ( !safeLayer || !mIface )
+        return;
 
-      configurePointCloud3DRenderer( layer );
-      for ( Qgs3DMapCanvas *canvas3D : mIface->mapCanvases3D() )
-      {
-        if ( canvas3D && canvas3D->mapSettings() )
-        {
-          QList<QgsMapLayer *> layers = canvas3D->mapSettings()->layers();
-          canvas3D->mapSettings()->setLayers( layers );
-        }
-      }
+      configurePointCloud3DRenderer( safeLayer );
+      refresh3DCanvases();
     } );
   }
 }
@@ -735,9 +1003,33 @@ void ThreeDViewTool::updateFeature3D( const QgsFeature &originFeat )
 // 响应要素几何/属性变更
 void ThreeDViewTool::onFeatureUpdated( QgsFeatureId fid )
 {
+  if ( !mFeatureUpdateTimer )
+    return;
+
+  mPendingFeatureUpdates.insert( fid );
+  if ( !mFeatureUpdateTimer->isActive() )
+    mFeatureUpdateTimer->start();
+}
+
+void ThreeDViewTool::applyFeature3DUpdate( QgsFeatureId fid )
+{
+  if ( !mActiveLayer )
+    return;
+
   QgsFeature originFeat;
   if ( mActiveLayer->getFeatures( QgsFeatureRequest( fid ) ).nextFeature( originFeat ) )
     updateFeature3D( originFeat );
+}
+
+void ThreeDViewTool::flushPendingFeatureUpdates()
+{
+  const QgsFeatureIds pendingUpdates = mPendingFeatureUpdates;
+  mPendingFeatureUpdates.clear();
+
+  for ( QgsFeatureId fid : pendingUpdates )
+    applyFeature3DUpdate( fid );
+
+  refresh3DCanvases();
 }
 
 // 响应要素删除
@@ -774,6 +1066,32 @@ void ThreeDViewTool::onFeatureAdded( QgsFeatureId fid )
 }
 
 // 完全重建内存图层数据
+void ThreeDViewTool::onHeightPreviewChanged( QgsVectorLayer *layer, const QgsFeatureIds &fids, const QString &heightFieldName, double height )
+{
+  if ( !layer || layer != mActiveLayer || !mTempLayer )
+    return;
+
+  Q_UNUSED( heightFieldName )
+  updatePreviewEntity( layer, fids, heightFieldName, height );
+}
+
+void ThreeDViewTool::onHeightPreviewFinished( QgsVectorLayer *layer, const QgsFeatureIds &fids, const QString &heightFieldName, double height )
+{
+  if ( !layer || layer != mActiveLayer || !mTempLayer )
+    return;
+
+  Q_UNUSED( heightFieldName )
+  Q_UNUSED( height )
+
+  clearPreviewEntity();
+  mPendingFeatureUpdates.subtract( fids );
+
+  for ( QgsFeatureId fid : fids )
+    applyFeature3DUpdate( fid );
+
+  refresh3DCanvases();
+}
+
 void ThreeDViewTool::refreshMemoryData()
 {
   if ( !mTempLayer || !mActiveLayer || mSelectedHeightField.isEmpty() )
@@ -807,12 +1125,5 @@ void ThreeDViewTool::refreshMemoryData()
   mTempLayer->triggerRepaint();
 
   // 强制刷新 3D 视图
-  for ( Qgs3DMapCanvas *canvas3D : mIface->mapCanvases3D() )
-  {
-    if ( canvas3D && canvas3D->mapSettings() )
-    {
-      QList<QgsMapLayer *> layers = canvas3D->mapSettings()->layers();
-      canvas3D->mapSettings()->setLayers( layers );
-    }
-  }
+  refresh3DCanvases();
 }

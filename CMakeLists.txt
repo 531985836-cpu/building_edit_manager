@@ -8,11 +8,13 @@ set(CMAKE_AUTORCC ON)
 # Source files
 set(buildingeditmanager_SRCS
   buildingeditmanager.cpp
+  buildingeditpreviewbus.cpp
   heightedit.cpp
   threedviewtool.cpp
   pointedit.cpp
   createtool.cpp
   view.cpp
+  roofedit.cpp
 )
 
 ########################################################
@@ -21,6 +23,7 @@ set(buildingeditmanager_UIS
   heightedit.ui
   threedview.ui
   createtool.ui
+  roofedit.ui
 )
 
 ########################################################

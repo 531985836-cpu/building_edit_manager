@@ -6,6 +6,8 @@
 #include <QWidget>
 #include <QPoint>
 #include <QMatrix4x4>
+#include <QPointer>
+#include <QTimer>
 
 #include "ui_threedview.h"
 
@@ -14,6 +16,21 @@ class QgsMapLayer;
 class QgsMapCanvas;
 class QgsPointCloudLayer;
 class QgisInterface;
+namespace Qt3DCore
+{
+  class QEntity;
+}
+namespace Qt3DRender
+{
+  class QAttribute;
+  class QBuffer;
+  class QGeometry;
+  class QGeometryRenderer;
+}
+namespace Qt3DExtras
+{
+  class QPhongMaterial;
+}
 
 struct MeshData
 {
@@ -59,6 +76,14 @@ class ThreeDViewTool : public QgsMapTool
     void ensureLayerIn3DView( QgsMapLayer *layer );
     void addLoadedPointCloudLayersTo3DView();
     void configurePointCloud3DRenderer( QgsPointCloudLayer *layer );
+    void cleanup3DState();
+    void refresh3DCanvases();
+    void applyFeature3DUpdate( QgsFeatureId fid );
+    void flushPendingFeatureUpdates();
+    void removeTempFeatures( const QgsFeatureIds &fids );
+    void ensurePreviewEntity();
+    void updatePreviewEntity( QgsVectorLayer *layer, const QgsFeatureIds &fids, const QString &heightFieldName, double height );
+    void clearPreviewEntity();
 
   private slots:
     void addVectorData();
@@ -67,18 +92,20 @@ class ThreeDViewTool : public QgsMapTool
     void onFeaturesDeleted( const QgsFeatureIds &fids );
     void onLayerChanged( int index );
     void onFeatureAdded( QgsFeatureId fid );
+    void onHeightPreviewChanged( QgsVectorLayer *layer, const QgsFeatureIds &fids, const QString &heightFieldName, double height );
+    void onHeightPreviewFinished( QgsVectorLayer *layer, const QgsFeatureIds &fids, const QString &heightFieldName, double height );
 
   private:
     // UI 成员
-    QWidget *mWidget = nullptr;
+    QPointer<QWidget> mWidget = nullptr;
     Ui::threedview mUI;
 
     // 核心数据
-    QgsMapCanvas *mCanvas = nullptr;
-    QgisInterface *mIface = nullptr;
+    QPointer<QgsMapCanvas> mCanvas = nullptr;
+    QPointer<QgisInterface> mIface = nullptr;
 
-    QgsVectorLayer *mActiveLayer = nullptr;
-    QgsVectorLayer *mTempLayer = nullptr;
+    QPointer<QgsVectorLayer> mActiveLayer = nullptr;
+    QPointer<QgsVectorLayer> mTempLayer = nullptr;
     QString mSelectedHeightField;
 
     // 鼠标交互状态
@@ -90,4 +117,14 @@ class ThreeDViewTool : public QgsMapTool
 
     // 存储映射
     QMap<QString, QgsVectorLayer *> mTempLayersMap;
+    QgsFeatureIds mPendingFeatureUpdates;
+    QTimer *mFeatureUpdateTimer = nullptr;
+    QgsFeatureIds mPreviewFids;
+    QPointer<Qt3DCore::QEntity> mPreviewEntity = nullptr;
+    QPointer<Qt3DRender::QGeometryRenderer> mPreviewRenderer = nullptr;
+    QPointer<Qt3DRender::QGeometry> mPreviewGeometry = nullptr;
+    QPointer<Qt3DRender::QBuffer> mPreviewVertexBuffer = nullptr;
+    QPointer<Qt3DRender::QAttribute> mPreviewPositionAttribute = nullptr;
+    QPointer<Qt3DRender::QAttribute> mPreviewNormalAttribute = nullptr;
+    QPointer<Qt3DExtras::QPhongMaterial> mPreviewMaterial = nullptr;
 };

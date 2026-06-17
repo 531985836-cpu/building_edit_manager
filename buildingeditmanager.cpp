@@ -3,7 +3,7 @@
 #include "threedviewtool.h"
 #include "pointedit.h"
 #include "createtool.h"
-#include "view.h"
+#include "roofedit.h"
 
 #include <QIcon>
 #include <QMenu>
@@ -28,6 +28,7 @@ BuildingEditManager::BuildingEditManager( QgisInterface *iface )
 
 BuildingEditManager::~BuildingEditManager()
 {
+  unload();
 }
 
 // ========================================================================
@@ -98,30 +99,62 @@ void BuildingEditManager::initGui()
   mIface->addToolBarIcon( mMainAction );
   mIface->addPluginToMenu( tr( "Building Edit Manager" ), mMainAction );
 
-  // =========================================================
-  // 【新增】：侧视图工具
-  // =========================================================
-
-  mViewAction = new QAction( tr( "侧视图" ), this );
-  mViewAction->setCheckable( true );
-
-  mMenu->addAction( mViewAction );
+  // 屋顶编辑工具
+  mRoofEditAction = new QAction( tr( "屋顶编辑" ), this );
+  mRoofEditAction->setCheckable( true );
+  mMenu->addAction( mRoofEditAction );
 
   connect(
-    mViewAction,
+    mRoofEditAction,
     &QAction::toggled,
     this,
-    &BuildingEditManager::activateView
+    &BuildingEditManager::activateRoofEdit
   );
 }
 
 void BuildingEditManager::unload()
 {
-  mIface->removePluginMenu( tr( "Building Edit Manager" ), mMainAction );
-  mIface->removeToolBarIcon( mMainAction );
+  if ( !mIface )
+    return;
+
+  if ( mHeightEditTool )
+    mIface->mapCanvas()->unsetMapTool( mHeightEditTool );
+  if ( mThreeDViewTool )
+    mIface->mapCanvas()->unsetMapTool( mThreeDViewTool );
+  if ( mPointEditTool )
+    mIface->mapCanvas()->unsetMapTool( mPointEditTool );
+  if ( mCreateTool )
+    mIface->mapCanvas()->unsetMapTool( mCreateTool );
+  if ( mRoofEditTool )
+    mIface->mapCanvas()->unsetMapTool( mRoofEditTool );
+
+  delete mHeightEditTool;
+  mHeightEditTool = nullptr;
+  delete mThreeDViewTool;
+  mThreeDViewTool = nullptr;
+  delete mPointEditTool;
+  mPointEditTool = nullptr;
+  delete mCreateTool;
+  mCreateTool = nullptr;
+  delete mRoofEditTool;
+  mRoofEditTool = nullptr;
+
+  if ( mMainAction )
+  {
+    mIface->removePluginMenu( tr( "Building Edit Manager" ), mMainAction );
+    mIface->removeToolBarIcon( mMainAction );
+  }
+
+  delete mMenu;
+  mMenu = nullptr;
 
   delete mMainAction;
   mMainAction = nullptr;
+  mHeightEditAction = nullptr;
+  mThreeDViewAction = nullptr;
+  mPointEditAction = nullptr;
+  mCreateToolAction = nullptr;
+  mRoofEditAction = nullptr;
 }
 
 // ========================================================================
@@ -144,6 +177,8 @@ void BuildingEditManager::activateHeightEdit( bool checked )
       mPointEditAction->setChecked( false );
     if ( mCreateToolAction && mCreateToolAction->isChecked() )
       mCreateToolAction->setChecked( false );
+    if ( mRoofEditAction && mRoofEditAction->isChecked() )
+      mRoofEditAction->setChecked( false );
 
     if ( !mHeightEditTool )
       mHeightEditTool = new HeightEditTool( mIface->mapCanvas() );
@@ -176,6 +211,8 @@ void BuildingEditManager::activateThreeDView( bool checked )
       mPointEditAction->setChecked( false );
     if ( mCreateToolAction && mCreateToolAction->isChecked() )
       mCreateToolAction->setChecked( false );
+    if ( mRoofEditAction && mRoofEditAction->isChecked() )
+      mRoofEditAction->setChecked( false );
 
     if ( !mThreeDViewTool )
       mThreeDViewTool = new ThreeDViewTool( mIface->mapCanvas(), mIface );
@@ -208,6 +245,8 @@ void BuildingEditManager::activatePointEdit( bool checked )
       mThreeDViewAction->setChecked( false );
     if ( mCreateToolAction && mCreateToolAction->isChecked() )
       mCreateToolAction->setChecked( false );
+    if ( mRoofEditAction && mRoofEditAction->isChecked() )
+      mRoofEditAction->setChecked( false );
 
     if ( !mPointEditTool )
       mPointEditTool = new PointEdit( mIface->mapCanvas() );
@@ -242,6 +281,8 @@ void BuildingEditManager::activateCreateTool( bool checked )
       mThreeDViewAction->setChecked( false );
     if ( mPointEditAction && mPointEditAction->isChecked() )
       mPointEditAction->setChecked( false );
+    if ( mRoofEditAction && mRoofEditAction->isChecked() )
+      mRoofEditAction->setChecked( false );
 
     // 2. 实例化工具（单例模式，避免重复创建）
     if ( !mCreateTool )
@@ -263,10 +304,10 @@ void BuildingEditManager::activateCreateTool( bool checked )
 }
 
 // ========================================================================
-// 激活侧视图工具
+// 激活屋顶编辑工具
 // ========================================================================
 
-void BuildingEditManager::activateView( bool checked )
+void BuildingEditManager::activateRoofEdit( bool checked )
 {
   if ( mInternalSwitch )
     return;
@@ -287,24 +328,15 @@ void BuildingEditManager::activateView( bool checked )
     if ( mCreateToolAction && mCreateToolAction->isChecked() )
       mCreateToolAction->setChecked( false );
 
-    if ( !mViewTool )
-    {
-      mViewTool = new View(
-        mIface->mapCanvas(),
-        mIface
-      );
-    }
+    if ( !mRoofEditTool )
+      mRoofEditTool = new RoofEditTool( mIface->mapCanvas(), mIface );
 
-    mIface->mapCanvas()->setMapTool(
-      mViewTool
-    );
+    mIface->mapCanvas()->setMapTool( mRoofEditTool );
   }
   else
   {
-    if ( mViewTool )
-      mIface->mapCanvas()->unsetMapTool(
-        mViewTool
-      );
+    if ( mRoofEditTool )
+      mIface->mapCanvas()->unsetMapTool( mRoofEditTool );
   }
 
   mInternalSwitch = false;

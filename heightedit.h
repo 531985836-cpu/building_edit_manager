@@ -12,11 +12,14 @@
 #include <QSlider>
 #include <QMap>
 #include <QPoint>
+#include <QTimer>
+#include <QPointer>
 
 #include "ui_heightedit.h"
 
 class QgsVectorLayer;
 class QgsMapMouseEvent;
+class QWheelEvent;
 
 class HeightEditTool : public QgsMapTool
 {
@@ -31,6 +34,8 @@ class HeightEditTool : public QgsMapTool
 
     void keyPressEvent( QKeyEvent *e ) override;
     void keyReleaseEvent( QKeyEvent *e ) override;
+    void wheelEvent( QWheelEvent *e ) override;
+    void deactivate() override;
 
   protected:
     bool eventFilter( QObject *obj, QEvent *event ) override;
@@ -45,6 +50,13 @@ class HeightEditTool : public QgsMapTool
     void startEditingLayer( QgsVectorLayer *layer );
 
     void showSelectedAttributes();
+    void applySliderValueToLayer( double heightValue );
+    void previewHeightValue( double heightValue );
+    void cancelHeightPreview();
+    void saveHeightPreview();
+    void setWheelStep( double step );
+    bool adjustHeightByWheel( QWheelEvent *event );
+    void updateHeightColumnText( double heightValue );
     void initSliderCache(); // 初始化滑块缓存
     double mReferenceHeight = 0.0;
     static constexpr double SLIDER_SCALE = 10.0; // 0.1 精度
@@ -73,12 +85,19 @@ class HeightEditTool : public QgsMapTool
     QPoint mStartScreenPoint;
 
     QgsRubberBand *mRubberBand = nullptr;
-    QgsVectorLayer *mActiveLayer = nullptr;
+    QPointer<QgsVectorLayer> mActiveLayer = nullptr;
 
     Ui::heightedit mUI;
-    QWidget *mWidget = nullptr;
+    QPointer<QWidget> mWidget = nullptr;
+    QTimer *mSliderUpdateTimer = nullptr;
+    int mPendingSliderValue = 0;
+    bool mHasPendingSliderValue = false;
+    bool mHasPreviewHeight = false;
+    double mPreviewHeight = 0.0;
+    double mWheelStep = 0.0;
 
   private slots:
     void onCellChanged( int row, int column );
     void onSliderChanged( int value );
+    void flushPendingSliderValue();
 };
