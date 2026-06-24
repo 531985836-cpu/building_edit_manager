@@ -1,12 +1,16 @@
 #include "threedviewtool.h"
 #include "buildingeditpreviewbus.h"
+#include "buildingroof.h"
 #include <qgsvectorlayer.h>
 #include <qgspointcloudlayer.h>
+#include <qgsrasterlayer.h>
 #include <qgsproject.h>
 #include <qgsmapmouseevent.h>
 #include <qgsfeatureiterator.h>
+#include <qgsfield.h>
 #include <qgsgeometry.h>
 #include <qgsmapcanvas.h>
+#include <qgsrectangle.h>
 #include <qgscoordinatetransform.h>
 #include <qgsprovidermetadata.h>
 #include <qgsproviderregistry.h>
@@ -44,6 +48,7 @@
 #include <QMap>
 #include <QVector3D>
 #include <cstring>
+#include <limits>
 #include <Qt3DCore/QEntity>
 #include <Qt3DRender/QAttribute>
 #include <Qt3DRender/QBuffer>
@@ -65,6 +70,7 @@ ThreeDViewTool::ThreeDViewTool( QgsMapCanvas *canvas, QgisInterface *iface )
   connect( mFeatureUpdateTimer, &QTimer::timeout, this, &ThreeDViewTool::flushPendingFeatureUpdates );
   connect( BuildingEditPreviewBus::instance(), &BuildingEditPreviewBus::heightPreviewChanged, this, &ThreeDViewTool::onHeightPreviewChanged );
   connect( BuildingEditPreviewBus::instance(), &BuildingEditPreviewBus::heightPreviewFinished, this, &ThreeDViewTool::onHeightPreviewFinished );
+  connect( BuildingEditPreviewBus::instance(), &BuildingEditPreviewBus::roofModelChanged, this, &ThreeDViewTool::onRoofModelChanged );
 
   auto layers = QgsProject::instance()->layers<QgsVectorLayer *>();
   if ( !layers.isEmpty() )
@@ -144,6 +150,170 @@ void ThreeDViewTool::removeTempFeatures( const QgsFeatureIds &fids )
   }
   mTempLayer->commitChanges();
   mTempLayer->triggerRepaint();
+}
+
+QList<BuildingRoof::RoofPoint> ThreeDViewTool::roofPointsForFeature( const QgsFeature &sourceFeature, bool *fromSavedLayer )
+{
+  auto collectPoints = [&sourceFeature]( const QString &layerName, bool useRelativePosition ) {
+    QList<BuildingRoof::RoofPoint> points;
+    const QList<QgsMapLayer *> layers = QgsProject::instance()->mapLayersByName( layerName );
+    if ( layers.isEmpty() )
+      return points;
+
+    QgsVectorLayer *pointLayer = qobject_cast<QgsVectorLayer *>( layers.first() );
+    if ( !pointLayer )
+      return points;
+
+    QgsFeatureRequest request;
+    request.setFilterExpression( QStringLiteral( "building_fid = %1" ).arg( sourceFeature.id() ) );
+    QgsFeatureIterator it = pointLayer->getFeatures( request );
+    QgsFeature feature;
+    const QgsRectangle bounds = sourceFeature.geometry().boundingBox();
+    const int relXIndex = pointLayer->fields().indexOf( QStringLiteral( "rel_x" ) );
+    const int relYIndex = pointLayer->fields().indexOf( QStringLiteral( "rel_y" ) );
+    while ( it.nextFeature( feature ) )
+    {
+      if ( !feature.hasGeometry() )
+        continue;
+
+      const QgsPoint *point = qgsgeometry_cast<const QgsPoint *>( feature.geometry().constGet() );
+      if ( !point )
+        continue;
+
+      QgsPoint roofPoint = *point;
+      if ( useRelativePosition && relXIndex >= 0 && relYIndex >= 0 && bounds.width() > 1e-12 && bounds.height() > 1e-12 )
+      {
+        bool okX = false;
+        bool okY = false;
+        const double relX = feature.attribute( relXIndex ).toDouble( &okX );
+        const double relY = feature.attribute( relYIndex ).toDouble( &okY );
+        if ( okX && okY )
+          roofPoint = QgsPoint( bounds.xMinimum() + relX * bounds.width(), bounds.yMinimum() + relY * bounds.height(), roofPoint.z() );
+      }
+
+      bool ok = false;
+      const double z = feature.attribute( QStringLiteral( "z" ) ).toDouble( &ok );
+      if ( ok )
+        roofPoint.setZ( z );
+
+      points.append( BuildingRoof::RoofPoint{ roofPoint, feature.attribute( QStringLiteral( "type" ) ).toString() } );
+    }
+
+    return points;
+  };
+
+  if ( fromSavedLayer )
+    *fromSavedLayer = false;
+
+  QList<BuildingRoof::RoofPoint> points = collectPoints( QStringLiteral( "Roof_Edit_Points" ), false );
+  if ( points.isEmpty() )
+  {
+    points = collectPoints( QStringLiteral( "Roof_Saved_Points" ), true );
+    if ( fromSavedLayer && !points.isEmpty() )
+      *fromSavedLayer = true;
+  }
+  return points;
+}
+
+double ThreeDViewTool::savedRoofBaseHeight( QgsFeatureId fid, double currentHeight )
+{
+  const QList<QgsMapLayer *> layers = QgsProject::instance()->mapLayersByName( QStringLiteral( "Roof_Saved_Points" ) );
+  if ( layers.isEmpty() )
+    return currentHeight;
+
+  QgsVectorLayer *savedLayer = qobject_cast<QgsVectorLayer *>( layers.first() );
+  if ( !savedLayer )
+    return currentHeight;
+
+  int baseIndex = savedLayer->fields().indexOf( QStringLiteral( "base_height" ) );
+  if ( baseIndex < 0 )
+  {
+    savedLayer->dataProvider()->addAttributes( QList<QgsField>() << QgsField( QStringLiteral( "base_height" ), QVariant::Double ) );
+    savedLayer->updateFields();
+    baseIndex = savedLayer->fields().indexOf( QStringLiteral( "base_height" ) );
+  }
+
+  QgsFeatureRequest request;
+  request.setFilterExpression( QStringLiteral( "building_fid = %1" ).arg( fid ) );
+  QgsFeatureIterator it = savedLayer->getFeatures( request );
+  QgsFeature feature;
+  QgsFeatureIds ids;
+  double baseHeight = std::numeric_limits<double>::quiet_NaN();
+  while ( it.nextFeature( feature ) )
+  {
+    ids.insert( feature.id() );
+    bool ok = false;
+    const double value = feature.attribute( QStringLiteral( "base_height" ) ).toDouble( &ok );
+    if ( ok )
+      baseHeight = value;
+  }
+
+  if ( std::isfinite( baseHeight ) )
+    return baseHeight;
+
+  if ( baseIndex >= 0 && !ids.isEmpty() )
+  {
+    if ( !savedLayer->isEditable() )
+      savedLayer->startEditing();
+    for ( QgsFeatureId savedFid : ids )
+      savedLayer->changeAttributeValue( savedFid, baseIndex, currentHeight );
+    savedLayer->commitChanges();
+  }
+
+  return currentHeight;
+}
+
+MeshData ThreeDViewTool::buildMeshForFeature( const QgsFeature &feature, double height )
+{
+  bool fromSavedLayer = false;
+  QList<BuildingRoof::RoofPoint> points = roofPointsForFeature( feature, &fromSavedLayer );
+  auto isGroundPoint = []( const QString &type ) {
+    return type.contains( QStringLiteral( "地面" ) )
+           || type.contains( QStringLiteral( "鍦伴潰" ) )
+           || type.contains( QStringLiteral( "ground" ), Qt::CaseInsensitive );
+  };
+
+  if ( fromSavedLayer && !points.isEmpty() )
+  {
+    const double delta = height - savedRoofBaseHeight( feature.id(), height );
+    if ( std::fabs( delta ) > 1e-9 )
+    {
+      for ( BuildingRoof::RoofPoint &point : points )
+      {
+        if ( !isGroundPoint( point.type ) )
+          point.point.setZ( point.point.z() + delta );
+      }
+    }
+  }
+
+  if ( !points.isEmpty() )
+  {
+    const BuildingRoof::MeshResult roof = BuildingRoof::buildSingleSlopePrismMesh( feature.geometry(), height, points );
+    if ( roof.success )
+    {
+      return MeshData{ roof.mesh.vertices, roof.mesh.indices };
+    }
+
+    const BuildingRoof::MeshResult gabledRoof = BuildingRoof::buildGabledRoofPrismMesh( feature.geometry(), height, points );
+    if ( gabledRoof.success )
+    {
+      return MeshData{ gabledRoof.mesh.vertices, gabledRoof.mesh.indices };
+    }
+
+    const BuildingRoof::MeshResult hippedRoof = BuildingRoof::buildHippedRoofPrismMesh( feature.geometry(), height, points );
+    if ( hippedRoof.success )
+    {
+      return MeshData{ hippedRoof.mesh.vertices, hippedRoof.mesh.indices };
+    }
+
+    const BuildingRoof::MeshResult multiRidgeRoof = BuildingRoof::buildMultiRidgePrismMesh( feature.geometry(), height, points );
+    if ( multiRidgeRoof.success )
+    {
+      return MeshData{ multiRidgeRoof.mesh.vertices, multiRidgeRoof.mesh.indices };
+    }
+  }
+
+  return BuildMesh::build( feature.geometry(), height );
 }
 
 void ThreeDViewTool::ensurePreviewEntity()
@@ -250,46 +420,51 @@ void ThreeDViewTool::updatePreviewEntity( QgsVectorLayer *layer, const QgsFeatur
     if ( !layer->getFeatures( QgsFeatureRequest( fid ) ).nextFeature( feat ) )
       continue;
 
-    MeshData mesh = BuildMesh::build( feat.geometry(), height );
-    if ( mesh.isEmpty() )
-      continue;
-
-    for ( int i = 0; i + 2 < mesh.indices.size(); i += 3 )
+    const MeshData mesh = buildMeshForFeature( feat, height );
+    auto appendMeshToPreview = [&]( const MeshData &mesh )
     {
-      QVector3D tri[3];
-      bool skipTriangle = false;
-      for ( int j = 0; j < 3; ++j )
+      if ( mesh.isEmpty() )
+        return;
+
+      for ( int i = 0; i + 2 < mesh.indices.size(); i += 3 )
       {
-        const QgsPoint &p = mesh.vertices[mesh.indices[i + j]];
-        QgsPointXY mapPoint( p.x(), p.y() );
-        if ( transformLayerCoordinates )
+        QVector3D tri[3];
+        bool skipTriangle = false;
+        for ( int j = 0; j < 3; ++j )
         {
-          try
+          const QgsPoint &p = mesh.vertices[mesh.indices[i + j]];
+          QgsPointXY mapPoint( p.x(), p.y() );
+          if ( transformLayerCoordinates )
           {
-            mapPoint = layerToSceneTransform.transform( mapPoint );
+            try
+            {
+              mapPoint = layerToSceneTransform.transform( mapPoint );
+            }
+            catch ( ... )
+            {
+              skipTriangle = true;
+              break;
+            }
           }
-          catch ( ... )
-          {
-            skipTriangle = true;
-            break;
-          }
+          QgsVector3D world = settings->mapToWorldCoordinates( QgsVector3D( mapPoint.x(), mapPoint.y(), p.z() ) );
+          tri[j] = QVector3D( static_cast<float>( world.x() ), static_cast<float>( world.y() ), static_cast<float>( world.z() ) );
         }
-        QgsVector3D world = settings->mapToWorldCoordinates( QgsVector3D( mapPoint.x(), mapPoint.y(), p.z() ) );
-        tri[j] = QVector3D( static_cast<float>( world.x() ), static_cast<float>( world.y() ), static_cast<float>( world.z() ) );
-      }
-      if ( skipTriangle )
-        continue;
+        if ( skipTriangle )
+          continue;
 
-      QVector3D normal = QVector3D::crossProduct( tri[1] - tri[0], tri[2] - tri[0] ).normalized();
-      if ( normal.isNull() )
-        normal = QVector3D( 0.0f, 0.0f, 1.0f );
+        QVector3D normal = QVector3D::crossProduct( tri[1] - tri[0], tri[2] - tri[0] ).normalized();
+        if ( normal.isNull() )
+          normal = QVector3D( 0.0f, 0.0f, 1.0f );
 
-      for ( int j = 0; j < 3; ++j )
-      {
-        raw << tri[j].x() << tri[j].y() << tri[j].z()
-            << normal.x() << normal.y() << normal.z();
+        for ( int j = 0; j < 3; ++j )
+        {
+          raw << tri[j].x() << tri[j].y() << tri[j].z()
+              << normal.x() << normal.y() << normal.z();
+        }
       }
-    }
+    };
+
+    appendMeshToPreview( mesh );
   }
 
   vertexBufferData.resize( raw.size() * static_cast<int>( sizeof( float ) ) );
@@ -378,7 +553,7 @@ void ThreeDViewTool::confirmSelection()
 
   if ( !mTempLayer )
   {
-    QString uri = QString( "PolygonZ?crs=%1&field=original_fid:long" )
+    QString uri = QString( "PolygonZ?crs=%1&field=original_fid:long&field=part:string" )
                     .arg( mActiveLayer->crs().authid() );
     QString tempLayerName = QString( "%1_3Dbuilding" ).arg( mActiveLayer->name() );
     mTempLayer = new QgsVectorLayer( uri, tempLayerName, "memory" );
@@ -505,6 +680,7 @@ void ThreeDViewTool::setupUI()
     connect( mUI.layercomboBox, QOverload<int>::of( &QComboBox::currentIndexChanged ), this, &ThreeDViewTool::onLayerChanged );
     connect( mUI.addvector, &QPushButton::clicked, this, &ThreeDViewTool::addVectorData );
     connect( mUI.addpointwould, &QPushButton::clicked, this, &ThreeDViewTool::addPointCloudData );
+    connect( mUI.addraster, &QPushButton::clicked, this, &ThreeDViewTool::addRasterData );
     mWidget->installEventFilter( this );
   }
 
@@ -643,6 +819,29 @@ void ThreeDViewTool::addPointCloudData()
       configurePointCloud3DRenderer( safeLayer );
       refresh3DCanvases();
     } );
+  }
+}
+
+void ThreeDViewTool::addRasterData()
+{
+  if ( !mIface )
+    return;
+
+  const QStringList paths = QFileDialog::getOpenFileNames(
+    mWidget,
+    tr( "Add Raster Data" ),
+    QString(),
+    tr( "Raster data (*.tif *.tiff *.img *.vrt *.jp2 *.png *.jpg *.jpeg);;GeoTIFF (*.tif *.tiff);;All files (*.*)" )
+  );
+
+  if ( paths.isEmpty() )
+    return;
+
+  for ( const QString &path : paths )
+  {
+    QgsRasterLayer *layer = mIface->addRasterLayer( path, QFileInfo( path ).baseName(), QStringLiteral( "gdal" ) );
+    if ( !layer || !layer->isValid() )
+      QMessageBox::warning( mWidget, tr( "Add Raster Data" ), tr( "Failed to load raster layer:\n%1" ).arg( path ) );
   }
 }
 
@@ -975,13 +1174,13 @@ void ThreeDViewTool::updateFeature3D( const QgsFeature &originFeat )
   if ( h <= 0 )
     h = 5.0;
 
-  MeshData mesh = BuildMesh::build( originFeat.geometry(), h );
+  const MeshData mesh = buildMeshForFeature( originFeat, h );
   if ( mesh.isEmpty() )
     return;
 
   QgsFeatureList newTriangles = buildBuildingFromMesh( mesh, QMatrix4x4() );
   for ( QgsFeature &tri : newTriangles )
-    tri.setAttributes( QgsAttributes() << originFeat.id() );
+    tri.setAttributes( QgsAttributes() << originFeat.id() << QStringLiteral( "full" ) );
 
   mTempLayer->startEditing();
 
@@ -1092,6 +1291,15 @@ void ThreeDViewTool::onHeightPreviewFinished( QgsVectorLayer *layer, const QgsFe
   refresh3DCanvases();
 }
 
+void ThreeDViewTool::onRoofModelChanged( QgsVectorLayer *layer, QgsFeatureId fid )
+{
+  if ( !layer || layer != mActiveLayer || !mTempLayer || fid == FID_NULL )
+    return;
+
+  applyFeature3DUpdate( fid );
+  refresh3DCanvases();
+}
+
 void ThreeDViewTool::refreshMemoryData()
 {
   if ( !mTempLayer || !mActiveLayer || mSelectedHeightField.isEmpty() )
@@ -1110,12 +1318,12 @@ void ThreeDViewTool::refreshMemoryData()
     if ( h <= 0 )
       h = 10.0;
 
-    MeshData mesh = BuildMesh::build( f.geometry(), h );
+    const MeshData mesh = buildMeshForFeature( f, h );
     QgsFeatureList triangles = buildBuildingFromMesh( mesh, QMatrix4x4() );
 
     for ( QgsFeature &tri : triangles )
     {
-      tri.setAttributes( QgsAttributes() << f.id() );
+      tri.setAttributes( QgsAttributes() << f.id() << QStringLiteral( "full" ) );
       allTriangles.append( tri );
     }
   }

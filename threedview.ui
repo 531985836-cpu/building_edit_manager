@@ -36,6 +36,13 @@
           </property>
          </widget>
         </item>
+        <item>
+         <widget class="QPushButton" name="addraster">
+          <property name="text">
+           <string>加载影像数据</string>
+          </property>
+         </widget>
+        </item>
        </layout>
       </item>
      </layout>

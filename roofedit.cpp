@@ -1,5 +1,7 @@
 #include "roofedit.h"
 
+#include "buildingeditpreviewbus.h"
+
 #include <qgisinterface.h>
 #include <qgs3dmapcanvas.h>
 #include <qgs3dmapsettings.h>
@@ -19,11 +21,17 @@
 #include <qgsproject.h>
 #include <qgsmarkersymbol.h>
 #include <qgscategorizedsymbolrenderer.h>
+#include <qgsfillsymbol.h>
 #include <qgsnullsymbolrenderer.h>
 #include <qgsphongmaterialsettings.h>
+#include <qgspolygon3dsymbol.h>
 #include <qgsrulebased3drenderer.h>
 #include <qgsrubberband.h>
+#include <qgssinglesymbolrenderer.h>
 #include <qgsvectorlayer.h>
+#include <qgsvectorlayer3drenderer.h>
+#include <qgslayertree.h>
+#include <qgslayertreelayer.h>
 
 #include <Qt3DCore/QEntity>
 #include <Qt3DCore/QTransform>
@@ -131,6 +139,8 @@ void RoofEditTool::setupUi()
   }
 
   connect( mUI.clearPointsButton, &QPushButton::clicked, this, &RoofEditTool::clearCurrentBuildingPoints );
+  connect( mUI.previewRoofButton, &QPushButton::clicked, this, &RoofEditTool::previewRoofModel );
+  connect( mUI.saveRoofButton, &QPushButton::clicked, this, &RoofEditTool::saveRoofModel );
 
   if ( mUI.radioButton_2 )
   {
@@ -242,7 +252,7 @@ bool RoofEditTool::isCandidateBuildingLayer( QgsVectorLayer *layer ) const
     return false;
 
   const QString name = layer->name();
-  if ( name == QLatin1String( "Roof_Edit_Points" ) || name == QLatin1String( "Roof_Edit_3D_Preview_Point" ) || name.endsWith( QLatin1String( "_3Dbuilding" ) ) )
+  if ( name == QLatin1String( "Roof_Edit_Points" ) || name == QLatin1String( "Roof_Saved_Points" ) || name == QLatin1String( "Roof_Edit_Roof_Preview" ) || name == QLatin1String( "Roof_Edit_Roofs" ) || name == QLatin1String( "Roof_Edit_3D_Preview_Point" ) || name.endsWith( QLatin1String( "_3Dbuilding" ) ) )
     return false;
 
   const QgsFields fields = layer->fields();
@@ -414,6 +424,14 @@ bool RoofEditTool::selectBuildingAt( const QgsPointXY &mapPoint )
   if ( !bestFeature.isValid() )
     return false;
 
+  const QgsFeatureId previousBuildingFid = mCurrentBuilding.isValid() ? mCurrentBuilding.id() : FID_NULL;
+  const bool switchingBuilding = previousBuildingFid != FID_NULL && previousBuildingFid != bestFeature.id();
+  if ( switchingBuilding && hasSavedRoofPoints( previousBuildingFid ) )
+  {
+    clearDraftPointsForBuilding( previousBuildingFid, false );
+    notifyRoofModelChanged( previousBuildingFid );
+  }
+
   cancelPointEditPreview();
   mSelectedPointFid = FID_NULL;
   mCurrentBuilding = bestFeature;
@@ -467,6 +485,7 @@ void RoofEditTool::addRoofPointAt( const QgsPointXY &mapPoint )
 
   refreshPointTable();
   ensurePointLayerIn3DView();
+  notifyRoofModelChanged();
   if ( mCanvas )
     mCanvas->refresh();
 }
@@ -526,6 +545,7 @@ void RoofEditTool::deleteRoofPoint( QgsFeatureId fid )
   mPointLayer->triggerRepaint();
   refreshPointTable();
   ensurePointLayerIn3DView();
+  notifyRoofModelChanged();
   if ( mCanvas )
     mCanvas->refresh();
 }
@@ -659,6 +679,7 @@ void RoofEditTool::confirmPointEditPreview()
   clearPointSelection();
   clearPointPreviewDisplay();
   ensurePointLayerIn3DView();
+  notifyRoofModelChanged();
   updatePointEditTip( tr( "点编辑结果已确定。" ) );
   if ( mWidget )
     QMessageBox::information( mWidget, tr( "点编辑" ), tr( "点编辑结果已保存。" ) );
@@ -982,11 +1003,65 @@ void RoofEditTool::ensurePointLayer()
   const QString crs = mActiveLayer && mActiveLayer->crs().isValid()
                         ? mActiveLayer->crs().authid()
                         : ( mCanvas ? mCanvas->mapSettings().destinationCrs().authid() : QStringLiteral( "EPSG:4326" ) );
-  const QString uri = QStringLiteral( "PointZ?crs=%1&field=building_fid:long&field=type:string&field=z:double&field=source:string" ).arg( crs );
+  const QString uri = QStringLiteral( "PointZ?crs=%1&field=building_fid:long&field=type:string&field=z:double&field=source:string&field=base_height:double" ).arg( crs );
   mPointLayer = new QgsVectorLayer( uri, tr( "Roof_Edit_Points" ), QStringLiteral( "memory" ) );
 
   setupPointLayerRenderer();
   QgsProject::instance()->addMapLayer( mPointLayer );
+}
+
+void RoofEditTool::ensureSavedPointLayer()
+{
+  auto ensureSavedFields = [this]() {
+    if ( !mSavedPointLayer )
+      return;
+
+    QList<QgsField> missingFields;
+    if ( mSavedPointLayer->fields().indexOf( QStringLiteral( "base_height" ) ) < 0 )
+      missingFields << QgsField( QStringLiteral( "base_height" ), QVariant::Double );
+    if ( mSavedPointLayer->fields().indexOf( QStringLiteral( "rel_x" ) ) < 0 )
+      missingFields << QgsField( QStringLiteral( "rel_x" ), QVariant::Double );
+    if ( mSavedPointLayer->fields().indexOf( QStringLiteral( "rel_y" ) ) < 0 )
+      missingFields << QgsField( QStringLiteral( "rel_y" ), QVariant::Double );
+
+    if ( !missingFields.isEmpty() )
+    {
+      mSavedPointLayer->dataProvider()->addAttributes( missingFields );
+      mSavedPointLayer->updateFields();
+    }
+  };
+
+  if ( mSavedPointLayer )
+  {
+    ensureSavedFields();
+    return;
+  }
+
+  const QList<QgsMapLayer *> existingLayers = QgsProject::instance()->mapLayersByName( QStringLiteral( "Roof_Saved_Points" ) );
+  if ( !existingLayers.isEmpty() )
+  {
+    mSavedPointLayer = qobject_cast<QgsVectorLayer *>( existingLayers.first() );
+    if ( mSavedPointLayer )
+    {
+      ensureSavedFields();
+      return;
+    }
+  }
+
+  const QString crs = mActiveLayer && mActiveLayer->crs().isValid()
+                        ? mActiveLayer->crs().authid()
+                        : ( mCanvas ? mCanvas->mapSettings().destinationCrs().authid() : QStringLiteral( "EPSG:4326" ) );
+  const QString uri = QStringLiteral( "PointZ?crs=%1&field=building_fid:long&field=type:string&field=z:double&field=source:string&field=base_height:double&field=rel_x:double&field=rel_y:double" ).arg( crs );
+  mSavedPointLayer = new QgsVectorLayer( uri, tr( "Roof_Saved_Points" ), QStringLiteral( "memory" ) );
+  QgsProject::instance()->addMapLayer( mSavedPointLayer, false );
+
+  QgsLayerTree *root = QgsProject::instance()->layerTreeRoot();
+  if ( root )
+  {
+    root->addLayer( mSavedPointLayer );
+    if ( QgsLayerTreeLayer *treeLayer = root->findLayer( mSavedPointLayer->id() ) )
+      treeLayer->setItemVisibilityChecked( false );
+  }
 }
 
 void RoofEditTool::setupPointLayerRenderer()
@@ -1045,6 +1120,418 @@ void RoofEditTool::ensurePointLayerIn3DView()
   {
     dock->show();
     dock->raise();
+  }
+}
+
+void RoofEditTool::ensureRoofPreviewLayer()
+{
+  if ( mRoofPreviewLayer )
+    return;
+
+  const QString crs = mActiveLayer && mActiveLayer->crs().isValid()
+                        ? mActiveLayer->crs().authid()
+                        : ( mCanvas ? mCanvas->mapSettings().destinationCrs().authid() : QStringLiteral( "EPSG:4326" ) );
+  const QString uri = QStringLiteral( "PolygonZ?crs=%1&field=building_fid:long&field=roof_type:string&field=preview:int" ).arg( crs );
+  mRoofPreviewLayer = new QgsVectorLayer( uri, tr( "Roof_Edit_Roof_Preview" ), QStringLiteral( "memory" ) );
+
+  setupRoofLayerRenderer( mRoofPreviewLayer, true );
+  QgsProject::instance()->addMapLayer( mRoofPreviewLayer );
+}
+
+void RoofEditTool::ensureRoofModelLayer()
+{
+  if ( mRoofModelLayer )
+    return;
+
+  const QString crs = mActiveLayer && mActiveLayer->crs().isValid()
+                        ? mActiveLayer->crs().authid()
+                        : ( mCanvas ? mCanvas->mapSettings().destinationCrs().authid() : QStringLiteral( "EPSG:4326" ) );
+  const QString uri = QStringLiteral( "PolygonZ?crs=%1&field=building_fid:long&field=roof_type:string&field=preview:int" ).arg( crs );
+  mRoofModelLayer = new QgsVectorLayer( uri, tr( "Roof_Edit_Roofs" ), QStringLiteral( "memory" ) );
+
+  setupRoofLayerRenderer( mRoofModelLayer, false );
+  QgsProject::instance()->addMapLayer( mRoofModelLayer );
+}
+
+void RoofEditTool::setupRoofLayerRenderer( QgsVectorLayer *layer, bool preview )
+{
+  if ( !layer )
+    return;
+
+  const QString fillColor = preview ? QStringLiteral( "0,170,255,70" ) : QStringLiteral( "30,150,210,120" );
+  const QString outlineColor = preview ? QStringLiteral( "0,115,210,210" ) : QStringLiteral( "20,80,150,230" );
+  std::unique_ptr<QgsFillSymbol> symbol = QgsFillSymbol::createSimple(
+    { { QStringLiteral( "color" ), fillColor },
+      { QStringLiteral( "outline_color" ), outlineColor },
+      { QStringLiteral( "outline_width" ), QStringLiteral( "0.45" ) } } );
+  layer->setRenderer( new QgsSingleSymbolRenderer( symbol.release() ) );
+
+  QgsPolygon3DSymbol *symbol3D = new QgsPolygon3DSymbol();
+  symbol3D->setAltitudeClamping( Qgis::AltitudeClamping::Absolute );
+  QgsPhongMaterialSettings *material = new QgsPhongMaterialSettings();
+  const QColor color = preview ? QColor( 0, 170, 255, 150 ) : QColor( 30, 150, 210, 185 );
+  material->setAmbient( color.darker( 130 ) );
+  material->setDiffuse( color );
+  symbol3D->setMaterialSettings( material );
+
+  QgsVectorLayer3DRenderer *renderer3D = new QgsVectorLayer3DRenderer();
+  renderer3D->setLayer( layer );
+  renderer3D->setSymbol( symbol3D );
+  layer->setRenderer3D( renderer3D );
+}
+
+void RoofEditTool::ensureLayerIn3DView( QgsVectorLayer *layer )
+{
+  if ( !mIface || !layer )
+    return;
+
+  Qgs3DMapCanvas *canvas3D = mIface->mapCanvases3D().isEmpty()
+                               ? mIface->createNewMapCanvas3D( tr( "3D Preview" ) )
+                               : mIface->mapCanvases3D().first();
+  if ( !canvas3D || !canvas3D->mapSettings() )
+    return;
+
+  QList<QgsMapLayer *> layers = canvas3D->mapSettings()->layers();
+  if ( !layers.contains( layer ) )
+  {
+    layers.append( layer );
+    canvas3D->mapSettings()->setLayers( layers );
+  }
+
+  if ( QWidget *dock = qobject_cast<QWidget *>( canvas3D->parent() ) )
+  {
+    dock->show();
+    dock->raise();
+  }
+
+  if ( QWidget *canvasWidget = qobject_cast<QWidget *>( canvas3D ) )
+    canvasWidget->update();
+}
+
+QList<BuildingRoof::RoofPoint> RoofEditTool::currentRoofPoints() const
+{
+  QList<BuildingRoof::RoofPoint> points;
+  if ( !mPointLayer || !mCurrentBuilding.isValid() )
+    return points;
+
+  QgsFeatureRequest request;
+  request.setFilterExpression( QStringLiteral( "building_fid = %1" ).arg( mCurrentBuilding.id() ) );
+  QgsFeatureIterator it = mPointLayer->getFeatures( request );
+  QgsFeature feature;
+
+  while ( it.nextFeature( feature ) )
+  {
+    if ( !feature.hasGeometry() )
+      continue;
+
+    const QgsPoint *point = qgsgeometry_cast<const QgsPoint *>( feature.geometry().constGet() );
+    if ( !point )
+      continue;
+
+    QgsPoint roofPoint = *point;
+    bool ok = false;
+    const double z = feature.attribute( QStringLiteral( "z" ) ).toDouble( &ok );
+    if ( ok )
+      roofPoint.setZ( z );
+
+    points.append( BuildingRoof::RoofPoint{ roofPoint, feature.attribute( QStringLiteral( "type" ) ).toString() } );
+  }
+
+  return points;
+}
+
+void RoofEditTool::saveCurrentRoofPoints()
+{
+  if ( !mCurrentBuilding.isValid() || !mPointLayer )
+    return;
+
+  ensureSavedPointLayer();
+  if ( !mSavedPointLayer )
+    return;
+
+  QgsFeatureIds oldIds;
+  QgsFeatureRequest savedRequest;
+  savedRequest.setFilterExpression( QStringLiteral( "building_fid = %1" ).arg( mCurrentBuilding.id() ) );
+  QgsFeatureIterator savedIt = mSavedPointLayer->getFeatures( savedRequest );
+  QgsFeature savedFeature;
+  while ( savedIt.nextFeature( savedFeature ) )
+    oldIds.insert( savedFeature.id() );
+
+  QgsFeatureList newFeatures;
+  const QgsRectangle buildingBounds = mCurrentBuilding.geometry().boundingBox();
+  const double width = buildingBounds.width();
+  const double height = buildingBounds.height();
+  QgsFeatureRequest draftRequest;
+  draftRequest.setFilterExpression( QStringLiteral( "building_fid = %1" ).arg( mCurrentBuilding.id() ) );
+  QgsFeatureIterator draftIt = mPointLayer->getFeatures( draftRequest );
+  QgsFeature draftFeature;
+  while ( draftIt.nextFeature( draftFeature ) )
+  {
+    const QgsPoint *draftPoint = draftFeature.hasGeometry() ? qgsgeometry_cast<const QgsPoint *>( draftFeature.geometry().constGet() ) : nullptr;
+    if ( !draftPoint )
+      continue;
+
+    const double relX = width > 1e-12 ? ( draftPoint->x() - buildingBounds.xMinimum() ) / width : 0.5;
+    const double relY = height > 1e-12 ? ( draftPoint->y() - buildingBounds.yMinimum() ) / height : 0.5;
+
+    QgsFeature feature( mSavedPointLayer->fields() );
+    feature.setGeometry( draftFeature.geometry() );
+    feature.setAttribute( QStringLiteral( "building_fid" ), mCurrentBuilding.id() );
+    feature.setAttribute( QStringLiteral( "type" ), draftFeature.attribute( QStringLiteral( "type" ) ) );
+    feature.setAttribute( QStringLiteral( "z" ), draftFeature.attribute( QStringLiteral( "z" ) ) );
+    feature.setAttribute( QStringLiteral( "source" ), draftFeature.attribute( QStringLiteral( "source" ) ) );
+    feature.setAttribute( QStringLiteral( "base_height" ), QVariant() );
+    feature.setAttribute( QStringLiteral( "rel_x" ), relX );
+    feature.setAttribute( QStringLiteral( "rel_y" ), relY );
+    newFeatures.append( feature );
+  }
+
+  if ( !mSavedPointLayer->isEditable() )
+    mSavedPointLayer->startEditing();
+  if ( !oldIds.isEmpty() )
+    mSavedPointLayer->deleteFeatures( oldIds );
+  if ( !newFeatures.isEmpty() )
+    mSavedPointLayer->addFeatures( newFeatures );
+  mSavedPointLayer->commitChanges();
+  mSavedPointLayer->triggerRepaint();
+}
+
+bool RoofEditTool::hasSavedRoofPoints( QgsFeatureId buildingFid ) const
+{
+  if ( buildingFid == FID_NULL )
+    return false;
+
+  const QList<QgsMapLayer *> layers = QgsProject::instance()->mapLayersByName( QStringLiteral( "Roof_Saved_Points" ) );
+  if ( layers.isEmpty() )
+    return false;
+
+  QgsVectorLayer *savedLayer = qobject_cast<QgsVectorLayer *>( layers.first() );
+  if ( !savedLayer )
+    return false;
+
+  QgsFeatureRequest request;
+  request.setFilterExpression( QStringLiteral( "building_fid = %1" ).arg( buildingFid ) );
+  QgsFeature feature;
+  return savedLayer->getFeatures( request ).nextFeature( feature );
+}
+
+void RoofEditTool::clearDraftPointsForBuilding( QgsFeatureId buildingFid, bool refreshUi )
+{
+  if ( !mPointLayer || buildingFid == FID_NULL )
+    return;
+
+  QgsFeatureRequest request;
+  request.setFilterExpression( QStringLiteral( "building_fid = %1" ).arg( buildingFid ) );
+  QgsFeatureIterator it = mPointLayer->getFeatures( request );
+  QgsFeature feature;
+  QgsFeatureIds ids;
+  while ( it.nextFeature( feature ) )
+    ids.insert( feature.id() );
+
+  if ( ids.isEmpty() )
+    return;
+
+  if ( ids.contains( mMovingPointFid ) )
+    clearPositionPreview();
+  if ( ids.contains( mSelectedPointFid ) )
+    mSelectedPointFid = FID_NULL;
+  if ( ids.contains( mPreviewPointFid ) )
+  {
+    mHasPointEditPreview = false;
+    mPreviewPointFid = FID_NULL;
+    clearPointPreviewDisplay();
+    updatePointEditTip();
+  }
+
+  if ( !mPointLayer->isEditable() )
+    mPointLayer->startEditing();
+  mPointLayer->deleteFeatures( ids );
+  mPointLayer->commitChanges();
+  mPointLayer->triggerRepaint();
+
+  if ( refreshUi )
+    refreshPointTable();
+  if ( mCanvas )
+    mCanvas->refresh();
+}
+
+void RoofEditTool::notifyRoofModelChanged()
+{
+  if ( mCurrentBuilding.isValid() )
+    notifyRoofModelChanged( mCurrentBuilding.id() );
+}
+
+void RoofEditTool::notifyRoofModelChanged( QgsFeatureId buildingFid )
+{
+  if ( mActiveLayer && buildingFid != FID_NULL )
+    emit BuildingEditPreviewBus::instance()->roofModelChanged( mActiveLayer, buildingFid );
+}
+
+bool RoofEditTool::updateRoofLayerFeature( QgsVectorLayer *layer, const QgsGeometry &geometry, bool preview )
+{
+  if ( !layer || !mCurrentBuilding.isValid() || geometry.isNull() || geometry.isEmpty() )
+    return false;
+
+  QgsFeatureIds oldIds;
+  QgsFeatureRequest request;
+  request.setFilterExpression( QStringLiteral( "building_fid = %1" ).arg( mCurrentBuilding.id() ) );
+  QgsFeatureIterator it = layer->getFeatures( request );
+  QgsFeature oldFeature;
+  while ( it.nextFeature( oldFeature ) )
+    oldIds.insert( oldFeature.id() );
+
+  if ( !layer->isEditable() )
+    layer->startEditing();
+
+  if ( !oldIds.isEmpty() )
+    layer->deleteFeatures( oldIds );
+
+  QgsFeature feature( layer->fields() );
+  feature.setGeometry( geometry );
+  feature.setAttribute( QStringLiteral( "building_fid" ), mCurrentBuilding.id() );
+  feature.setAttribute( QStringLiteral( "roof_type" ), mUI.roofTypeComboBox ? mUI.roofTypeComboBox->currentText() : tr( "单坡屋顶" ) );
+  feature.setAttribute( QStringLiteral( "preview" ), preview ? 1 : 0 );
+  layer->addFeature( feature );
+  layer->commitChanges();
+  layer->triggerRepaint();
+
+  if ( mCanvas )
+    mCanvas->refresh();
+  return true;
+}
+
+void RoofEditTool::previewRoofModel()
+{
+  if ( !mCurrentBuilding.isValid() )
+  {
+    QMessageBox::warning( mWidget, tr( "Roof preview" ), tr( "Please select a building feature first." ) );
+    return;
+  }
+
+  if ( mHasPointEditPreview )
+  {
+    QMessageBox::warning( mWidget, tr( "Roof preview" ), tr( "Please press Enter to save the current key point edit first." ) );
+    return;
+  }
+
+  const QList<BuildingRoof::RoofPoint> roofPoints = currentRoofPoints();
+  BuildingRoof::MeshResult roofMesh = BuildingRoof::buildSingleSlopePrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
+  if ( !roofMesh.success )
+    roofMesh = BuildingRoof::buildGabledRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
+  if ( !roofMesh.success )
+    roofMesh = BuildingRoof::buildHippedRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
+  if ( !roofMesh.success )
+    roofMesh = BuildingRoof::buildMultiRidgePrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
+  if ( !roofMesh.success )
+  {
+    QMessageBox::warning( mWidget, tr( "Roof preview" ), roofMesh.error );
+    return;
+  }
+
+  notifyRoofModelChanged();
+  return;
+
+  if ( !mCurrentBuilding.isValid() )
+  {
+    QMessageBox::warning( mWidget, tr( "屋顶预览" ), tr( "请先选择一个建筑物面要素。" ) );
+    return;
+  }
+
+  if ( mHasPointEditPreview )
+  {
+    QMessageBox::warning( mWidget, tr( "屋顶预览" ), tr( "请先按 Enter 保存当前关键点编辑结果。" ) );
+    return;
+  }
+
+  const BuildingRoof::Result roof = BuildingRoof::buildSingleSlopeRoof( mCurrentBuilding.geometry(), currentRoofPoints() );
+  if ( !roof.success )
+  {
+    QMessageBox::warning( mWidget, tr( "屋顶预览" ), roof.error );
+    return;
+  }
+
+  ensureRoofPreviewLayer();
+  if ( updateRoofLayerFeature( mRoofPreviewLayer, roof.geometry, true ) )
+    ensureLayerIn3DView( mRoofPreviewLayer );
+}
+
+void RoofEditTool::saveRoofModel()
+{
+  if ( !mCurrentBuilding.isValid() )
+  {
+    QMessageBox::warning( mWidget, tr( "Save roof" ), tr( "Please select a building feature first." ) );
+    return;
+  }
+
+  if ( mHasPointEditPreview )
+  {
+    QMessageBox::warning( mWidget, tr( "Save roof" ), tr( "Please press Enter to save the current key point edit first." ) );
+    return;
+  }
+
+  const QList<BuildingRoof::RoofPoint> roofPoints = currentRoofPoints();
+  BuildingRoof::MeshResult roofMesh = BuildingRoof::buildSingleSlopePrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
+  if ( !roofMesh.success )
+    roofMesh = BuildingRoof::buildGabledRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
+  if ( !roofMesh.success )
+    roofMesh = BuildingRoof::buildHippedRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
+  if ( !roofMesh.success )
+    roofMesh = BuildingRoof::buildMultiRidgePrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
+  if ( !roofMesh.success )
+  {
+    QMessageBox::warning( mWidget, tr( "Save roof" ), roofMesh.error );
+    return;
+  }
+
+  const QgsFeatureId savedBuildingFid = mCurrentBuilding.id();
+  saveCurrentRoofPoints();
+  clearDraftPointsForBuilding( savedBuildingFid, true );
+  notifyRoofModelChanged( savedBuildingFid );
+  QMessageBox::information( mWidget, tr( "Save roof" ), tr( "Roof key points saved. The 3D building mesh has been rebuilt." ) );
+
+  cancelPointEditPreview();
+  clearPointSelection();
+  if ( mActiveLayer )
+    mActiveLayer->removeSelection();
+  if ( mUI.radioButton_2 )
+    mUI.radioButton_2->setChecked( false );
+  if ( mUI.radioButton )
+    mUI.radioButton->setChecked( false );
+  if ( mUI.editModeRadioButton )
+    mUI.editModeRadioButton->setChecked( false );
+  mCurrentBuilding = QgsFeature();
+  if ( mUI.pointTableWidget )
+    mUI.pointTableWidget->setRowCount( 0 );
+  if ( mWidget )
+    mWidget->hide();
+  if ( mCanvas )
+    mCanvas->refresh();
+  return;
+
+  if ( !mCurrentBuilding.isValid() )
+  {
+    QMessageBox::warning( mWidget, tr( "保存屋顶" ), tr( "请先选择一个建筑物面要素。" ) );
+    return;
+  }
+
+  if ( mHasPointEditPreview )
+  {
+    QMessageBox::warning( mWidget, tr( "保存屋顶" ), tr( "请先按 Enter 保存当前关键点编辑结果。" ) );
+    return;
+  }
+
+  const BuildingRoof::Result roof = BuildingRoof::buildSingleSlopeRoof( mCurrentBuilding.geometry(), currentRoofPoints() );
+  if ( !roof.success )
+  {
+    QMessageBox::warning( mWidget, tr( "保存屋顶" ), roof.error );
+    return;
+  }
+
+  ensureRoofModelLayer();
+  if ( updateRoofLayerFeature( mRoofModelLayer, roof.geometry, false ) )
+  {
+    ensureLayerIn3DView( mRoofModelLayer );
+    QMessageBox::information( mWidget, tr( "保存屋顶" ), tr( "屋顶模型已保存。" ) );
   }
 }
 
@@ -1141,6 +1628,7 @@ void RoofEditTool::clearCurrentBuildingPoints()
   mPointLayer->commitChanges();
   mPointLayer->triggerRepaint();
   refreshPointTable();
+  notifyRoofModelChanged();
   if ( mCanvas )
     mCanvas->refresh();
 }

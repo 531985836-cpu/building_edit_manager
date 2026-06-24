@@ -10,6 +10,7 @@
 #include <QPointer>
 #include <QWidget>
 
+#include "buildingroof.h"
 #include "ui_roofedit.h"
 
 class QgsMapCanvas;
@@ -53,6 +54,8 @@ class RoofEditTool : public QgsMapTool
     void clearCurrentBuildingPoints();
     void onPointSelectionChanged();
     void confirmPointEditPreview();
+    void previewRoofModel();
+    void saveRoofModel();
 
   private:
     void setupUi();
@@ -89,7 +92,19 @@ class RoofEditTool : public QgsMapTool
     void updatePositionPreview( const QgsPointXY &mapPoint );
     void clearPositionPreview();
     void ensurePointLayer();
+    void ensureSavedPointLayer();
     void ensurePointLayerIn3DView();
+    void ensureRoofPreviewLayer();
+    void ensureRoofModelLayer();
+    void setupRoofLayerRenderer( QgsVectorLayer *layer, bool preview );
+    void ensureLayerIn3DView( QgsVectorLayer *layer );
+    QList<BuildingRoof::RoofPoint> currentRoofPoints() const;
+    bool updateRoofLayerFeature( QgsVectorLayer *layer, const QgsGeometry &geometry, bool preview );
+    void saveCurrentRoofPoints();
+    bool hasSavedRoofPoints( QgsFeatureId buildingFid ) const;
+    void clearDraftPointsForBuilding( QgsFeatureId buildingFid, bool refreshUi );
+    void notifyRoofModelChanged();
+    void notifyRoofModelChanged( QgsFeatureId buildingFid );
     void refreshPointTable();
     void setupPointLayerRenderer();
     QString currentPointType() const;
@@ -105,6 +120,9 @@ class RoofEditTool : public QgsMapTool
     QPointer<QgsVectorLayer> mActiveLayer = nullptr;
     QPointer<QgsPointCloudLayer> mPointCloudLayer = nullptr;
     QPointer<QgsVectorLayer> mPointLayer = nullptr;
+    QPointer<QgsVectorLayer> mSavedPointLayer = nullptr;
+    QPointer<QgsVectorLayer> mRoofPreviewLayer = nullptr;
+    QPointer<QgsVectorLayer> mRoofModelLayer = nullptr;
     QPointer<QgsRubberBand> mPointPreviewRubberBand = nullptr;
     QPointer<Qgs3DMapCanvas> mPreviewCanvas3D = nullptr;
     QPointer<Qt3DCore::QEntity> mPreviewRootEntity = nullptr;

@@ -9,12 +9,14 @@
 #include <QPointer>
 #include <QTimer>
 
+#include "buildingroof.h"
 #include "ui_threedview.h"
 
 class QgsVectorLayer;
 class QgsMapLayer;
 class QgsMapCanvas;
 class QgsPointCloudLayer;
+class QgsRasterLayer;
 class QgisInterface;
 namespace Qt3DCore
 {
@@ -81,6 +83,9 @@ class ThreeDViewTool : public QgsMapTool
     void applyFeature3DUpdate( QgsFeatureId fid );
     void flushPendingFeatureUpdates();
     void removeTempFeatures( const QgsFeatureIds &fids );
+    QList<BuildingRoof::RoofPoint> roofPointsForFeature( const QgsFeature &feature, bool *fromSavedLayer = nullptr );
+    double savedRoofBaseHeight( QgsFeatureId fid, double currentHeight );
+    MeshData buildMeshForFeature( const QgsFeature &feature, double height );
     void ensurePreviewEntity();
     void updatePreviewEntity( QgsVectorLayer *layer, const QgsFeatureIds &fids, const QString &heightFieldName, double height );
     void clearPreviewEntity();
@@ -88,12 +93,14 @@ class ThreeDViewTool : public QgsMapTool
   private slots:
     void addVectorData();
     void addPointCloudData();
+    void addRasterData();
     void onFeatureUpdated( QgsFeatureId fid );
     void onFeaturesDeleted( const QgsFeatureIds &fids );
     void onLayerChanged( int index );
     void onFeatureAdded( QgsFeatureId fid );
     void onHeightPreviewChanged( QgsVectorLayer *layer, const QgsFeatureIds &fids, const QString &heightFieldName, double height );
     void onHeightPreviewFinished( QgsVectorLayer *layer, const QgsFeatureIds &fids, const QString &heightFieldName, double height );
+    void onRoofModelChanged( QgsVectorLayer *layer, QgsFeatureId fid );
 
   private:
     // UI 成员
