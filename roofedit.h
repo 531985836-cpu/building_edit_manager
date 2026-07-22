@@ -55,6 +55,7 @@ class RoofEditTool : public QgsMapTool
     void onPointSelectionChanged();
     void confirmPointEditPreview();
     void previewRoofModel();
+    void deleteRoofModel();
     void saveRoofModel();
 
   private:
@@ -99,6 +100,7 @@ class RoofEditTool : public QgsMapTool
     void setupRoofLayerRenderer( QgsVectorLayer *layer, bool preview );
     void ensureLayerIn3DView( QgsVectorLayer *layer );
     QList<BuildingRoof::RoofPoint> currentRoofPoints() const;
+    bool normalizeCurrentRidgeHeights( bool refreshUi );
     bool updateRoofLayerFeature( QgsVectorLayer *layer, const QgsGeometry &geometry, bool preview );
     void saveCurrentRoofPoints();
     bool hasSavedRoofPoints( QgsFeatureId buildingFid ) const;
@@ -109,7 +111,8 @@ class RoofEditTool : public QgsMapTool
     void setupPointLayerRenderer();
     QString currentPointType() const;
     QColor colorForPointType( const QString &type ) const;
-    double estimateHeightFromPointCloud( const QgsPointXY &mapPoint ) const;
+    double estimateHeightFromPointCloud( const QgsPointXY &mapPoint, const QString &pointType ) const;
+    QVector<BuildingRoof::RoofSample> collectPointCloudSamplesForGeometry( const QgsGeometry &geometry, int maxSamples = 20000 ) const;
     void collectNodes( const QgsPointCloudIndex &index, const QgsPointCloudNodeId &nodeId, const QgsRectangle &extent, QList<QgsPointCloudNodeId> &nodes ) const;
 
     QPointer<QgisInterface> mIface = nullptr;

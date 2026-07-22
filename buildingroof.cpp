@@ -23,6 +23,38 @@ namespace
     double z = 0.0;
   };
 
+  struct LineInterval
+  {
+    double start = 0.0;
+    double end = 0.0;
+  };
+
+  struct BentGableSegment
+  {
+    QgsPointXY start;
+    QgsPointXY end;
+    QgsPoint ridgePoint;
+    double dirX = 0.0;
+    double dirY = 0.0;
+    double normalX = 0.0;
+    double normalY = 0.0;
+    double length = 0.0;
+    double sameSideLimit = 0.0;
+    double oppositeLimit = 0.0;
+  };
+
+  struct ClusterSample
+  {
+    QgsPointXY point;
+    double u = 0.0;
+    double v = 0.0;
+    int cluster = -1;
+    bool visited = false;
+  };
+
+  double profileRoofZ( const QVector<ProfileAnchor> &anchors, double s );
+  void appendProfileAnchor( QVector<ProfileAnchor> &anchors, double s, double z );
+
   bool isGroundPointType( const QString &type )
   {
     return type.contains( QStringLiteral( "地面" ) )
@@ -37,12 +69,27 @@ namespace
            || type.contains( QStringLiteral( "ridge" ), Qt::CaseInsensitive );
   }
 
+  bool isVertexPointType( const QString &type )
+  {
+    return type.contains( QStringLiteral( "顶点" ) )
+           || type.contains( QStringLiteral( "vertex" ), Qt::CaseInsensitive );
+  }
+
+  bool isSurfacePointType( const QString &type )
+  {
+    return type.contains( QStringLiteral( "曲面点" ) )
+           || type.contains( QStringLiteral( "surface" ), Qt::CaseInsensitive );
+  }
+
   QList<BuildingRoof::RoofPoint> boundaryPoints( const QList<BuildingRoof::RoofPoint> &roofPoints )
   {
     QList<BuildingRoof::RoofPoint> points;
     for ( const BuildingRoof::RoofPoint &roofPoint : roofPoints )
     {
-      if ( !isGroundPointType( roofPoint.type ) && !isRidgePointType( roofPoint.type ) )
+      if ( !isGroundPointType( roofPoint.type )
+           && !isRidgePointType( roofPoint.type )
+           && !isVertexPointType( roofPoint.type )
+           && !isSurfacePointType( roofPoint.type ) )
         points.append( roofPoint );
     }
     return points;
@@ -64,6 +111,28 @@ namespace
     for ( const BuildingRoof::RoofPoint &roofPoint : roofPoints )
     {
       if ( isRidgePointType( roofPoint.type ) )
+        points.append( roofPoint );
+    }
+    return points;
+  }
+
+  QList<BuildingRoof::RoofPoint> vertexPoints( const QList<BuildingRoof::RoofPoint> &roofPoints )
+  {
+    QList<BuildingRoof::RoofPoint> points;
+    for ( const BuildingRoof::RoofPoint &roofPoint : roofPoints )
+    {
+      if ( isVertexPointType( roofPoint.type ) )
+        points.append( roofPoint );
+    }
+    return points;
+  }
+
+  QList<BuildingRoof::RoofPoint> surfacePoints( const QList<BuildingRoof::RoofPoint> &roofPoints )
+  {
+    QList<BuildingRoof::RoofPoint> points;
+    for ( const BuildingRoof::RoofPoint &roofPoint : roofPoints )
+    {
+      if ( isSurfacePointType( roofPoint.type ) )
         points.append( roofPoint );
     }
     return points;
@@ -107,6 +176,95 @@ namespace
       std::reverse( ring.begin(), ring.end() );
 
     return ring;
+  }
+
+  QgsGeometry polygonGeometryFromRing( const QVector<QgsPointXY> &ring )
+  {
+    if ( ring.size() < 3 )
+      return QgsGeometry();
+
+    QgsPolylineXY exterior;
+    exterior.reserve( ring.size() + 1 );
+    for ( const QgsPointXY &point : ring )
+      exterior.append( point );
+    exterior.append( ring.first() );
+
+    QgsPolygonXY polygon;
+    polygon.append( exterior );
+    return QgsGeometry::fromPolygonXY( polygon );
+  }
+
+  QVector<QVector<QgsPointXY>> exteriorRingsFromGeometry( const QgsGeometry &geometry )
+  {
+    QVector<QVector<QgsPointXY>> rings;
+    if ( geometry.isNull() || geometry.isEmpty() )
+      return rings;
+
+    const QgsPolygonXY polygon = geometry.asPolygon();
+    if ( !polygon.isEmpty() )
+    {
+      const QVector<QgsPointXY> ring = exteriorRing( polygon );
+      if ( ring.size() >= 3 )
+        rings.append( ring );
+      return rings;
+    }
+
+    const QgsMultiPolygonXY multiPolygon = geometry.asMultiPolygon();
+    for ( const QgsPolygonXY &part : multiPolygon )
+    {
+      const QVector<QgsPointXY> ring = exteriorRing( part );
+      if ( ring.size() >= 3 )
+        rings.append( ring );
+    }
+    return rings;
+  }
+
+  QVector<QgsPointXY> openRing( const QgsPolylineXY &ring )
+  {
+    QVector<QgsPointXY> points;
+    for ( const QgsPointXY &point : ring )
+    {
+      if ( points.isEmpty() || point != points.last() )
+        points.append( point );
+    }
+    if ( points.size() > 1 && points.first() == points.last() )
+      points.removeLast();
+    return points;
+  }
+
+  QVector<QgsPointXY> geometryRingPoints( const QgsGeometry &geometry )
+  {
+    QVector<QgsPointXY> points;
+    auto appendPolygon = [&points]( const QgsPolygonXY &polygon ) {
+      for ( const QgsPolylineXY &ring : polygon )
+      {
+        for ( const QgsPointXY &point : openRing( ring ) )
+        {
+          bool exists = false;
+          for ( const QgsPointXY &existing : points )
+          {
+            if ( existing == point )
+            {
+              exists = true;
+              break;
+            }
+          }
+          if ( !exists )
+            points.append( point );
+        }
+      }
+    };
+
+    const QgsPolygonXY polygon = geometry.asPolygon();
+    if ( !polygon.isEmpty() )
+      appendPolygon( polygon );
+    else
+    {
+      const QgsMultiPolygonXY multiPolygon = geometry.asMultiPolygon();
+      for ( const QgsPolygonXY &part : multiPolygon )
+        appendPolygon( part );
+    }
+    return points;
   }
 
   QVector<int> triangulateRing( const QVector<QgsPointXY> &ring )
@@ -174,6 +332,182 @@ namespace
     return result;
   }
 
+  void appendVerticalWall( BuildingRoof::Mesh &mesh, const QVector<QgsPointXY> &ring, double lowerZ, double upperZ )
+  {
+    if ( ring.size() < 2 || std::fabs( upperZ - lowerZ ) <= 1e-8 )
+      return;
+
+    const int count = ring.size();
+    for ( int i = 0; i < count; ++i )
+    {
+      const QgsPointXY &a = ring[i];
+      const QgsPointXY &b = ring[( i + 1 ) % count];
+      const int offset = mesh.vertices.size();
+      mesh.vertices.append( QgsPoint( a.x(), a.y(), lowerZ ) );
+      mesh.vertices.append( QgsPoint( b.x(), b.y(), lowerZ ) );
+      mesh.vertices.append( QgsPoint( a.x(), a.y(), upperZ ) );
+      mesh.vertices.append( QgsPoint( b.x(), b.y(), upperZ ) );
+      mesh.indices << offset << offset + 1 << offset + 2;
+      mesh.indices << offset + 2 << offset + 1 << offset + 3;
+    }
+  }
+
+  void appendHorizontalRingSurface( BuildingRoof::Mesh &mesh, const QVector<QgsPointXY> &ring, double z, bool flip = false )
+  {
+    if ( ring.size() < 3 )
+      return;
+
+    QVector<QgsPointXY> localRing = ring;
+    double area = 0.0;
+    for ( int i = 0; i < localRing.size(); ++i )
+    {
+      const QgsPointXY &a = localRing[i];
+      const QgsPointXY &b = localRing[( i + 1 ) % localRing.size()];
+      area += a.x() * b.y() - b.x() * a.y();
+    }
+    if ( area < 0.0 )
+      std::reverse( localRing.begin(), localRing.end() );
+
+    const int offset = mesh.vertices.size();
+    for ( const QgsPointXY &point : localRing )
+      mesh.vertices.append( QgsPoint( point.x(), point.y(), z ) );
+
+    const QVector<int> triangles = triangulateRing( localRing );
+    for ( int i = 0; i + 2 < triangles.size(); i += 3 )
+    {
+      if ( flip )
+        mesh.indices << offset + triangles[i] << offset + triangles[i + 2] << offset + triangles[i + 1];
+      else
+        mesh.indices << offset + triangles[i] << offset + triangles[i + 1] << offset + triangles[i + 2];
+    }
+  }
+
+  void appendApexRoofSurface( BuildingRoof::Mesh &mesh, const QVector<QgsPointXY> &ring, double eaveHeight, const QgsPoint &apexPoint )
+  {
+    if ( ring.size() < 3 )
+      return;
+
+    const int count = ring.size();
+    for ( int i = 0; i < count; ++i )
+    {
+      const QgsPointXY &a = ring[i];
+      const QgsPointXY &b = ring[( i + 1 ) % count];
+      const int offset = mesh.vertices.size();
+      mesh.vertices.append( QgsPoint( a.x(), a.y(), eaveHeight ) );
+      mesh.vertices.append( QgsPoint( b.x(), b.y(), eaveHeight ) );
+      mesh.vertices.append( apexPoint );
+      mesh.indices << offset << offset + 1 << offset + 2;
+    }
+  }
+
+  double distanceToRing2( const QVector<QgsPointXY> &ring, const QgsPointXY &point );
+
+  void appendHorizontalGeometrySurface( BuildingRoof::Mesh &mesh, const QgsGeometry &geometry, double z, bool flip = false )
+  {
+    if ( geometry.isNull() || geometry.isEmpty() )
+      return;
+
+    const QVector<QgsPointXY> points = geometryRingPoints( geometry );
+    if ( points.size() < 3 )
+      return;
+
+    QgsMultiPointXY pointSet;
+    for ( const QgsPointXY &point : points )
+      pointSet.append( point );
+
+    QgsGeometry tin = QgsGeometry::fromMultiPointXY( pointSet ).delaunayTriangulation( 0.0, false );
+    QVector<QgsGeometry> triangles = tin.asGeometryCollection();
+    if ( triangles.isEmpty() && !tin.isNull() )
+      triangles.append( tin );
+
+    for ( const QgsGeometry &triangleGeometry : triangles )
+    {
+      const QgsPolygonXY triangle = triangleGeometry.asPolygon();
+      if ( triangle.isEmpty() || triangle.first().size() < 4 )
+        continue;
+
+      const QgsPolylineXY triangleRing = triangle.first();
+      const QgsPointXY a = triangleRing.at( 0 );
+      const QgsPointXY b = triangleRing.at( 1 );
+      const QgsPointXY c = triangleRing.at( 2 );
+      const QgsPointXY centroid( ( a.x() + b.x() + c.x() ) / 3.0, ( a.y() + b.y() + c.y() ) / 3.0 );
+      if ( !geometry.contains( QgsGeometry::fromPointXY( centroid ) ) )
+        continue;
+
+      const int offset = mesh.vertices.size();
+      mesh.vertices.append( QgsPoint( a.x(), a.y(), z ) );
+      mesh.vertices.append( QgsPoint( b.x(), b.y(), z ) );
+      mesh.vertices.append( QgsPoint( c.x(), c.y(), z ) );
+      if ( flip )
+        mesh.indices << offset << offset + 2 << offset + 1;
+      else
+        mesh.indices << offset << offset + 1 << offset + 2;
+    }
+  }
+
+  double distanceToRings2( const QVector<QVector<QgsPointXY>> &rings, const QgsPointXY &point )
+  {
+    double bestDistance = std::numeric_limits<double>::max();
+    for ( const QVector<QgsPointXY> &ring : rings )
+    {
+      if ( ring.size() >= 2 )
+        bestDistance = std::min( bestDistance, distanceToRing2( ring, point ) );
+    }
+    return bestDistance;
+  }
+
+  double flatTopHippedRoofZ( const QgsPointXY &point, const QVector<QgsPointXY> &outerRing, const QVector<QVector<QgsPointXY>> &topRings, double baseHeight, double topHeight )
+  {
+    const double outerDistance = std::sqrt( std::max( 0.0, distanceToRing2( outerRing, point ) ) );
+    const double topDistance = std::sqrt( std::max( 0.0, distanceToRings2( topRings, point ) ) );
+    const double total = outerDistance + topDistance;
+    if ( total <= 1e-8 )
+      return topHeight;
+
+    const double t = std::max( 0.0, std::min( 1.0, outerDistance / total ) );
+    return baseHeight + ( topHeight - baseHeight ) * t;
+  }
+
+  void appendSlopedFlatTopHippedSurface( BuildingRoof::Mesh &mesh, const QgsGeometry &geometry, const QVector<QgsPointXY> &outerRing, const QVector<QVector<QgsPointXY>> &topRings, double baseHeight, double topHeight )
+  {
+    if ( geometry.isNull() || geometry.isEmpty() || outerRing.size() < 3 || topRings.isEmpty() )
+      return;
+
+    const QVector<QgsPointXY> points = geometryRingPoints( geometry );
+    if ( points.size() < 3 )
+      return;
+
+    QgsMultiPointXY pointSet;
+    for ( const QgsPointXY &point : points )
+      pointSet.append( point );
+
+    QgsGeometry tin = QgsGeometry::fromMultiPointXY( pointSet ).delaunayTriangulation( 0.0, false );
+    QVector<QgsGeometry> triangles = tin.asGeometryCollection();
+    if ( triangles.isEmpty() && !tin.isNull() )
+      triangles.append( tin );
+
+    for ( const QgsGeometry &triangleGeometry : triangles )
+    {
+      const QgsPolygonXY triangle = triangleGeometry.asPolygon();
+      if ( triangle.isEmpty() || triangle.first().size() < 4 )
+        continue;
+
+      const QgsPolylineXY triangleRing = triangle.first();
+      const QgsPointXY a = triangleRing.at( 0 );
+      const QgsPointXY b = triangleRing.at( 1 );
+      const QgsPointXY c = triangleRing.at( 2 );
+      const QgsPointXY centroid( ( a.x() + b.x() + c.x() ) / 3.0, ( a.y() + b.y() + c.y() ) / 3.0 );
+      if ( !geometry.contains( QgsGeometry::fromPointXY( centroid ) ) )
+        continue;
+
+      const int offset = mesh.vertices.size();
+      mesh.vertices.append( QgsPoint( a.x(), a.y(), flatTopHippedRoofZ( a, outerRing, topRings, baseHeight, topHeight ) ) );
+      mesh.vertices.append( QgsPoint( b.x(), b.y(), flatTopHippedRoofZ( b, outerRing, topRings, baseHeight, topHeight ) ) );
+      mesh.vertices.append( QgsPoint( c.x(), c.y(), flatTopHippedRoofZ( c, outerRing, topRings, baseHeight, topHeight ) ) );
+      mesh.indices << offset << offset + 1 << offset + 2;
+    }
+  }
+
   double pointOnSlopeZ( const QgsPointXY &point, const QgsPoint &lowPoint, const QgsPoint &highPoint, double baseHeight )
   {
     const double axisX = highPoint.x() - lowPoint.x();
@@ -200,6 +534,16 @@ namespace
   {
     if ( points.isEmpty() || !nearlySamePoint( points.last(), point ) )
       points.append( point );
+  }
+
+  void appendPointIfAbsent( QVector<QgsPointXY> &points, const QgsPointXY &point )
+  {
+    for ( const QgsPointXY &existing : points )
+    {
+      if ( nearlySamePoint( existing, point ) )
+        return;
+    }
+    points.append( point );
   }
 
   double profileDistance( const QgsPointXY &point, double normalX, double normalY )
@@ -305,6 +649,226 @@ namespace
     return std::pow( point.x() - px, 2.0 ) + std::pow( point.y() - py, 2.0 );
   }
 
+  double distanceToRing2( const QVector<QgsPointXY> &ring, const QgsPointXY &point )
+  {
+    double bestDistance = std::numeric_limits<double>::max();
+    for ( int i = 0; i < ring.size(); ++i )
+      bestDistance = std::min( bestDistance, pointSegmentDistance2( point, ring[i], ring[( i + 1 ) % ring.size()] ) );
+    return bestDistance;
+  }
+
+  QVector<int> dbscanRegionQuery( const QVector<ClusterSample> &samples, int index, double eps )
+  {
+    QVector<int> neighbors;
+    const double eps2 = eps * eps;
+    const QgsPointXY &point = samples.at( index ).point;
+    for ( int i = 0; i < samples.size(); ++i )
+    {
+      const double dx = point.x() - samples.at( i ).point.x();
+      const double dy = point.y() - samples.at( i ).point.y();
+      if ( dx * dx + dy * dy <= eps2 )
+        neighbors.append( i );
+    }
+    return neighbors;
+  }
+
+  void dbscanExpandCluster( QVector<ClusterSample> &samples, int index, QVector<int> neighbors, int clusterId, double eps, int minPts )
+  {
+    samples[index].cluster = clusterId;
+    for ( int cursor = 0; cursor < neighbors.size(); ++cursor )
+    {
+      const int neighborIndex = neighbors.at( cursor );
+      ClusterSample &neighbor = samples[neighborIndex];
+      if ( !neighbor.visited )
+      {
+        neighbor.visited = true;
+        const QVector<int> nextNeighbors = dbscanRegionQuery( samples, neighborIndex, eps );
+        if ( nextNeighbors.size() >= minPts )
+        {
+          for ( int next : nextNeighbors )
+          {
+            if ( !neighbors.contains( next ) )
+              neighbors.append( next );
+          }
+        }
+      }
+      if ( neighbor.cluster < 0 )
+        neighbor.cluster = clusterId;
+    }
+  }
+
+  int assignDbscanClusters( QVector<ClusterSample> &samples, double eps, int minPts )
+  {
+    int clusterId = 0;
+    for ( int i = 0; i < samples.size(); ++i )
+    {
+      if ( samples[i].visited )
+        continue;
+
+      samples[i].visited = true;
+      const QVector<int> neighbors = dbscanRegionQuery( samples, i, eps );
+      if ( neighbors.size() < minPts )
+        continue;
+
+      dbscanExpandCluster( samples, i, neighbors, clusterId, eps, minPts );
+      ++clusterId;
+    }
+    return clusterId;
+  }
+
+  QVector<QgsPointXY> largestClusterBox( const QVector<ClusterSample> &samples, int clusterCount, double axisX, double axisY, double normalX, double normalY, double padding )
+  {
+    if ( clusterCount <= 0 )
+      return {};
+
+    QVector<int> counts( clusterCount, 0 );
+    for ( const ClusterSample &sample : samples )
+    {
+      if ( sample.cluster >= 0 && sample.cluster < clusterCount )
+        ++counts[sample.cluster];
+    }
+
+    int bestCluster = 0;
+    for ( int i = 1; i < counts.size(); ++i )
+    {
+      if ( counts.at( i ) > counts.at( bestCluster ) )
+        bestCluster = i;
+    }
+    if ( counts.at( bestCluster ) < 3 )
+      return {};
+
+    double minU = std::numeric_limits<double>::max();
+    double maxU = -std::numeric_limits<double>::max();
+    double minV = std::numeric_limits<double>::max();
+    double maxV = -std::numeric_limits<double>::max();
+    for ( const ClusterSample &sample : samples )
+    {
+      if ( sample.cluster != bestCluster )
+        continue;
+      minU = std::min( minU, sample.u );
+      maxU = std::max( maxU, sample.u );
+      minV = std::min( minV, sample.v );
+      maxV = std::max( maxV, sample.v );
+    }
+
+    minU -= padding;
+    maxU += padding;
+    minV -= padding;
+    maxV += padding;
+    auto fromLocal = [&]( double u, double v ) {
+      return QgsPointXY( axisX * u + normalX * v, axisY * u + normalY * v );
+    };
+    return QVector<QgsPointXY>{ fromLocal( minU, minV ), fromLocal( maxU, minV ), fromLocal( maxU, maxV ), fromLocal( minU, maxV ) };
+  }
+
+  QVector<QgsPointXY> clusterBoxNearPoint( const QVector<ClusterSample> &samples, int clusterCount, const QgsPointXY &targetPoint, double axisX, double axisY, double normalX, double normalY, double padding, double maxSpan )
+  {
+    if ( clusterCount <= 0 )
+      return {};
+
+    QVector<int> counts( clusterCount, 0 );
+    QVector<double> minDistance2( clusterCount, std::numeric_limits<double>::max() );
+    for ( const ClusterSample &sample : samples )
+    {
+      if ( sample.cluster < 0 || sample.cluster >= clusterCount )
+        continue;
+
+      ++counts[sample.cluster];
+      const double dx = sample.point.x() - targetPoint.x();
+      const double dy = sample.point.y() - targetPoint.y();
+      minDistance2[sample.cluster] = std::min( minDistance2[sample.cluster], dx * dx + dy * dy );
+    }
+
+    int bestCluster = -1;
+    for ( int i = 0; i < clusterCount; ++i )
+    {
+      if ( counts.at( i ) < 3 )
+        continue;
+      if ( bestCluster < 0 || minDistance2.at( i ) < minDistance2.at( bestCluster ) )
+        bestCluster = i;
+    }
+    if ( bestCluster < 0 )
+      return {};
+
+    double minU = std::numeric_limits<double>::max();
+    double maxU = -std::numeric_limits<double>::max();
+    double minV = std::numeric_limits<double>::max();
+    double maxV = -std::numeric_limits<double>::max();
+    for ( const ClusterSample &sample : samples )
+    {
+      if ( sample.cluster != bestCluster )
+        continue;
+      minU = std::min( minU, sample.u );
+      maxU = std::max( maxU, sample.u );
+      minV = std::min( minV, sample.v );
+      maxV = std::max( maxV, sample.v );
+    }
+
+    minU -= padding;
+    maxU += padding;
+    minV -= padding;
+    maxV += padding;
+
+    const double targetU = targetPoint.x() * axisX + targetPoint.y() * axisY;
+    const double targetV = targetPoint.x() * normalX + targetPoint.y() * normalY;
+    auto clampSpan = []( double &minValue, double &maxValue, double center, double spanLimit ) {
+      if ( spanLimit <= 1e-8 || maxValue - minValue <= spanLimit )
+        return;
+
+      double newMin = center - spanLimit * 0.5;
+      double newMax = center + spanLimit * 0.5;
+      if ( newMin < minValue )
+      {
+        newMax += minValue - newMin;
+        newMin = minValue;
+      }
+      if ( newMax > maxValue )
+      {
+        newMin -= newMax - maxValue;
+        newMax = maxValue;
+      }
+      minValue = std::max( minValue, newMin );
+      maxValue = std::min( maxValue, newMax );
+    };
+    clampSpan( minU, maxU, targetU, maxSpan );
+    clampSpan( minV, maxV, targetV, maxSpan );
+
+    auto fromLocal = [&]( double u, double v ) {
+      return QgsPointXY( axisX * u + normalX * v, axisY * u + normalY * v );
+    };
+    return QVector<QgsPointXY>{ fromLocal( minU, minV ), fromLocal( maxU, minV ), fromLocal( maxU, maxV ), fromLocal( minU, maxV ) };
+  }
+
+  double estimateDbscanEps( const QVector<ClusterSample> &samples, double fallback )
+  {
+    if ( samples.size() < 2 )
+      return fallback;
+
+    QVector<double> nearestDistances;
+    nearestDistances.reserve( samples.size() );
+    for ( int i = 0; i < samples.size(); ++i )
+    {
+      double best = std::numeric_limits<double>::max();
+      for ( int j = 0; j < samples.size(); ++j )
+      {
+        if ( i == j )
+          continue;
+        const double dx = samples.at( i ).point.x() - samples.at( j ).point.x();
+        const double dy = samples.at( i ).point.y() - samples.at( j ).point.y();
+        best = std::min( best, std::hypot( dx, dy ) );
+      }
+      if ( std::isfinite( best ) )
+        nearestDistances.append( best );
+    }
+
+    if ( nearestDistances.isEmpty() )
+      return fallback;
+
+    std::sort( nearestDistances.begin(), nearestDistances.end() );
+    const double median = nearestDistances.at( nearestDistances.size() / 2 );
+    return std::max( fallback, median * 2.5 );
+  }
+
   bool nearestEdgeDirection( const QVector<QgsPointXY> &ring, const QgsPoint &boundaryPoint, double &dirX, double &dirY )
   {
     if ( ring.size() < 2 )
@@ -402,13 +966,12 @@ namespace
     return result;
   }
 
-  double gabledTopZ( const QgsPointXY &point, const QgsPoint &boundaryPoint, const QgsPoint &ridgePoint, double normalX, double normalY, double oppositeLimit, double baseHeight )
+  double gabledTopZ( const QgsPointXY &point, const QgsPoint &boundaryPoint, const QgsPoint &ridgePoint, double normalX, double normalY, double sameSideLimit, double oppositeLimit, double baseHeight )
   {
     const double roofRise = ridgePoint.z() - boundaryPoint.z();
     const double ridgeHeight = baseHeight + roofRise;
     const double distance = signedDistanceToLine( point, ridgePoint, normalX, normalY );
     const double boundaryDistance = signedDistanceToLine( QgsPointXY( boundaryPoint.x(), boundaryPoint.y() ), ridgePoint, normalX, normalY );
-    const double sameSideLimit = std::fabs( boundaryDistance );
 
     if ( std::fabs( distance ) <= 1e-8 )
       return ridgeHeight;
@@ -424,7 +987,7 @@ namespace
     return std::max( baseHeight, ridgeHeight - roofRise * ratio );
   }
 
-  void appendTriangulatedRoofSurface( BuildingRoof::Mesh &mesh, const QVector<QgsPointXY> &polygon, const QgsPoint &boundaryPoint, const QgsPoint &ridgePoint, double normalX, double normalY, double oppositeLimit, double baseHeight )
+  void appendTriangulatedRoofSurface( BuildingRoof::Mesh &mesh, const QVector<QgsPointXY> &polygon, const QgsPoint &boundaryPoint, const QgsPoint &ridgePoint, double normalX, double normalY, double sameSideLimit, double oppositeLimit, double baseHeight )
   {
     if ( polygon.size() < 3 )
       return;
@@ -442,7 +1005,7 @@ namespace
 
     const int vertexOffset = mesh.vertices.size();
     for ( const QgsPointXY &point : localRing )
-      mesh.vertices.append( QgsPoint( point.x(), point.y(), gabledTopZ( point, boundaryPoint, ridgePoint, normalX, normalY, oppositeLimit, baseHeight ) ) );
+      mesh.vertices.append( QgsPoint( point.x(), point.y(), gabledTopZ( point, boundaryPoint, ridgePoint, normalX, normalY, sameSideLimit, oppositeLimit, baseHeight ) ) );
 
     const QVector<int> triangles = triangulateRing( localRing );
     for ( int i = 0; i + 2 < triangles.size(); i += 3 )
@@ -513,6 +1076,960 @@ namespace
         inside = !inside;
     }
     return inside;
+  }
+
+  double cross2d( double ax, double ay, double bx, double by )
+  {
+    return ax * by - ay * bx;
+  }
+
+  double lineParameter( const QgsPointXY &origin, double dirX, double dirY, const QgsPointXY &point )
+  {
+    return ( point.x() - origin.x() ) * dirX + ( point.y() - origin.y() ) * dirY;
+  }
+
+  QgsPointXY pointOnLine( const QgsPointXY &origin, double dirX, double dirY, double t )
+  {
+    return QgsPointXY( origin.x() + t * dirX, origin.y() + t * dirY );
+  }
+
+  void appendUniqueValue( QVector<double> &values, double value )
+  {
+    for ( double existing : values )
+    {
+      if ( std::fabs( existing - value ) <= 1e-7 )
+        return;
+    }
+    values.append( value );
+  }
+
+  bool pointOnSegment2d( const QgsPointXY &point, const QgsPointXY &a, const QgsPointXY &b, double *segmentT = nullptr )
+  {
+    const double dx = b.x() - a.x();
+    const double dy = b.y() - a.y();
+    const double len2 = dx * dx + dy * dy;
+    if ( len2 <= 1e-12 )
+      return nearlySamePoint( point, a );
+
+    const double t = ( ( point.x() - a.x() ) * dx + ( point.y() - a.y() ) * dy ) / len2;
+    if ( t < -1e-8 || t > 1.0 + 1e-8 )
+      return false;
+
+    const QgsPointXY projected( a.x() + t * dx, a.y() + t * dy );
+    if ( !nearlySamePoint( point, projected ) )
+      return false;
+
+    if ( segmentT )
+      *segmentT = std::max( 0.0, std::min( 1.0, t ) );
+    return true;
+  }
+
+  QVector<QgsPointXY> ringWithInsertedBoundaryPoints( const QVector<QgsPointXY> &ring, const QVector<QgsPointXY> &points )
+  {
+    QVector<QgsPointXY> result;
+    if ( ring.isEmpty() )
+      return result;
+
+    for ( int i = 0; i < ring.size(); ++i )
+    {
+      const QgsPointXY &a = ring[i];
+      const QgsPointXY &b = ring[( i + 1 ) % ring.size()];
+      appendUniquePoint( result, a );
+
+      QVector<QPair<double, QgsPointXY>> inserts;
+      for ( const QgsPointXY &point : points )
+      {
+        double t = 0.0;
+        if ( pointOnSegment2d( point, a, b, &t ) && t > 1e-8 && t < 1.0 - 1e-8 )
+          inserts.append( qMakePair( t, point ) );
+      }
+
+      std::sort( inserts.begin(), inserts.end(), []( const QPair<double, QgsPointXY> &lhs, const QPair<double, QgsPointXY> &rhs ) {
+        return lhs.first < rhs.first;
+      } );
+      for ( const QPair<double, QgsPointXY> &insert : inserts )
+        appendUniquePoint( result, insert.second );
+    }
+
+    if ( result.size() > 1 && nearlySamePoint( result.first(), result.last() ) )
+      result.removeLast();
+    return result;
+  }
+
+  QVector<LineInterval> lineInsideRingIntervals( const QVector<QgsPointXY> &ring, const QgsPointXY &origin, double dirX, double dirY )
+  {
+    QVector<double> values;
+    for ( int i = 0; i < ring.size(); ++i )
+    {
+      const QgsPointXY &a = ring[i];
+      const QgsPointXY &b = ring[( i + 1 ) % ring.size()];
+      const double edgeX = b.x() - a.x();
+      const double edgeY = b.y() - a.y();
+      const double den = cross2d( dirX, dirY, edgeX, edgeY );
+      const double relX = a.x() - origin.x();
+      const double relY = a.y() - origin.y();
+
+      if ( std::fabs( den ) <= 1e-12 )
+      {
+        if ( std::fabs( cross2d( relX, relY, dirX, dirY ) ) <= 1e-8 )
+        {
+          appendUniqueValue( values, lineParameter( origin, dirX, dirY, a ) );
+          appendUniqueValue( values, lineParameter( origin, dirX, dirY, b ) );
+        }
+        continue;
+      }
+
+      const double t = cross2d( relX, relY, edgeX, edgeY ) / den;
+      const double u = cross2d( relX, relY, dirX, dirY ) / den;
+      if ( u >= -1e-8 && u <= 1.0 + 1e-8 )
+        appendUniqueValue( values, t );
+    }
+
+    std::sort( values.begin(), values.end() );
+    QVector<LineInterval> intervals;
+    for ( int i = 0; i + 1 < values.size(); ++i )
+    {
+      const double a = values.at( i );
+      const double b = values.at( i + 1 );
+      if ( b - a <= 1e-7 )
+        continue;
+
+      const QgsPointXY mid = pointOnLine( origin, dirX, dirY, 0.5 * ( a + b ) );
+      if ( pointInRing( ring, mid ) )
+        intervals.append( LineInterval{ a, b } );
+    }
+    return intervals;
+  }
+
+  bool intervalContains( const LineInterval &interval, double value )
+  {
+    return value >= interval.start - 1e-7 && value <= interval.end + 1e-7;
+  }
+
+  bool findIntervalContaining( const QVector<LineInterval> &intervals, double first, double second, LineInterval &interval )
+  {
+    for ( const LineInterval &candidate : intervals )
+    {
+      if ( intervalContains( candidate, first ) && intervalContains( candidate, second ) )
+      {
+        interval = candidate;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  double chooseEndpointOnRidgeSide( const LineInterval &interval, double bendT, double ridgeT )
+  {
+    const double side = ridgeT - bendT;
+    double bestT = std::fabs( interval.start - bendT ) > std::fabs( interval.end - bendT ) ? interval.start : interval.end;
+    double bestDistance = -1.0;
+    for ( double candidate : { interval.start, interval.end } )
+    {
+      if ( ( candidate - bendT ) * side < -1e-7 )
+        continue;
+
+      const double distance = std::fabs( candidate - bendT );
+      if ( distance > bestDistance )
+      {
+        bestDistance = distance;
+        bestT = candidate;
+      }
+    }
+    return bestT;
+  }
+
+  double chooseFarthestEndpoint( const LineInterval &interval, double originT )
+  {
+    return std::fabs( interval.start - originT ) > std::fabs( interval.end - originT ) ? interval.start : interval.end;
+  }
+
+  bool isConcaveVertex( const QVector<QgsPointXY> &ring, int index )
+  {
+    const QgsPointXY &previous = ring[( index - 1 + ring.size() ) % ring.size()];
+    const QgsPointXY &current = ring[index];
+    const QgsPointXY &next = ring[( index + 1 ) % ring.size()];
+    const double ax = current.x() - previous.x();
+    const double ay = current.y() - previous.y();
+    const double bx = next.x() - current.x();
+    const double by = next.y() - current.y();
+    return cross2d( ax, ay, bx, by ) < -1e-8;
+  }
+
+  bool adjacentRingIndices( int a, int b, int count )
+  {
+    return a == b || ( a + 1 ) % count == b || ( b + 1 ) % count == a;
+  }
+
+  bool segmentInsideRing( const QVector<QgsPointXY> &ring, const QgsPointXY &a, const QgsPointXY &b )
+  {
+    for ( double t : { 0.25, 0.5, 0.75 } )
+    {
+      const QgsPointXY sample( a.x() + t * ( b.x() - a.x() ), a.y() + t * ( b.y() - a.y() ) );
+      if ( !pointInRing( ring, sample ) )
+        return false;
+    }
+    return true;
+  }
+
+  double ringExtentSize( const QVector<QgsPointXY> &ring )
+  {
+    if ( ring.isEmpty() )
+      return 1.0;
+
+    double minX = ring.first().x();
+    double maxX = ring.first().x();
+    double minY = ring.first().y();
+    double maxY = ring.first().y();
+    for ( const QgsPointXY &point : ring )
+    {
+      minX = std::min( minX, point.x() );
+      maxX = std::max( maxX, point.x() );
+      minY = std::min( minY, point.y() );
+      maxY = std::max( maxY, point.y() );
+    }
+    return std::max( 1.0, std::hypot( maxX - minX, maxY - minY ) );
+  }
+
+  double maxDistanceToPointOnRing( const QVector<QgsPointXY> &ring, const QgsPointXY &center )
+  {
+    double maxDistance = 0.0;
+    for ( const QgsPointXY &point : ring )
+      maxDistance = std::max( maxDistance, std::hypot( point.x() - center.x(), point.y() - center.y() ) );
+    return maxDistance;
+  }
+
+  double sphericalCapHeight( double distance, double supportRadius, double rise )
+  {
+    if ( rise <= 1e-8 || supportRadius <= 1e-8 )
+      return 0.0;
+
+    const double sphereRadius = ( supportRadius * supportRadius + rise * rise ) / ( 2.0 * rise );
+    const double inside = sphereRadius * sphereRadius - distance * distance;
+    if ( inside <= 0.0 )
+      return 0.0;
+
+    return std::max( 0.0, std::sqrt( inside ) - ( sphereRadius - rise ) );
+  }
+
+  double domeRoofZ( const QgsPointXY &point, const QgsPoint &surfacePoint, const QVector<QgsPointXY> &ring, double baseHeight )
+  {
+    const double rise = surfacePoint.z() - baseHeight;
+    if ( rise <= 0.0 )
+      return baseHeight;
+
+    const QgsPointXY center( surfacePoint.x(), surfacePoint.y() );
+    const double supportRadius = maxDistanceToPointOnRing( ring, center );
+    const double distance = std::hypot( point.x() - center.x(), point.y() - center.y() );
+    return baseHeight + sphericalCapHeight( distance, supportRadius, rise );
+  }
+
+  double balancedBarrelTopHeight( const QgsPoint &surfaceStart, const QgsPoint &surfaceEnd, double u, double axisLength )
+  {
+    Q_UNUSED( u )
+    Q_UNUSED( axisLength )
+
+    const double startZ = surfaceStart.z();
+    const double endZ = surfaceEnd.z();
+    return 0.5 * ( startZ + endZ );
+  }
+
+  bool snapDirectionToClosestRingEdge( const QVector<QgsPointXY> &ring, double &axisX, double &axisY )
+  {
+    constexpr double snapAngleRadians = 15.0 * 3.14159265358979323846 / 180.0;
+    const double minDot = std::cos( snapAngleRadians );
+
+    double bestAbsDot = -1.0;
+    double bestSignedDot = 1.0;
+    double bestX = axisX;
+    double bestY = axisY;
+
+    for ( int i = 0; i < ring.size(); ++i )
+    {
+      const QgsPointXY &a = ring.at( i );
+      const QgsPointXY &b = ring.at( ( i + 1 ) % ring.size() );
+      double edgeX = b.x() - a.x();
+      double edgeY = b.y() - a.y();
+      const double edgeLength = std::hypot( edgeX, edgeY );
+      if ( edgeLength <= 1e-8 )
+        continue;
+
+      edgeX /= edgeLength;
+      edgeY /= edgeLength;
+      const double signedDot = axisX * edgeX + axisY * edgeY;
+      const double absDot = std::fabs( signedDot );
+      if ( absDot > bestAbsDot )
+      {
+        bestAbsDot = absDot;
+        bestSignedDot = signedDot;
+        bestX = edgeX;
+        bestY = edgeY;
+      }
+    }
+
+    if ( bestAbsDot < minDot )
+      return false;
+
+    axisX = bestSignedDot < 0.0 ? -bestX : bestX;
+    axisY = bestSignedDot < 0.0 ? -bestY : bestY;
+    return true;
+  }
+
+  double barrelProfileHeight( double s, double minS, double centerS, double maxS, double baseHeight, double topHeight )
+  {
+    const double rise = topHeight - baseHeight;
+    if ( rise <= 1e-8 )
+      return baseHeight;
+
+    const double supportRadius = s < centerS ? centerS - minS : maxS - centerS;
+    if ( supportRadius <= 1e-8 )
+      return baseHeight;
+
+    const double distance = std::min( supportRadius, std::fabs( s - centerS ) );
+    return baseHeight + sphericalCapHeight( distance, supportRadius, rise );
+  }
+
+  bool barrelProfileFrame( const QVector<QgsPointXY> &ring, const QgsPoint &surfaceStart, const QgsPoint &surfaceEnd, double &normalX, double &normalY, double &minS, double &centerS, double &maxS, double &axisLength )
+  {
+    if ( ring.size() < 3 )
+      return false;
+
+    const QgsPointXY a( surfaceStart.x(), surfaceStart.y() );
+    const QgsPointXY b( surfaceEnd.x(), surfaceEnd.y() );
+    const double dx = b.x() - a.x();
+    const double dy = b.y() - a.y();
+    axisLength = std::hypot( dx, dy );
+    if ( axisLength <= 1e-8 )
+      return false;
+
+    double axisX = dx / axisLength;
+    double axisY = dy / axisLength;
+    snapDirectionToClosestRingEdge( ring, axisX, axisY );
+
+    normalX = -axisY;
+    normalY = axisX;
+    centerS = 0.5 * ( profileDistance( a, normalX, normalY ) + profileDistance( b, normalX, normalY ) );
+
+    minS = std::numeric_limits<double>::max();
+    maxS = -std::numeric_limits<double>::max();
+    for ( const QgsPointXY &ringPoint : ring )
+    {
+      const double s = profileDistance( ringPoint, normalX, normalY );
+      minS = std::min( minS, s );
+      maxS = std::max( maxS, s );
+    }
+
+    centerS = std::max( minS, std::min( maxS, centerS ) );
+    return maxS - minS > 1e-8;
+  }
+
+  QVector<ProfileAnchor> barrelProfileAnchors( const QVector<QgsPointXY> &ring, const QgsPoint &surfaceStart, const QgsPoint &surfaceEnd, double baseHeight, double &normalX, double &normalY )
+  {
+    QVector<ProfileAnchor> profileAnchors;
+    double minS = 0.0;
+    double centerS = 0.0;
+    double maxS = 0.0;
+    double axisLength = 0.0;
+    if ( !barrelProfileFrame( ring, surfaceStart, surfaceEnd, normalX, normalY, minS, centerS, maxS, axisLength ) )
+      return profileAnchors;
+
+    const double topHeight = balancedBarrelTopHeight( surfaceStart, surfaceEnd, 0.0, axisLength );
+    if ( topHeight <= baseHeight + 1e-8 )
+      return profileAnchors;
+
+    constexpr int sideSegments = 24;
+    appendProfileAnchor( profileAnchors, minS, baseHeight );
+    for ( int i = 1; i <= sideSegments; ++i )
+    {
+      const double s = minS + ( centerS - minS ) * i / sideSegments;
+      appendProfileAnchor( profileAnchors, s, barrelProfileHeight( s, minS, centerS, maxS, baseHeight, topHeight ) );
+    }
+    for ( int i = 1; i <= sideSegments; ++i )
+    {
+      const double s = centerS + ( maxS - centerS ) * i / sideSegments;
+      appendProfileAnchor( profileAnchors, s, barrelProfileHeight( s, minS, centerS, maxS, baseHeight, topHeight ) );
+    }
+    appendProfileAnchor( profileAnchors, maxS, baseHeight );
+
+    std::sort( profileAnchors.begin(), profileAnchors.end(), []( const ProfileAnchor &lhs, const ProfileAnchor &rhs ) {
+      return lhs.s < rhs.s;
+    } );
+    return profileAnchors;
+  }
+
+  double barrelRoofZ( const QgsPointXY &point, const QgsPoint &surfaceStart, const QgsPoint &surfaceEnd, const QVector<QgsPointXY> &ring, double baseHeight )
+  {
+    double normalX = 0.0;
+    double normalY = 0.0;
+    const QVector<ProfileAnchor> profileAnchors = barrelProfileAnchors( ring, surfaceStart, surfaceEnd, baseHeight, normalX, normalY );
+    if ( profileAnchors.isEmpty() )
+      return baseHeight;
+
+    return profileRoofZ( profileAnchors, profileDistance( point, normalX, normalY ) );
+  }
+
+  double curvedRoofZAt( const QgsPointXY &point, const QVector<QgsPointXY> &ring, const QList<BuildingRoof::RoofPoint> &surfaces, double baseHeight )
+  {
+    if ( surfaces.size() == 1 )
+      return domeRoofZ( point, surfaces.first().point, ring, baseHeight );
+    return barrelRoofZ( point, surfaces.at( 0 ).point, surfaces.at( 1 ).point, ring, baseHeight );
+  }
+
+  bool rayDistanceToRingBoundary( const QVector<QgsPointXY> &ring, const QgsPointXY &origin, double dirX, double dirY, double &distance )
+  {
+    const QVector<LineInterval> intervals = lineInsideRingIntervals( ring, origin, dirX, dirY );
+    LineInterval containing;
+    if ( !findIntervalContaining( intervals, 0.0, 0.0, containing ) )
+      return false;
+
+    distance = std::max( 0.0, containing.end );
+    return distance > 1e-8;
+  }
+
+  void appendDomeRoofSurface( BuildingRoof::Mesh &mesh, const QVector<QgsPointXY> &ring, const QgsPoint &surfacePoint, double baseHeight )
+  {
+    const double rise = surfacePoint.z() - baseHeight;
+    if ( ring.size() < 3 || rise <= 1e-8 )
+      return;
+
+    constexpr double twoPi = 6.28318530717958647692;
+    const int angularSegments = 96;
+    const int radialSegments = 32;
+    const QgsPointXY center( surfacePoint.x(), surfacePoint.y() );
+
+    QVector<double> rayDistances;
+    rayDistances.reserve( angularSegments );
+    double supportRadius = 0.0;
+    for ( int i = 0; i < angularSegments; ++i )
+    {
+      const double angle = twoPi * i / angularSegments;
+      double distance = 0.0;
+      if ( !rayDistanceToRingBoundary( ring, center, std::cos( angle ), std::sin( angle ), distance ) )
+        distance = 0.0;
+      rayDistances.append( distance );
+      supportRadius = std::max( supportRadius, distance );
+    }
+    if ( supportRadius <= 1e-8 )
+      return;
+
+    const int centerIndex = mesh.vertices.size();
+    mesh.vertices.append( QgsPoint( surfacePoint.x(), surfacePoint.y(), surfacePoint.z() ) );
+
+    QVector<QVector<int>> rings;
+    rings.reserve( radialSegments );
+    for ( int r = 1; r <= radialSegments; ++r )
+    {
+      const double fraction = static_cast<double>( r ) / radialSegments;
+      QVector<int> row;
+      row.reserve( angularSegments );
+      for ( int i = 0; i < angularSegments; ++i )
+      {
+        const double angle = twoPi * i / angularSegments;
+        const double distance = rayDistances.at( i ) * fraction;
+        const QgsPointXY point( center.x() + std::cos( angle ) * distance, center.y() + std::sin( angle ) * distance );
+        const double z = baseHeight + sphericalCapHeight( distance, supportRadius, rise );
+        row.append( mesh.vertices.size() );
+        mesh.vertices.append( QgsPoint( point.x(), point.y(), z ) );
+      }
+      rings.append( row );
+    }
+
+    const QVector<int> &firstRing = rings.first();
+    for ( int i = 0; i < angularSegments; ++i )
+      mesh.indices << centerIndex << firstRing.at( i ) << firstRing.at( ( i + 1 ) % angularSegments );
+
+    for ( int r = 1; r < rings.size(); ++r )
+    {
+      const QVector<int> &previous = rings.at( r - 1 );
+      const QVector<int> &current = rings.at( r );
+      for ( int i = 0; i < angularSegments; ++i )
+      {
+        const int next = ( i + 1 ) % angularSegments;
+        mesh.indices << previous.at( i ) << current.at( i ) << previous.at( next );
+        mesh.indices << previous.at( next ) << current.at( i ) << current.at( next );
+      }
+    }
+  }
+
+  void appendBarrelRoofSurface( BuildingRoof::Mesh &mesh, const QVector<QgsPointXY> &ring, const QgsPoint &surfaceStart, const QgsPoint &surfaceEnd, double baseHeight )
+  {
+    double normalX = 0.0;
+    double normalY = 0.0;
+    const QVector<ProfileAnchor> profileAnchors = barrelProfileAnchors( ring, surfaceStart, surfaceEnd, baseHeight, normalX, normalY );
+    if ( profileAnchors.size() < 3 )
+      return;
+
+    QVector<double> profileDistances;
+    profileDistances.reserve( profileAnchors.size() );
+    for ( const ProfileAnchor &anchor : profileAnchors )
+      profileDistances.append( anchor.s );
+
+    const QVector<QgsPointXY> profileRing = ringWithProfileIntersections( ring, normalX, normalY, profileDistances );
+    for ( int i = 0; i + 1 < profileAnchors.size(); ++i )
+    {
+      const double a = profileAnchors.at( i ).s;
+      const double b = profileAnchors.at( i + 1 ).s;
+      if ( b - a <= 1e-8 )
+        continue;
+
+      QVector<QgsPointXY> strip = clipPolygonByProfileRange( profileRing, normalX, normalY, a, b );
+      if ( strip.size() < 3 )
+        continue;
+
+      const int offset = mesh.vertices.size();
+      for ( const QgsPointXY &point : strip )
+        mesh.vertices.append( QgsPoint( point.x(), point.y(), profileRoofZ( profileAnchors, profileDistance( point, normalX, normalY ) ) ) );
+
+      const QVector<int> triangles = triangulateRing( strip );
+      for ( int t = 0; t + 2 < triangles.size(); t += 3 )
+        mesh.indices << offset + triangles[t] << offset + triangles[t + 1] << offset + triangles[t + 2];
+    }
+  }
+
+  QVector<QgsPointXY> curvedRoofSamplePoints( const QVector<QgsPointXY> &ring, const QList<BuildingRoof::RoofPoint> &surfaces )
+  {
+    QVector<QgsPointXY> points = ring;
+    for ( int i = 0; i < ring.size(); ++i )
+    {
+      const QgsPointXY &a = ring.at( i );
+      const QgsPointXY &b = ring.at( ( i + 1 ) % ring.size() );
+      for ( int j = 1; j < 8; ++j )
+      {
+        const double t = j / 8.0;
+        appendPointIfAbsent( points, QgsPointXY( a.x() + t * ( b.x() - a.x() ), a.y() + t * ( b.y() - a.y() ) ) );
+      }
+    }
+
+    for ( const BuildingRoof::RoofPoint &surface : surfaces )
+      appendPointIfAbsent( points, QgsPointXY( surface.point.x(), surface.point.y() ) );
+
+    if ( surfaces.size() == 2 )
+    {
+      const QgsPoint &a = surfaces.at( 0 ).point;
+      const QgsPoint &b = surfaces.at( 1 ).point;
+      for ( int i = 1; i < 16; ++i )
+      {
+        const double t = i / 16.0;
+        const QgsPointXY sample( a.x() + t * ( b.x() - a.x() ), a.y() + t * ( b.y() - a.y() ) );
+        if ( pointInRing( ring, sample ) )
+          appendPointIfAbsent( points, sample );
+      }
+    }
+
+    double minX = ring.first().x();
+    double maxX = ring.first().x();
+    double minY = ring.first().y();
+    double maxY = ring.first().y();
+    for ( const QgsPointXY &point : ring )
+    {
+      minX = std::min( minX, point.x() );
+      maxX = std::max( maxX, point.x() );
+      minY = std::min( minY, point.y() );
+      maxY = std::max( maxY, point.y() );
+    }
+
+    const double width = std::max( 1e-8, maxX - minX );
+    const double height = std::max( 1e-8, maxY - minY );
+    const int gridX = std::max( 16, std::min( 64, static_cast<int>( std::ceil( width / std::max( width, height ) * 56.0 ) ) ) );
+    const int gridY = std::max( 16, std::min( 64, static_cast<int>( std::ceil( height / std::max( width, height ) * 56.0 ) ) ) );
+    for ( int ix = 1; ix < gridX; ++ix )
+    {
+      for ( int iy = 1; iy < gridY; ++iy )
+      {
+        const QgsPointXY sample( minX + width * ix / gridX, minY + height * iy / gridY );
+        if ( pointInRing( ring, sample ) )
+          appendPointIfAbsent( points, sample );
+      }
+    }
+    return points;
+  }
+
+  void appendCurvedRoofSurface( BuildingRoof::Mesh &mesh, const QVector<QgsPointXY> &ring, const QList<BuildingRoof::RoofPoint> &surfaces, double baseHeight )
+  {
+    if ( ring.size() < 3 || surfaces.isEmpty() )
+      return;
+
+    if ( surfaces.size() == 1 )
+      appendDomeRoofSurface( mesh, ring, surfaces.first().point, baseHeight );
+    else
+      appendBarrelRoofSurface( mesh, ring, surfaces.at( 0 ).point, surfaces.at( 1 ).point, baseHeight );
+  }
+
+  void appendCurvedRoofWall( BuildingRoof::Mesh &mesh, const QVector<QgsPointXY> &ring, const QList<BuildingRoof::RoofPoint> &surfaces, double baseHeight )
+  {
+    if ( ring.size() < 2 )
+      return;
+
+    const int count = ring.size();
+    for ( int i = 0; i < count; ++i )
+    {
+      const QgsPointXY &a = ring.at( i );
+      const QgsPointXY &b = ring.at( ( i + 1 ) % count );
+      const double edgeLength = std::hypot( b.x() - a.x(), b.y() - a.y() );
+      const double targetLength = std::max( ringExtentSize( ring ) / 80.0, 1e-8 );
+      const int segments = std::max( 1, std::min( 32, static_cast<int>( std::ceil( edgeLength / targetLength ) ) ) );
+      for ( int segment = 0; segment < segments; ++segment )
+      {
+        const double t0 = static_cast<double>( segment ) / segments;
+        const double t1 = static_cast<double>( segment + 1 ) / segments;
+        const QgsPointXY p0( a.x() + ( b.x() - a.x() ) * t0, a.y() + ( b.y() - a.y() ) * t0 );
+        const QgsPointXY p1( a.x() + ( b.x() - a.x() ) * t1, a.y() + ( b.y() - a.y() ) * t1 );
+        const double topA = curvedRoofZAt( p0, ring, surfaces, baseHeight );
+        const double topB = curvedRoofZAt( p1, ring, surfaces, baseHeight );
+        const int offset = mesh.vertices.size();
+        mesh.vertices.append( QgsPoint( p0.x(), p0.y(), 0.0 ) );
+        mesh.vertices.append( QgsPoint( p1.x(), p1.y(), 0.0 ) );
+        mesh.vertices.append( QgsPoint( p0.x(), p0.y(), topA ) );
+        mesh.vertices.append( QgsPoint( p1.x(), p1.y(), topB ) );
+        mesh.indices << offset << offset + 1 << offset + 2;
+        mesh.indices << offset + 2 << offset + 1 << offset + 3;
+      }
+    }
+  }
+
+  QgsGeometry halfPlaneGeometry( const QVector<QgsPointXY> &referenceRing, const QgsPointXY &linePoint, double normalX, double normalY, bool keepPositive )
+  {
+    const double lineDirX = -normalY;
+    const double lineDirY = normalX;
+    const double side = keepPositive ? 1.0 : -1.0;
+    const double extent = ringExtentSize( referenceRing ) * 8.0 + 100.0;
+
+    const QgsPointXY a( linePoint.x() + lineDirX * extent, linePoint.y() + lineDirY * extent );
+    const QgsPointXY b( linePoint.x() - lineDirX * extent, linePoint.y() - lineDirY * extent );
+    const QgsPointXY c( b.x() + side * normalX * extent, b.y() + side * normalY * extent );
+    const QgsPointXY d( a.x() + side * normalX * extent, a.y() + side * normalY * extent );
+    return polygonGeometryFromRing( QVector<QgsPointXY>{ a, b, c, d } );
+  }
+
+  QgsGeometry intersectWithHalfPlane( const QgsGeometry &geometry, const QVector<QgsPointXY> &referenceRing, const QgsPointXY &linePoint, double normalX, double normalY, bool keepPositive )
+  {
+    if ( geometry.isNull() || geometry.isEmpty() )
+      return QgsGeometry();
+    return geometry.intersection( halfPlaneGeometry( referenceRing, linePoint, normalX, normalY, keepPositive ) );
+  }
+
+  bool lineSegmentIntersection( const QgsPointXY &linePoint, double lineDirX, double lineDirY, const QgsPointXY &segmentStart, const QgsPointXY &segmentEnd, QgsPointXY &intersection, double &lineT, double &segmentT )
+  {
+    const double segmentX = segmentEnd.x() - segmentStart.x();
+    const double segmentY = segmentEnd.y() - segmentStart.y();
+    const double den = cross2d( lineDirX, lineDirY, segmentX, segmentY );
+    if ( std::fabs( den ) <= 1e-12 )
+      return false;
+
+    const double relX = segmentStart.x() - linePoint.x();
+    const double relY = segmentStart.y() - linePoint.y();
+    lineT = cross2d( relX, relY, segmentX, segmentY ) / den;
+    segmentT = cross2d( relX, relY, lineDirX, lineDirY ) / den;
+    if ( segmentT < -1e-8 || segmentT > 1.0 + 1e-8 )
+      return false;
+
+    intersection = pointOnLine( linePoint, lineDirX, lineDirY, lineT );
+    return true;
+  }
+
+  bool findTransitionChord( const QVector<QgsPointXY> &ring, int cornerIndex, const QgsPointXY &ridgeXY, double dirX, double dirY, const QVector<LineInterval> &primaryIntervals, QgsPointXY &bend, double &bendT, double &splitNormalX, double &splitNormalY )
+  {
+    const QgsPointXY &corner = ring[cornerIndex];
+    const int count = ring.size();
+    bool found = false;
+    double bestScore = std::numeric_limits<double>::max();
+
+    for ( int j = 0; j < count; ++j )
+    {
+      if ( adjacentRingIndices( cornerIndex, j, count ) )
+        continue;
+
+      const QgsPointXY &candidate = ring[j];
+      if ( !segmentInsideRing( ring, corner, candidate ) )
+        continue;
+
+      QgsPointXY candidateBend;
+      double candidateBendT = 0.0;
+      double chordT = 0.0;
+      if ( !lineSegmentIntersection( ridgeXY, dirX, dirY, corner, candidate, candidateBend, candidateBendT, chordT ) )
+        continue;
+
+      LineInterval primaryInterval;
+      if ( !findIntervalContaining( primaryIntervals, 0.0, candidateBendT, primaryInterval ) )
+        continue;
+
+      const double chordX = candidate.x() - corner.x();
+      const double chordY = candidate.y() - corner.y();
+      const double chordLength = std::hypot( chordX, chordY );
+      if ( chordLength <= 1e-8 )
+        continue;
+
+      const double chordDirX = chordX / chordLength;
+      const double chordDirY = chordY / chordLength;
+      const double perpendicularScore = std::fabs( chordDirX * dirX + chordDirY * dirY );
+      const double centeredScore = std::fabs( chordT - 0.5 );
+      const double score = perpendicularScore + 0.05 * centeredScore;
+      if ( score < bestScore )
+      {
+        bestScore = score;
+        bend = candidateBend;
+        bendT = candidateBendT;
+        splitNormalX = -chordDirY;
+        splitNormalY = chordDirX;
+        found = true;
+      }
+    }
+
+    return found;
+  }
+
+  void computeBentSegmentLimits( BentGableSegment &segment, const QVector<QgsPointXY> &ring, const QgsPoint &boundaryPoint )
+  {
+    const double boundaryDistance = signedDistanceToLine( QgsPointXY( boundaryPoint.x(), boundaryPoint.y() ), segment.ridgePoint, segment.normalX, segment.normalY );
+    for ( const QgsPointXY &point : ring )
+    {
+      const double along = lineParameter( segment.start, segment.dirX, segment.dirY, point );
+      if ( along < -1e-7 || along > segment.length + 1e-7 )
+        continue;
+
+      const double distance = signedDistanceToLine( point, segment.ridgePoint, segment.normalX, segment.normalY );
+      if ( distance * boundaryDistance < 0.0 )
+        segment.oppositeLimit = std::max( segment.oppositeLimit, std::fabs( distance ) );
+      else
+        segment.sameSideLimit = std::max( segment.sameSideLimit, std::fabs( distance ) );
+    }
+
+    if ( segment.sameSideLimit <= 1e-8 )
+      segment.sameSideLimit = std::fabs( boundaryDistance );
+    if ( segment.oppositeLimit <= 1e-8 )
+      segment.oppositeLimit = segment.sameSideLimit;
+  }
+
+  bool makeBentSegment( const QgsPointXY &start, const QgsPointXY &end, double ridgeHeight, const QVector<QgsPointXY> &ring, const QgsPoint &boundaryPoint, BentGableSegment &segment )
+  {
+    const double dx = end.x() - start.x();
+    const double dy = end.y() - start.y();
+    const double length = std::hypot( dx, dy );
+    if ( length <= 1e-8 )
+      return false;
+
+    segment.start = start;
+    segment.end = end;
+    segment.length = length;
+    segment.dirX = dx / length;
+    segment.dirY = dy / length;
+    segment.normalX = -segment.dirY;
+    segment.normalY = segment.dirX;
+    segment.ridgePoint = QgsPoint( start.x(), start.y(), ridgeHeight );
+    computeBentSegmentLimits( segment, ring, boundaryPoint );
+    return segment.sameSideLimit > 1e-8 || segment.oppositeLimit > 1e-8;
+  }
+
+  bool bentSecondaryDirection( const QVector<QgsPointXY> &ring, int cornerIndex, double primaryDirX, double primaryDirY, double &secondaryDirX, double &secondaryDirY )
+  {
+    const QgsPointXY &previous = ring[( cornerIndex - 1 + ring.size() ) % ring.size()];
+    const QgsPointXY &corner = ring[cornerIndex];
+    const QgsPointXY &next = ring[( cornerIndex + 1 ) % ring.size()];
+
+    const double candidates[2][2] = {
+      { previous.x() - corner.x(), previous.y() - corner.y() },
+      { next.x() - corner.x(), next.y() - corner.y() }
+    };
+
+    double bestScore = std::numeric_limits<double>::max();
+    bool found = false;
+    for ( const auto &candidate : candidates )
+    {
+      const double length = std::hypot( candidate[0], candidate[1] );
+      if ( length <= 1e-8 )
+        continue;
+
+      const double candidateX = candidate[0] / length;
+      const double candidateY = candidate[1] / length;
+      const double score = std::fabs( candidateX * primaryDirX + candidateY * primaryDirY );
+      if ( score < bestScore )
+      {
+        bestScore = score;
+        secondaryDirX = candidateX;
+        secondaryDirY = candidateY;
+        found = true;
+      }
+    }
+    return found && bestScore < 0.95;
+  }
+
+  double bentGabledTopZ( const QgsPointXY &point, const QgsPoint &boundaryPoint, const QVector<BentGableSegment> &segments, double baseHeight )
+  {
+    double bestZ = baseHeight;
+    bool hasSegment = false;
+    for ( const BentGableSegment &segment : segments )
+    {
+      const double along = lineParameter( segment.start, segment.dirX, segment.dirY, point );
+      if ( along < -1e-7 || along > segment.length + 1e-7 )
+        continue;
+
+      const double z = gabledTopZ( point, boundaryPoint, segment.ridgePoint, segment.normalX, segment.normalY, segment.sameSideLimit, segment.oppositeLimit, baseHeight );
+      bestZ = hasSegment ? std::max( bestZ, z ) : z;
+      hasSegment = true;
+    }
+    return hasSegment ? bestZ : baseHeight;
+  }
+
+  void appendTriangulatedBentRoofSurface( BuildingRoof::Mesh &mesh, const QVector<QgsPointXY> &polygon, const QgsPoint &boundaryPoint, const QVector<BentGableSegment> &segments, double baseHeight )
+  {
+    if ( polygon.size() < 3 )
+      return;
+
+    QVector<QgsPointXY> localRing = polygon;
+    double area = 0.0;
+    for ( int i = 0; i < localRing.size(); ++i )
+    {
+      const QgsPointXY &a = localRing[i];
+      const QgsPointXY &b = localRing[( i + 1 ) % localRing.size()];
+      area += a.x() * b.y() - b.x() * a.y();
+    }
+    if ( area < 0.0 )
+      std::reverse( localRing.begin(), localRing.end() );
+
+    const int vertexOffset = mesh.vertices.size();
+    for ( const QgsPointXY &point : localRing )
+      mesh.vertices.append( QgsPoint( point.x(), point.y(), bentGabledTopZ( point, boundaryPoint, segments, baseHeight ) ) );
+
+    const QVector<int> triangles = triangulateRing( localRing );
+    for ( int i = 0; i + 2 < triangles.size(); i += 3 )
+      mesh.indices << vertexOffset + triangles[i] << vertexOffset + triangles[i + 1] << vertexOffset + triangles[i + 2];
+  }
+
+  void appendBentSegmentRoofSurfaces( BuildingRoof::Mesh &mesh, const QgsGeometry &footprintGeometry, const QVector<QgsPointXY> &referenceRing, const BentGableSegment &segment, const QgsPoint &boundaryPoint, const QVector<BentGableSegment> &segments, double baseHeight )
+  {
+    const QgsPointXY ridgeXY( segment.ridgePoint.x(), segment.ridgePoint.y() );
+    for ( bool keepPositive : { true, false } )
+    {
+      const QgsGeometry slopeGeometry = intersectWithHalfPlane( footprintGeometry, referenceRing, ridgeXY, segment.normalX, segment.normalY, keepPositive );
+      for ( const QVector<QgsPointXY> &slopeRing : exteriorRingsFromGeometry( slopeGeometry ) )
+        appendTriangulatedBentRoofSurface( mesh, slopeRing, boundaryPoint, segments, baseHeight );
+    }
+  }
+
+  BuildingRoof::MeshResult buildBentGabledRoofPrismMesh( const QVector<QgsPointXY> &inputRing, const QgsPoint &boundaryPoint, const QgsPoint &ridgePoint, double dirX, double dirY )
+  {
+    BuildingRoof::MeshResult result;
+    if ( inputRing.size() < 5 )
+      return result;
+
+    const QgsPointXY ridgeXY( ridgePoint.x(), ridgePoint.y() );
+    const QVector<LineInterval> primaryIntervals = lineInsideRingIntervals( inputRing, ridgeXY, dirX, dirY );
+    if ( primaryIntervals.isEmpty() )
+      return result;
+
+    bool found = false;
+    double bestScore = std::numeric_limits<double>::max();
+    QgsPointXY bestPrimaryEnd;
+    QgsPointXY bestBend;
+    QgsPointXY bestSecondaryEnd;
+    double bestSplitNormalX = 0.0;
+    double bestSplitNormalY = 0.0;
+
+    for ( int pass = 0; pass < 2 && !found; ++pass )
+    {
+      bestScore = std::numeric_limits<double>::max();
+      for ( int i = 0; i < inputRing.size(); ++i )
+      {
+        if ( pass == 0 && !isConcaveVertex( inputRing, i ) )
+          continue;
+        if ( pass == 1 && isConcaveVertex( inputRing, i ) )
+          continue;
+
+        QgsPointXY bend;
+        double bendT = 0.0;
+        double splitNormalX = 0.0;
+        double splitNormalY = 0.0;
+        if ( !findTransitionChord( inputRing, i, ridgeXY, dirX, dirY, primaryIntervals, bend, bendT, splitNormalX, splitNormalY ) )
+          continue;
+
+        LineInterval primaryInterval;
+        if ( !findIntervalContaining( primaryIntervals, 0.0, bendT, primaryInterval ) )
+          continue;
+
+        double secondaryDirX = 0.0;
+        double secondaryDirY = 0.0;
+        if ( !bentSecondaryDirection( inputRing, i, dirX, dirY, secondaryDirX, secondaryDirY ) )
+          continue;
+
+        const QVector<LineInterval> secondaryIntervals = lineInsideRingIntervals( inputRing, bend, secondaryDirX, secondaryDirY );
+        LineInterval secondaryInterval;
+        if ( !findIntervalContaining( secondaryIntervals, 0.0, 0.0, secondaryInterval ) )
+          continue;
+
+        const double primaryEndT = chooseEndpointOnRidgeSide( primaryInterval, bendT, 0.0 );
+        const double secondaryEndT = chooseFarthestEndpoint( secondaryInterval, 0.0 );
+        const QgsPointXY primaryEnd = pointOnLine( ridgeXY, dirX, dirY, primaryEndT );
+        const QgsPointXY secondaryEnd = pointOnLine( bend, secondaryDirX, secondaryDirY, secondaryEndT );
+
+        if ( nearlySamePoint( primaryEnd, bend ) || nearlySamePoint( secondaryEnd, bend ) )
+          continue;
+
+        const double score = std::fabs( bendT );
+        if ( score < bestScore )
+        {
+          bestScore = score;
+          bestPrimaryEnd = primaryEnd;
+          bestBend = bend;
+          bestSecondaryEnd = secondaryEnd;
+          bestSplitNormalX = splitNormalX;
+          bestSplitNormalY = splitNormalY;
+          found = true;
+        }
+      }
+    }
+
+    if ( !found )
+      return result;
+
+    const double baseHeight = boundaryPoint.z();
+    QVector<QgsPointXY> ring = ringWithInsertedBoundaryPoints( inputRing, QVector<QgsPointXY>{ bestPrimaryEnd, bestSecondaryEnd } );
+
+    QVector<BentGableSegment> segments;
+    BentGableSegment primarySegment;
+    BentGableSegment secondarySegment;
+    if ( !makeBentSegment( bestPrimaryEnd, bestBend, ridgePoint.z(), ring, boundaryPoint, primarySegment ) )
+      return result;
+    if ( !makeBentSegment( bestBend, bestSecondaryEnd, ridgePoint.z(), ring, boundaryPoint, secondarySegment ) )
+      return result;
+    segments << primarySegment << secondarySegment;
+
+    const QgsPoint splitPoint( bestBend.x(), bestBend.y(), ridgePoint.z() );
+    const double primarySide = signedDistanceToLine( bestPrimaryEnd, splitPoint, bestSplitNormalX, bestSplitNormalY );
+    if ( std::fabs( primarySide ) <= 1e-8 )
+      return result;
+
+    const QgsGeometry footprintGeometry = polygonGeometryFromRing( ring );
+    const QgsPointXY splitXY( splitPoint.x(), splitPoint.y() );
+    const QgsGeometry primaryFootprint = intersectWithHalfPlane( footprintGeometry, ring, splitXY, bestSplitNormalX, bestSplitNormalY, primarySide > 0.0 );
+    const QgsGeometry secondaryFootprint = intersectWithHalfPlane( footprintGeometry, ring, splitXY, bestSplitNormalX, bestSplitNormalY, primarySide < 0.0 );
+    if ( exteriorRingsFromGeometry( primaryFootprint ).isEmpty() || exteriorRingsFromGeometry( secondaryFootprint ).isEmpty() )
+      return result;
+
+    for ( const QgsPointXY &point : ring )
+    {
+      result.mesh.vertices.append( QgsPoint( point.x(), point.y(), 0.0 ) );
+      result.mesh.vertices.append( QgsPoint( point.x(), point.y(), bentGabledTopZ( point, boundaryPoint, segments, baseHeight ) ) );
+    }
+
+    const int count = ring.size();
+    for ( int i = 0; i < count; ++i )
+    {
+      const int next = ( i + 1 ) % count;
+      result.mesh.indices << 2 * i << 2 * next << 2 * i + 1;
+      result.mesh.indices << 2 * i + 1 << 2 * next << 2 * next + 1;
+    }
+
+    const QVector<int> bottomTriangles = triangulateRing( ring );
+    for ( int i = 0; i + 2 < bottomTriangles.size(); i += 3 )
+      result.mesh.indices << 2 * bottomTriangles[i] << 2 * bottomTriangles[i + 2] << 2 * bottomTriangles[i + 1];
+
+    appendBentSegmentRoofSurfaces( result.mesh, primaryFootprint, ring, primarySegment, boundaryPoint, segments, baseHeight );
+    appendBentSegmentRoofSurfaces( result.mesh, secondaryFootprint, ring, secondarySegment, boundaryPoint, segments, baseHeight );
+
+    result.success = !result.mesh.isEmpty();
+    if ( !result.success )
+      result.error = QStringLiteral( "Bent gabled roof mesh generation failed." );
+    return result;
   }
 
   double eaveHeightAt( const QVector<AnchorPoint> &eaveAnchors, const QgsPointXY &point, double fallbackZ )
@@ -637,6 +2154,35 @@ namespace
     }
     anchors.append( ProfileAnchor{ s, z } );
   }
+
+  void averageRidgePairHeightIfClose( BuildingRoof::RoofPoint &first, BuildingRoof::RoofPoint &second )
+  {
+    if ( std::fabs( first.point.z() - second.point.z() ) > BuildingRoof::RIDGE_HEIGHT_AVERAGE_THRESHOLD )
+      return;
+
+    const double averageZ = 0.5 * ( first.point.z() + second.point.z() );
+    first.point.setZ( averageZ );
+    second.point.setZ( averageZ );
+  }
+
+  void averageMirroredRidgeProfileHeightsIfClose( QVector<ProfileAnchor> &ridgeAnchors )
+  {
+    std::sort( ridgeAnchors.begin(), ridgeAnchors.end(), []( const ProfileAnchor &lhs, const ProfileAnchor &rhs ) {
+      return lhs.s < rhs.s;
+    } );
+
+    for ( int left = 0, right = ridgeAnchors.size() - 1; left < right; ++left, --right )
+    {
+      ProfileAnchor &leftAnchor = ridgeAnchors[left];
+      ProfileAnchor &rightAnchor = ridgeAnchors[right];
+      if ( std::fabs( leftAnchor.z - rightAnchor.z ) > BuildingRoof::RIDGE_HEIGHT_AVERAGE_THRESHOLD )
+        continue;
+
+      const double averageZ = 0.5 * ( leftAnchor.z + rightAnchor.z );
+      leftAnchor.z = averageZ;
+      rightAnchor.z = averageZ;
+    }
+  }
 }
 
 BuildingRoof::Result BuildingRoof::buildSingleSlopeRoof( const QgsGeometry &buildingGeometry, const QList<RoofPoint> &roofPoints )
@@ -744,6 +2290,359 @@ BuildingRoof::MeshResult BuildingRoof::buildSingleSlopePrismMesh( const QgsGeome
   return result;
 }
 
+BuildingRoof::MeshResult BuildingRoof::buildFlatReliefPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints, const QVector<RoofSample> &pointCloudSamples )
+{
+  Q_UNUSED( buildingHeight )
+  MeshResult result;
+
+  const QList<RoofPoint> boundary = boundaryPoints( roofPoints );
+  if ( hasRidgePoint( roofPoints ) )
+  {
+    result.error = QStringLiteral( "Flat relief roof requires no ridge point." );
+    return result;
+  }
+  if ( boundary.size() != 2 )
+  {
+    result.error = QStringLiteral( "Flat relief roof requires exactly two boundary points." );
+    return result;
+  }
+
+  const QgsPoint p1 = boundary.at( 0 ).point;
+  const QgsPoint p2 = boundary.at( 1 ).point;
+  if ( std::hypot( p2.x() - p1.x(), p2.y() - p1.y() ) <= 1e-6 )
+  {
+    result.error = QStringLiteral( "The two flat relief points must have different positions." );
+    return result;
+  }
+  if ( std::fabs( p1.z() - p2.z() ) <= 1e-6 )
+  {
+    result.error = QStringLiteral( "The two flat relief points must have different heights." );
+    return result;
+  }
+
+  const QgsPolygonXY polygon = firstPolygon( buildingGeometry );
+  const QVector<QgsPointXY> ring = exteriorRing( polygon );
+  if ( ring.size() < 3 )
+  {
+    result.error = QStringLiteral( "The building footprint cannot be used for flat relief roof mesh generation." );
+    return result;
+  }
+
+  const QgsPointXY p1xy( p1.x(), p1.y() );
+  const QgsPointXY p2xy( p2.x(), p2.y() );
+  const double d1 = distanceToRing2( ring, p1xy );
+  const double d2 = distanceToRing2( ring, p2xy );
+  const QgsPoint mainPoint = d1 <= d2 ? p1 : p2;
+  const QgsPoint reliefPoint = d1 <= d2 ? p2 : p1;
+  const double mainHeight = mainPoint.z();
+  const double reliefHeight = reliefPoint.z();
+
+  double axisX = 0.0;
+  double axisY = 0.0;
+  if ( !nearestEdgeDirection( ring, mainPoint, axisX, axisY ) )
+  {
+    axisX = p2.x() - p1.x();
+    axisY = p2.y() - p1.y();
+    const double length = std::hypot( axisX, axisY );
+    if ( length <= 1e-8 )
+    {
+      result.error = QStringLiteral( "Cannot infer flat relief direction." );
+      return result;
+    }
+    axisX /= length;
+    axisY /= length;
+  }
+  const double normalX = -axisY;
+  const double normalY = axisX;
+
+  const double extent = ringExtentSize( ring );
+  QVector<ClusterSample> samples;
+  const double heightDifference = std::fabs( reliefHeight - mainHeight );
+  const double reliefTolerance = std::max( 0.10, heightDifference * 0.20 );
+  const double mainTolerance = std::max( 0.10, heightDifference * 0.20 );
+  for ( const RoofSample &sample : pointCloudSamples )
+  {
+    const QgsPoint &point = sample.point;
+    const QgsPointXY samplePoint( point.x(), point.y() );
+    if ( !pointInRing( ring, samplePoint ) )
+      continue;
+
+    if ( std::fabs( point.z() - reliefHeight ) > reliefTolerance )
+      continue;
+    if ( std::fabs( point.z() - mainHeight ) <= mainTolerance )
+      continue;
+
+    const double u = point.x() * axisX + point.y() * axisY;
+    const double v = point.x() * normalX + point.y() * normalY;
+    samples.append( ClusterSample{ samplePoint, u, v, -1, false } );
+  }
+
+  if ( samples.size() < 3 )
+  {
+    result.error = QStringLiteral( "DBSCAN could not find enough point-cloud samples near the flat relief height." );
+    return result;
+  }
+
+  const double eps = estimateDbscanEps( samples, std::max( extent * 0.03, 0.5 ) );
+  const int clusterCount = assignDbscanClusters( samples, eps, 3 );
+  const QVector<QgsPointXY> reliefRing = largestClusterBox( samples, clusterCount, axisX, axisY, normalX, normalY, eps * 0.5 );
+  if ( reliefRing.size() < 3 )
+  {
+    result.error = QStringLiteral( "DBSCAN could not form a flat relief cluster." );
+    return result;
+  }
+
+  const QgsGeometry footprintGeometry = polygonGeometryFromRing( ring );
+  QgsGeometry reliefGeometry = polygonGeometryFromRing( reliefRing ).intersection( footprintGeometry );
+  if ( reliefGeometry.isNull() || reliefGeometry.isEmpty() )
+  {
+    result.error = QStringLiteral( "Flat relief cluster does not intersect the footprint." );
+    return result;
+  }
+
+  const bool isRaisedRelief = reliefHeight > mainHeight;
+  const QgsGeometry mainRoofGeometry = isRaisedRelief ? footprintGeometry : footprintGeometry.difference( reliefGeometry );
+  appendVerticalWall( result.mesh, ring, 0.0, mainHeight );
+  appendHorizontalRingSurface( result.mesh, ring, 0.0, true );
+  appendHorizontalGeometrySurface( result.mesh, mainRoofGeometry, mainHeight );
+  appendHorizontalGeometrySurface( result.mesh, reliefGeometry, reliefHeight );
+
+  const double lowerZ = std::min( mainHeight, reliefHeight );
+  const double upperZ = std::max( mainHeight, reliefHeight );
+  for ( const QVector<QgsPointXY> &reliefPart : exteriorRingsFromGeometry( reliefGeometry ) )
+    appendVerticalWall( result.mesh, reliefPart, lowerZ, upperZ );
+
+  result.success = !result.mesh.isEmpty();
+  if ( !result.success )
+    result.error = QStringLiteral( "Flat relief roof mesh generation failed." );
+  return result;
+}
+
+BuildingRoof::MeshResult BuildingRoof::buildClusteredFlatTopHippedRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints, const QVector<RoofSample> &pointCloudSamples )
+{
+  Q_UNUSED( buildingHeight )
+  MeshResult result;
+
+  const QList<RoofPoint> boundary = boundaryPoints( roofPoints );
+  const QList<RoofPoint> ridges = ridgePoints( roofPoints );
+  if ( boundary.size() != 2 || ridges.size() != 1 )
+  {
+    result.error = QStringLiteral( "Clustered flat-top hipped roof requires exactly two boundary points and one ridge point." );
+    return result;
+  }
+
+  const QgsPoint basePoint = boundary.at( 0 ).point;
+  const QgsPoint topPoint = boundary.at( 1 ).point;
+  const QgsPoint clusterPoint = ridges.first().point;
+  const double baseHeight = basePoint.z();
+  const double topHeight = topPoint.z();
+  if ( topHeight <= baseHeight + 1e-6 )
+  {
+    result.error = QStringLiteral( "The second boundary point must be higher than the first boundary point." );
+    return result;
+  }
+
+  const QgsPolygonXY polygon = firstPolygon( buildingGeometry );
+  const QVector<QgsPointXY> ring = exteriorRing( polygon );
+  if ( ring.size() < 3 )
+  {
+    result.error = QStringLiteral( "The building footprint cannot be used for clustered flat-top hipped roof mesh generation." );
+    return result;
+  }
+
+  double axisX = 0.0;
+  double axisY = 0.0;
+  if ( !nearestEdgeDirection( ring, basePoint, axisX, axisY ) )
+  {
+    axisX = topPoint.x() - basePoint.x();
+    axisY = topPoint.y() - basePoint.y();
+    const double length = std::hypot( axisX, axisY );
+    if ( length <= 1e-8 )
+    {
+      result.error = QStringLiteral( "Cannot infer clustered flat-top hipped roof direction." );
+      return result;
+    }
+    axisX /= length;
+    axisY /= length;
+  }
+  const double normalX = -axisY;
+  const double normalY = axisX;
+
+  const double extent = ringExtentSize( ring );
+  const double heightDifference = std::fabs( topHeight - baseHeight );
+  const double topTolerance = std::max( 0.10, heightDifference * 0.20 );
+  const double baseTolerance = std::max( 0.10, heightDifference * 0.20 );
+  QVector<ClusterSample> samples;
+  for ( const RoofSample &sample : pointCloudSamples )
+  {
+    const QgsPoint &point = sample.point;
+    const QgsPointXY samplePoint( point.x(), point.y() );
+    if ( !pointInRing( ring, samplePoint ) )
+      continue;
+
+    if ( std::fabs( point.z() - topHeight ) > topTolerance )
+      continue;
+    if ( std::fabs( point.z() - baseHeight ) <= baseTolerance )
+      continue;
+
+    const double u = point.x() * axisX + point.y() * axisY;
+    const double v = point.x() * normalX + point.y() * normalY;
+    samples.append( ClusterSample{ samplePoint, u, v, -1, false } );
+  }
+
+  if ( samples.size() < 3 )
+  {
+    result.error = QStringLiteral( "DBSCAN could not find enough point-cloud samples near the upper flat-top height." );
+    return result;
+  }
+
+  const double eps = estimateDbscanEps( samples, std::max( extent * 0.03, 0.5 ) );
+  const int clusterCount = assignDbscanClusters( samples, eps, 3 );
+  QVector<QgsPointXY> topRing = clusterBoxNearPoint( samples, clusterCount, QgsPointXY( clusterPoint.x(), clusterPoint.y() ), axisX, axisY, normalX, normalY, eps * 0.5, extent * 2.0 );
+  if ( topRing.size() < 3 )
+    topRing = clusterBoxNearPoint( samples, clusterCount, QgsPointXY( topPoint.x(), topPoint.y() ), axisX, axisY, normalX, normalY, eps * 0.5, extent * 2.0 );
+  if ( topRing.size() < 3 )
+  {
+    result.error = QStringLiteral( "DBSCAN could not form an upper flat-top cluster." );
+    return result;
+  }
+
+  const QgsGeometry footprintGeometry = polygonGeometryFromRing( ring );
+  QgsGeometry topGeometry = polygonGeometryFromRing( topRing ).intersection( footprintGeometry );
+  if ( topGeometry.isNull() || topGeometry.isEmpty() )
+  {
+    result.error = QStringLiteral( "Upper flat-top cluster does not intersect the footprint." );
+    return result;
+  }
+
+  QgsGeometry slopeGeometry = footprintGeometry.difference( topGeometry );
+  if ( slopeGeometry.isNull() || slopeGeometry.isEmpty() )
+  {
+    result.error = QStringLiteral( "Upper flat-top cluster covers the full footprint." );
+    return result;
+  }
+
+  const QVector<QVector<QgsPointXY>> topRings = exteriorRingsFromGeometry( topGeometry );
+  if ( topRings.isEmpty() )
+  {
+    result.error = QStringLiteral( "Upper flat-top cluster has no usable boundary." );
+    return result;
+  }
+
+  appendVerticalWall( result.mesh, ring, 0.0, baseHeight );
+  appendHorizontalRingSurface( result.mesh, ring, 0.0, true );
+  appendSlopedFlatTopHippedSurface( result.mesh, slopeGeometry, ring, topRings, baseHeight, topHeight );
+  appendHorizontalGeometrySurface( result.mesh, topGeometry, topHeight );
+
+  result.success = !result.mesh.isEmpty();
+  if ( !result.success )
+    result.error = QStringLiteral( "Clustered flat-top hipped roof mesh generation failed." );
+  return result;
+}
+
+BuildingRoof::MeshResult BuildingRoof::buildCurvedRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints )
+{
+  Q_UNUSED( buildingHeight )
+  MeshResult result;
+
+  const QList<RoofPoint> boundaries = boundaryPoints( roofPoints );
+  const QList<RoofPoint> ridges = ridgePoints( roofPoints );
+  const QList<RoofPoint> vertices = vertexPoints( roofPoints );
+  const QList<RoofPoint> surfaces = surfacePoints( roofPoints );
+  if ( boundaries.size() != 1 || !ridges.isEmpty() || !vertices.isEmpty() || ( surfaces.size() != 1 && surfaces.size() != 2 ) )
+  {
+    result.error = QStringLiteral( "Curved roof requires exactly one boundary point and one or two surface points." );
+    return result;
+  }
+
+  const QgsPoint boundaryPoint = boundaries.first().point;
+  for ( const RoofPoint &surface : surfaces )
+  {
+    if ( surface.point.z() <= boundaryPoint.z() + 1e-6 )
+    {
+      result.error = QStringLiteral( "Surface points must be higher than the boundary point." );
+      return result;
+    }
+  }
+
+  const QgsPolygonXY polygon = firstPolygon( buildingGeometry );
+  const QVector<QgsPointXY> ring = exteriorRing( polygon );
+  if ( ring.size() < 3 )
+  {
+    result.error = QStringLiteral( "The building footprint cannot be used for curved roof mesh generation." );
+    return result;
+  }
+
+  for ( const RoofPoint &surface : surfaces )
+  {
+    if ( !pointInRing( ring, QgsPointXY( surface.point.x(), surface.point.y() ) ) )
+    {
+      result.error = QStringLiteral( "Surface points must lie inside the building footprint." );
+      return result;
+    }
+  }
+
+  if ( surfaces.size() == 2 )
+  {
+    const QgsPoint &a = surfaces.at( 0 ).point;
+    const QgsPoint &b = surfaces.at( 1 ).point;
+    if ( std::hypot( a.x() - b.x(), a.y() - b.y() ) <= 1e-8 )
+    {
+      result.error = QStringLiteral( "The two barrel roof surface points must have different positions." );
+      return result;
+    }
+  }
+
+  appendCurvedRoofWall( result.mesh, ring, surfaces, boundaryPoint.z() );
+  appendHorizontalRingSurface( result.mesh, ring, 0.0, true );
+  appendCurvedRoofSurface( result.mesh, ring, surfaces, boundaryPoint.z() );
+
+  result.success = !result.mesh.isEmpty();
+  if ( !result.success )
+    result.error = QStringLiteral( "Curved roof mesh generation failed." );
+  return result;
+}
+
+BuildingRoof::MeshResult BuildingRoof::buildApexRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints )
+{
+  Q_UNUSED( buildingHeight )
+  MeshResult result;
+
+  const QList<RoofPoint> boundaries = boundaryPoints( roofPoints );
+  const QList<RoofPoint> ridges = ridgePoints( roofPoints );
+  const QList<RoofPoint> vertices = vertexPoints( roofPoints );
+  if ( boundaries.size() != 1 || !ridges.isEmpty() || vertices.size() != 1 )
+  {
+    result.error = QStringLiteral( "Apex roof requires exactly one boundary point and one vertex point." );
+    return result;
+  }
+
+  const QgsPoint boundaryPoint = boundaries.first().point;
+  const QgsPoint apexPoint = vertices.first().point;
+  if ( apexPoint.z() <= boundaryPoint.z() + 1e-6 )
+  {
+    result.error = QStringLiteral( "The apex point must be higher than the boundary point." );
+    return result;
+  }
+
+  const QgsPolygonXY polygon = firstPolygon( buildingGeometry );
+  const QVector<QgsPointXY> ring = exteriorRing( polygon );
+  if ( ring.size() < 3 )
+  {
+    result.error = QStringLiteral( "The building footprint cannot be used for apex roof mesh generation." );
+    return result;
+  }
+
+  appendVerticalWall( result.mesh, ring, 0.0, boundaryPoint.z() );
+  appendHorizontalRingSurface( result.mesh, ring, 0.0, true );
+  appendApexRoofSurface( result.mesh, ring, boundaryPoint.z(), apexPoint );
+
+  result.success = !result.mesh.isEmpty();
+  if ( !result.success )
+    result.error = QStringLiteral( "Apex roof mesh generation failed." );
+  return result;
+}
+
 BuildingRoof::MeshResult BuildingRoof::buildGabledRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints )
 {
   Q_UNUSED( buildingHeight )
@@ -787,6 +2686,10 @@ BuildingRoof::MeshResult BuildingRoof::buildGabledRoofPrismMesh( const QgsGeomet
     return result;
   }
 
+  const MeshResult bentResult = buildBentGabledRoofPrismMesh( ring, boundaryPoint, ridgePoint, dirX, dirY );
+  if ( bentResult.success )
+    return bentResult;
+
   const double normalX = -dirY;
   const double normalY = dirX;
   const double boundaryDistance = signedDistanceToLine( QgsPointXY( boundaryPoint.x(), boundaryPoint.y() ), ridgePoint, normalX, normalY );
@@ -797,19 +2700,24 @@ BuildingRoof::MeshResult BuildingRoof::buildGabledRoofPrismMesh( const QgsGeomet
   }
 
   ring = ringWithRidgeIntersections( ring, ridgePoint, normalX, normalY );
+  double sameSideLimit = 0.0;
   double oppositeLimit = 0.0;
   for ( const QgsPointXY &point : ring )
   {
     const double distance = signedDistanceToLine( point, ridgePoint, normalX, normalY );
     if ( distance * boundaryDistance < 0.0 )
       oppositeLimit = std::max( oppositeLimit, std::fabs( distance ) );
+    else
+      sameSideLimit = std::max( sameSideLimit, std::fabs( distance ) );
   }
+  if ( sameSideLimit <= 1e-8 )
+    sameSideLimit = std::fabs( boundaryDistance );
 
   const double baseHeight = boundaryPoint.z();
   for ( const QgsPointXY &point : ring )
   {
     result.mesh.vertices.append( QgsPoint( point.x(), point.y(), 0.0 ) );
-    result.mesh.vertices.append( QgsPoint( point.x(), point.y(), gabledTopZ( point, boundaryPoint, ridgePoint, normalX, normalY, oppositeLimit, baseHeight ) ) );
+    result.mesh.vertices.append( QgsPoint( point.x(), point.y(), gabledTopZ( point, boundaryPoint, ridgePoint, normalX, normalY, sameSideLimit, oppositeLimit, baseHeight ) ) );
   }
 
   const int count = ring.size();
@@ -824,8 +2732,8 @@ BuildingRoof::MeshResult BuildingRoof::buildGabledRoofPrismMesh( const QgsGeomet
   for ( int i = 0; i + 2 < bottomTriangles.size(); i += 3 )
     result.mesh.indices << 2 * bottomTriangles[i] << 2 * bottomTriangles[i + 2] << 2 * bottomTriangles[i + 1];
 
-  appendTriangulatedRoofSurface( result.mesh, clipRingByRidgeSide( ring, ridgePoint, normalX, normalY, true ), boundaryPoint, ridgePoint, normalX, normalY, oppositeLimit, baseHeight );
-  appendTriangulatedRoofSurface( result.mesh, clipRingByRidgeSide( ring, ridgePoint, normalX, normalY, false ), boundaryPoint, ridgePoint, normalX, normalY, oppositeLimit, baseHeight );
+  appendTriangulatedRoofSurface( result.mesh, clipRingByRidgeSide( ring, ridgePoint, normalX, normalY, true ), boundaryPoint, ridgePoint, normalX, normalY, sameSideLimit, oppositeLimit, baseHeight );
+  appendTriangulatedRoofSurface( result.mesh, clipRingByRidgeSide( ring, ridgePoint, normalX, normalY, false ), boundaryPoint, ridgePoint, normalX, normalY, sameSideLimit, oppositeLimit, baseHeight );
 
   result.success = !result.mesh.isEmpty();
   if ( !result.success )
@@ -883,13 +2791,16 @@ BuildingRoof::MeshResult BuildingRoof::buildMultiRidgePrismMesh( const QgsGeomet
   }
 
   QVector<ProfileAnchor> profileAnchors;
+  QVector<ProfileAnchor> ridgeProfileAnchors;
   const double defaultEaveZ = boundaries.first().point.z();
   appendProfileAnchor( profileAnchors, minS, defaultEaveZ );
   appendProfileAnchor( profileAnchors, maxS, defaultEaveZ );
-  for ( const RoofPoint &boundary : boundaries )
-    appendProfileAnchor( profileAnchors, profileDistance( QgsPointXY( boundary.point.x(), boundary.point.y() ), normalX, normalY ), boundary.point.z() );
   for ( const RoofPoint &ridge : ridges )
-    appendProfileAnchor( profileAnchors, profileDistance( QgsPointXY( ridge.point.x(), ridge.point.y() ), normalX, normalY ), ridge.point.z() );
+    appendProfileAnchor( ridgeProfileAnchors, profileDistance( QgsPointXY( ridge.point.x(), ridge.point.y() ), normalX, normalY ), ridge.point.z() );
+
+  averageMirroredRidgeProfileHeightsIfClose( ridgeProfileAnchors );
+  for ( const ProfileAnchor &ridgeAnchor : ridgeProfileAnchors )
+    appendProfileAnchor( profileAnchors, ridgeAnchor.s, ridgeAnchor.z );
 
   std::sort( profileAnchors.begin(), profileAnchors.end(), []( const ProfileAnchor &lhs, const ProfileAnchor &rhs ) {
     return lhs.s < rhs.s;
@@ -961,13 +2872,15 @@ BuildingRoof::MeshResult BuildingRoof::buildHippedRoofPrismMesh( const QgsGeomet
   Q_UNUSED( buildingHeight )
 
   const QList<RoofPoint> boundaries = boundaryPoints( roofPoints );
-  const QList<RoofPoint> ridges = ridgePoints( roofPoints );
+  QList<RoofPoint> ridges = ridgePoints( roofPoints );
   if ( boundaries.size() != 1 || ridges.size() != 2 )
   {
     MeshResult result;
     result.error = QStringLiteral( "Hipped roof requires exactly one boundary point and two ridge points." );
     return result;
   }
+
+  averageRidgePairHeightIfClose( ridges[0], ridges[1] );
 
   const RoofPoint boundary = boundaries.first();
   if ( ridges.at( 0 ).point.z() <= boundary.point.z() + 1e-6 || ridges.at( 1 ).point.z() <= boundary.point.z() + 1e-6 )
@@ -1009,7 +2922,6 @@ BuildingRoof::MeshResult BuildingRoof::buildHippedRoofPrismMesh( const QgsGeomet
   QVector<AnchorPoint> eaveAnchors;
   QVector<AnchorPoint> roofAnchors;
   appendAnchor( eaveAnchors, QgsPointXY( boundary.point.x(), boundary.point.y() ), boundary.point.z() );
-  appendAnchor( roofAnchors, QgsPointXY( boundary.point.x(), boundary.point.y() ), boundary.point.z() );
   appendAnchor( roofAnchors, QgsPointXY( ridges.at( 0 ).point.x(), ridges.at( 0 ).point.y() ), ridges.at( 0 ).point.z() );
   appendAnchor( roofAnchors, QgsPointXY( ridges.at( 1 ).point.x(), ridges.at( 1 ).point.y() ), ridges.at( 1 ).point.z() );
 

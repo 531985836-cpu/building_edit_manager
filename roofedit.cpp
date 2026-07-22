@@ -39,6 +39,7 @@
 #include <Qt3DExtras/QSphereMesh>
 #include <QBrush>
 #include <QComboBox>
+#include <QCryptographicHash>
 #include <QHeaderView>
 #include <QKeyEvent>
 #include <QMessageBox>
@@ -47,6 +48,7 @@
 #include <QTableWidgetItem>
 #include <QWheelEvent>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -57,6 +59,184 @@ namespace
   const QString ROOF_POINT_BOUNDARY = QStringLiteral( "边界点" );
   const QString ROOF_POINT_RIDGE = QStringLiteral( "屋脊点" );
   const QString ROOF_POINT_GROUND = QStringLiteral( "地面点" );
+  const QString ROOF_POINT_VERTEX = QStringLiteral( "顶点" );
+  const QString ROOF_POINT_SURFACE = QStringLiteral( "曲面点" );
+
+  struct EditableRidgePoint
+  {
+    QgsFeatureId fid = FID_NULL;
+    QgsPoint point;
+    double s = 0.0;
+  };
+
+  bool isRoofRidgePointType( const QString &type )
+  {
+    return type.contains( ROOF_POINT_RIDGE )
+           || type.contains( QStringLiteral( "灞嬭剨" ) )
+           || type.contains( QStringLiteral( "ridge" ), Qt::CaseInsensitive );
+  }
+
+  bool isRoofGroundPointType( const QString &type )
+  {
+    return type.contains( ROOF_POINT_GROUND )
+           || type.contains( QStringLiteral( "鍦伴潰" ) )
+           || type.contains( QStringLiteral( "ground" ), Qt::CaseInsensitive );
+  }
+
+  bool isRoofVertexPointType( const QString &type )
+  {
+    return type.contains( ROOF_POINT_VERTEX )
+           || type.contains( QStringLiteral( "vertex" ), Qt::CaseInsensitive );
+  }
+
+  bool isRoofSurfacePointType( const QString &type )
+  {
+    return type.contains( ROOF_POINT_SURFACE )
+           || type.contains( QStringLiteral( "surface" ), Qt::CaseInsensitive );
+  }
+
+  bool isRoofBoundaryPointType( const QString &type )
+  {
+    return !isRoofRidgePointType( type )
+           && !isRoofGroundPointType( type )
+           && !isRoofVertexPointType( type )
+           && !isRoofSurfacePointType( type );
+  }
+
+  double percentileValue( const QVector<double> &sortedValues, double percentile )
+  {
+    if ( sortedValues.isEmpty() )
+      return 0.0;
+
+    const double clamped = std::max( 0.0, std::min( 1.0, percentile ) );
+    const int index = std::max( 0, std::min( sortedValues.size() - 1, static_cast<int>( std::round( clamped * ( sortedValues.size() - 1 ) ) ) ) );
+    return sortedValues.at( index );
+  }
+
+  double heightPercentileForPointType( const QString &pointType )
+  {
+    if ( isRoofVertexPointType( pointType ) )
+      return 0.98;
+    if ( isRoofRidgePointType( pointType ) )
+      return 0.95;
+    if ( isRoofSurfacePointType( pointType ) )
+      return 0.60;
+    return 0.80;
+  }
+
+  QVector<QgsPointXY> featureExteriorRing( const QgsFeature &feature )
+  {
+    QVector<QgsPointXY> ring;
+    if ( !feature.hasGeometry() )
+      return ring;
+
+    QgsPolygonXY polygon = feature.geometry().asPolygon();
+    if ( polygon.isEmpty() )
+    {
+      const QgsMultiPolygonXY multiPolygon = feature.geometry().asMultiPolygon();
+      if ( !multiPolygon.isEmpty() )
+        polygon = multiPolygon.first();
+    }
+
+    if ( polygon.isEmpty() )
+      return ring;
+
+    for ( const QgsPointXY &point : polygon.first() )
+    {
+      if ( ring.isEmpty() || point != ring.last() )
+        ring.append( point );
+    }
+    if ( ring.size() > 1 && ring.first() == ring.last() )
+      ring.removeLast();
+    return ring;
+  }
+
+  QString buildingShapeSignature( const QgsGeometry &geometry )
+  {
+    if ( geometry.isNull() || geometry.isEmpty() )
+      return QString();
+
+    QgsPolygonXY polygon = geometry.asPolygon();
+    if ( polygon.isEmpty() )
+    {
+      const QgsMultiPolygonXY multiPolygon = geometry.asMultiPolygon();
+      if ( !multiPolygon.isEmpty() )
+        polygon = multiPolygon.first();
+    }
+    if ( polygon.isEmpty() || polygon.first().size() < 3 )
+      return QString();
+
+    const QgsRectangle bounds = geometry.boundingBox();
+    QByteArray bytes;
+    bytes.reserve( polygon.first().size() * 32 );
+    bytes.append( QByteArray::number( qRound64( bounds.width() * 10000.0 ) ) );
+    bytes.append( ':' );
+    bytes.append( QByteArray::number( qRound64( bounds.height() * 10000.0 ) ) );
+    bytes.append( ';' );
+
+    for ( const QgsPointXY &point : polygon.first() )
+    {
+      bytes.append( QByteArray::number( qRound64( ( point.x() - bounds.xMinimum() ) * 10000.0 ) ) );
+      bytes.append( ',' );
+      bytes.append( QByteArray::number( qRound64( ( point.y() - bounds.yMinimum() ) * 10000.0 ) ) );
+      bytes.append( ';' );
+    }
+
+    return QString::fromLatin1( QCryptographicHash::hash( bytes, QCryptographicHash::Md5 ).toHex() );
+  }
+
+  double pointSegmentDistance2ForRoofEdit( const QgsPointXY &point, const QgsPointXY &a, const QgsPointXY &b )
+  {
+    const double dx = b.x() - a.x();
+    const double dy = b.y() - a.y();
+    const double len2 = dx * dx + dy * dy;
+    if ( len2 <= 1e-12 )
+      return std::pow( point.x() - a.x(), 2.0 ) + std::pow( point.y() - a.y(), 2.0 );
+
+    const double t = std::max( 0.0, std::min( 1.0, ( ( point.x() - a.x() ) * dx + ( point.y() - a.y() ) * dy ) / len2 ) );
+    const double px = a.x() + t * dx;
+    const double py = a.y() + t * dy;
+    return std::pow( point.x() - px, 2.0 ) + std::pow( point.y() - py, 2.0 );
+  }
+
+  bool nearestRoofEditEdgeDirection( const QVector<QgsPointXY> &ring, const QgsPoint &boundaryPoint, double &dirX, double &dirY )
+  {
+    if ( ring.size() < 2 )
+      return false;
+
+    const QgsPointXY query( boundaryPoint.x(), boundaryPoint.y() );
+    double bestDistance = std::numeric_limits<double>::max();
+    int bestIndex = -1;
+    for ( int i = 0; i < ring.size(); ++i )
+    {
+      const double distance = pointSegmentDistance2ForRoofEdit( query, ring[i], ring[( i + 1 ) % ring.size()] );
+      if ( distance < bestDistance )
+      {
+        bestDistance = distance;
+        bestIndex = i;
+      }
+    }
+
+    if ( bestIndex < 0 )
+      return false;
+
+    const QgsPointXY &a = ring[bestIndex];
+    const QgsPointXY &b = ring[( bestIndex + 1 ) % ring.size()];
+    dirX = b.x() - a.x();
+    dirY = b.y() - a.y();
+    const double length = std::hypot( dirX, dirY );
+    if ( length <= 1e-12 )
+      return false;
+
+    dirX /= length;
+    dirY /= length;
+    return true;
+  }
+
+  double roofEditProfileDistance( const QgsPoint &point, double normalX, double normalY )
+  {
+    return point.x() * normalX + point.y() * normalY;
+  }
 
   QgsMarkerSymbol *createRoofMarkerSymbol( const QString &shape, const QColor &color, double size )
   {
@@ -73,7 +253,7 @@ namespace
     QgsPoint3DSymbol *symbol = new QgsPoint3DSymbol();
     symbol->setAltitudeClamping( Qgis::AltitudeClamping::Absolute );
     symbol->setShape( Qgis::Point3DShape::Billboard );
-    symbol->setBillboardSymbol( createRoofMarkerSymbol( shape, color, 7.0 ) );
+    symbol->setBillboardSymbol( createRoofMarkerSymbol( shape, color, 4.8 ) );
 
     QgsPhongMaterialSettings *material = new QgsPhongMaterialSettings();
     material->setAmbient( color.darker( 120 ) );
@@ -139,69 +319,20 @@ void RoofEditTool::setupUi()
   }
 
   connect( mUI.clearPointsButton, &QPushButton::clicked, this, &RoofEditTool::clearCurrentBuildingPoints );
-  connect( mUI.previewRoofButton, &QPushButton::clicked, this, &RoofEditTool::previewRoofModel );
+  connect( mUI.previewRoofButton, &QPushButton::clicked, this, &RoofEditTool::deleteRoofModel );
   connect( mUI.saveRoofButton, &QPushButton::clicked, this, &RoofEditTool::saveRoofModel );
-
-  if ( mUI.radioButton_2 )
-  {
-    mUI.radioButton_2->setAutoExclusive( false );
-    mUI.radioButton_2->setChecked( false );
-    connect( mUI.radioButton_2, &QRadioButton::clicked, this, [this]( bool checked ) {
-      if ( checked )
-      {
-        if ( mUI.radioButton )
-          mUI.radioButton->setChecked( false );
-        if ( mUI.editModeRadioButton )
-          mUI.editModeRadioButton->setChecked( false );
-        cancelPointEditPreview();
-        clearPointSelection();
-      }
-    } );
-  }
-
-  if ( mUI.radioButton )
-  {
-    mUI.radioButton->setAutoExclusive( false );
-    mUI.radioButton->setChecked( false );
-    connect( mUI.radioButton, &QRadioButton::clicked, this, [this]( bool checked ) {
-      if ( checked )
-      {
-        if ( mUI.radioButton_2 )
-          mUI.radioButton_2->setChecked( false );
-        if ( mUI.editModeRadioButton )
-          mUI.editModeRadioButton->setChecked( false );
-        cancelPointEditPreview();
-        clearPointSelection();
-      }
-    } );
-  }
-
-  if ( mUI.editModeRadioButton )
-  {
-    mUI.editModeRadioButton->setAutoExclusive( false );
-    mUI.editModeRadioButton->setChecked( false );
-    connect( mUI.editModeRadioButton, &QRadioButton::clicked, this, [this]( bool checked ) {
-      if ( mUI.radioButton_2 )
-        mUI.radioButton_2->setChecked( false );
-      if ( mUI.radioButton )
-        mUI.radioButton->setChecked( false );
-      if ( !checked )
-        cancelPointEditPreview();
-      updatePointEditTip();
-    } );
-  }
 
   QShortcut *returnShortcut = new QShortcut( QKeySequence( Qt::Key_Return ), mWidget );
   returnShortcut->setContext( Qt::WidgetWithChildrenShortcut );
   connect( returnShortcut, &QShortcut::activated, this, [this] {
-    if ( isHeightEditEnabled() && mHasPointEditPreview )
+    if ( mHasPointEditPreview )
       confirmPointEditPreview();
   } );
 
   QShortcut *enterShortcut = new QShortcut( QKeySequence( Qt::Key_Enter ), mWidget );
   enterShortcut->setContext( Qt::WidgetWithChildrenShortcut );
   connect( enterShortcut, &QShortcut::activated, this, [this] {
-    if ( isHeightEditEnabled() && mHasPointEditPreview )
+    if ( mHasPointEditPreview )
       confirmPointEditPreview();
   } );
 
@@ -307,20 +438,10 @@ void RoofEditTool::canvasPressEvent( QgsMapMouseEvent *e )
 
   const QgsPointXY mapPoint = e->mapPoint();
 
-  if ( mCurrentBuilding.isValid() && mWidget && mWidget->isVisible() && isPositionEditEnabled() )
+  if ( mCurrentBuilding.isValid() && mWidget && mWidget->isVisible() )
   {
-    handlePositionEditClick( mapPoint );
-    return;
-  }
-
-  if ( mCurrentBuilding.isValid() && mWidget && mWidget->isVisible() && isHeightEditEnabled() )
-  {
-    selectRoofPointAt( mapPoint );
-    return;
-  }
-
-  if ( mCurrentBuilding.isValid() && mWidget && mWidget->isVisible() && mUI.radioButton_2 && mUI.radioButton_2->isChecked() )
-  {
+    if ( handlePositionEditClick( mapPoint ) )
+      return;
     addRoofPointAt( mapPoint );
     return;
   }
@@ -359,12 +480,15 @@ void RoofEditTool::canvasDoubleClickEvent( QgsMapMouseEvent *e )
   if ( !e || e->button() != Qt::LeftButton )
     return;
 
-  if ( !mWidget || !mWidget->isVisible() || !mUI.radioButton || !mUI.radioButton->isChecked() )
+  if ( !mWidget || !mWidget->isVisible() || !mCurrentBuilding.isValid() )
     return;
 
   const QgsFeatureId fid = findRoofPointAt( e->mapPoint() );
   if ( fid != FID_NULL )
+  {
     deleteRoofPoint( fid );
+    e->accept();
+  }
 }
 
 void RoofEditTool::wheelEvent( QWheelEvent *e )
@@ -377,7 +501,7 @@ void RoofEditTool::wheelEvent( QWheelEvent *e )
 
 void RoofEditTool::keyPressEvent( QKeyEvent *e )
 {
-  if ( e && ( e->key() == Qt::Key_Return || e->key() == Qt::Key_Enter ) && isHeightEditEnabled() && mHasPointEditPreview )
+  if ( e && ( e->key() == Qt::Key_Return || e->key() == Qt::Key_Enter ) && mHasPointEditPreview )
   {
     confirmPointEditPreview();
     e->accept();
@@ -450,6 +574,10 @@ QColor RoofEditTool::colorForPointType( const QString &type ) const
 {
   if ( type.contains( ROOF_POINT_RIDGE ) || type.contains( QStringLiteral( "屋脊" ) ) )
     return QColor( 220, 40, 40 );
+  if ( type.contains( ROOF_POINT_VERTEX ) || type.contains( QStringLiteral( "顶点" ) ) )
+    return QColor( 245, 205, 35 );
+  if ( type.contains( ROOF_POINT_SURFACE ) || type.contains( QStringLiteral( "曲面" ) ) )
+    return QColor( 170, 60, 210 );
   if ( type.contains( ROOF_POINT_GROUND ) || type.contains( QStringLiteral( "地面" ) ) )
     return QColor( 240, 190, 35 );
   return QColor( 20, 170, 80 );
@@ -466,8 +594,8 @@ void RoofEditTool::addRoofPointAt( const QgsPointXY &mapPoint )
 
   const QString pcId = mUI.pointCloudComboBox ? mUI.pointCloudComboBox->currentData().toString() : QString();
   mPointCloudLayer = qobject_cast<QgsPointCloudLayer *>( QgsProject::instance()->mapLayer( pcId ) );
-  const double z = estimateHeightFromPointCloud( mapPoint );
   const QString pointType = currentPointType();
+  const double z = estimateHeightFromPointCloud( mapPoint, pointType );
 
   if ( !mPointLayer->isEditable() )
     mPointLayer->startEditing();
@@ -483,6 +611,7 @@ void RoofEditTool::addRoofPointAt( const QgsPointXY &mapPoint )
   mPointLayer->commitChanges();
   mPointLayer->triggerRepaint();
 
+  normalizeCurrentRidgeHeights( false );
   refreshPointTable();
   ensurePointLayerIn3DView();
   notifyRoofModelChanged();
@@ -675,6 +804,7 @@ void RoofEditTool::confirmPointEditPreview()
   mHasPointEditPreview = false;
   mPreviewPointFid = FID_NULL;
   updateRoofPoint( fid, point );
+  normalizeCurrentRidgeHeights( false );
   refreshPointTable();
   clearPointSelection();
   clearPointPreviewDisplay();
@@ -769,7 +899,7 @@ void RoofEditTool::updatePointPreviewDisplay( const QgsPoint &point )
       mPointPreviewRubberBand->setColor( QColor( 205, 65, 220, 230 ) );
       mPointPreviewRubberBand->setSecondaryStrokeColor( QColor( 255, 255, 255, 230 ) );
       mPointPreviewRubberBand->setIcon( QgsRubberBand::ICON_FULL_DIAMOND );
-      mPointPreviewRubberBand->setIconSize( 12 );
+      mPointPreviewRubberBand->setIconSize( 10 );
       mPointPreviewRubberBand->setWidth( 2 );
     }
     mPointPreviewRubberBand->reset( Qgis::GeometryType::Point );
@@ -833,7 +963,7 @@ void RoofEditTool::ensure3DPreviewEntity()
   mPreviewPointEntity = new Qt3DCore::QEntity( mPreviewRootEntity );
   mPreviewPointEntity->setObjectName( QStringLiteral( "RoofEditPreviewPoint" ) );
   Qt3DExtras::QSphereMesh *pointMesh = new Qt3DExtras::QSphereMesh( mPreviewPointEntity );
-  pointMesh->setRadius( 1.2f );
+  pointMesh->setRadius( 0.2f );
   pointMesh->setRings( 12 );
   pointMesh->setSlices( 16 );
   Qt3DExtras::QPhongMaterial *pointMaterial = new Qt3DExtras::QPhongMaterial( mPreviewPointEntity );
@@ -911,14 +1041,14 @@ bool RoofEditTool::isHeightEditEnabled() const
 {
   if ( !mWidget || !mWidget->isVisible() )
     return false;
-  return mUI.editModeRadioButton && mUI.editModeRadioButton->isChecked();
+  return mCurrentBuilding.isValid();
 }
 
 bool RoofEditTool::isPositionEditEnabled() const
 {
   if ( !mWidget || !mWidget->isVisible() )
     return false;
-  return mUI.editModeRadioButton && mUI.editModeRadioButton->isChecked();
+  return mCurrentBuilding.isValid();
 }
 
 bool RoofEditTool::handlePositionEditClick( const QgsPointXY &mapPoint )
@@ -1023,6 +1153,12 @@ void RoofEditTool::ensureSavedPointLayer()
       missingFields << QgsField( QStringLiteral( "rel_x" ), QVariant::Double );
     if ( mSavedPointLayer->fields().indexOf( QStringLiteral( "rel_y" ) ) < 0 )
       missingFields << QgsField( QStringLiteral( "rel_y" ), QVariant::Double );
+    if ( mSavedPointLayer->fields().indexOf( QStringLiteral( "building_shape" ) ) < 0 )
+      missingFields << QgsField( QStringLiteral( "building_shape" ), QVariant::String );
+    if ( mSavedPointLayer->fields().indexOf( QStringLiteral( "building_center_x" ) ) < 0 )
+      missingFields << QgsField( QStringLiteral( "building_center_x" ), QVariant::Double );
+    if ( mSavedPointLayer->fields().indexOf( QStringLiteral( "building_center_y" ) ) < 0 )
+      missingFields << QgsField( QStringLiteral( "building_center_y" ), QVariant::Double );
 
     if ( !missingFields.isEmpty() )
     {
@@ -1051,7 +1187,7 @@ void RoofEditTool::ensureSavedPointLayer()
   const QString crs = mActiveLayer && mActiveLayer->crs().isValid()
                         ? mActiveLayer->crs().authid()
                         : ( mCanvas ? mCanvas->mapSettings().destinationCrs().authid() : QStringLiteral( "EPSG:4326" ) );
-  const QString uri = QStringLiteral( "PointZ?crs=%1&field=building_fid:long&field=type:string&field=z:double&field=source:string&field=base_height:double&field=rel_x:double&field=rel_y:double" ).arg( crs );
+  const QString uri = QStringLiteral( "PointZ?crs=%1&field=building_fid:long&field=type:string&field=z:double&field=source:string&field=base_height:double&field=rel_x:double&field=rel_y:double&field=building_shape:string&field=building_center_x:double&field=building_center_y:double" ).arg( crs );
   mSavedPointLayer = new QgsVectorLayer( uri, tr( "Roof_Saved_Points" ), QStringLiteral( "memory" ) );
   QgsProject::instance()->addMapLayer( mSavedPointLayer, false );
 
@@ -1071,12 +1207,14 @@ void RoofEditTool::setupPointLayerRenderer()
 
   const QColor boundaryColor( 20, 170, 80 );
   const QColor ridgeColor( 220, 40, 40 );
-  const QColor groundColor( 240, 190, 35 );
+  const QColor vertexColor( 245, 205, 35 );
+  const QColor surfaceColor( 170, 60, 210 );
 
   QgsCategoryList categories;
-  categories << QgsRendererCategory( ROOF_POINT_BOUNDARY, createRoofMarkerSymbol( QStringLiteral( "circle" ), boundaryColor, 3.6 ), ROOF_POINT_BOUNDARY )
-             << QgsRendererCategory( ROOF_POINT_RIDGE, createRoofMarkerSymbol( QStringLiteral( "triangle" ), ridgeColor, 4.0 ), ROOF_POINT_RIDGE )
-             << QgsRendererCategory( ROOF_POINT_GROUND, createRoofMarkerSymbol( QStringLiteral( "star" ), groundColor, 4.4 ), ROOF_POINT_GROUND );
+  categories << QgsRendererCategory( ROOF_POINT_BOUNDARY, createRoofMarkerSymbol( QStringLiteral( "circle" ), boundaryColor, 2.5 ), ROOF_POINT_BOUNDARY )
+             << QgsRendererCategory( ROOF_POINT_RIDGE, createRoofMarkerSymbol( QStringLiteral( "triangle" ), ridgeColor, 2.8 ), ROOF_POINT_RIDGE )
+             << QgsRendererCategory( ROOF_POINT_VERTEX, createRoofMarkerSymbol( QStringLiteral( "diamond" ), vertexColor, 3.0 ), ROOF_POINT_VERTEX )
+             << QgsRendererCategory( ROOF_POINT_SURFACE, createRoofMarkerSymbol( QStringLiteral( "square" ), surfaceColor, 2.8 ), ROOF_POINT_SURFACE );
   mPointLayer->setRenderer( new QgsCategorizedSymbolRenderer( QStringLiteral( "type" ), categories ) );
 
   QgsRuleBased3DRenderer::Rule *rootRule = new QgsRuleBased3DRenderer::Rule( nullptr );
@@ -1089,9 +1227,13 @@ void RoofEditTool::setupPointLayerRenderer()
     QStringLiteral( "\"type\" = '屋脊点'" ),
     ROOF_POINT_RIDGE ) );
   rootRule->appendChild( new QgsRuleBased3DRenderer::Rule(
-    createRoofPoint3DSymbol( QStringLiteral( "star" ), groundColor ),
-    QStringLiteral( "\"type\" = '地面点'" ),
-    ROOF_POINT_GROUND ) );
+    createRoofPoint3DSymbol( QStringLiteral( "diamond" ), vertexColor ),
+    QStringLiteral( "\"type\" = '顶点'" ),
+    ROOF_POINT_VERTEX ) );
+  rootRule->appendChild( new QgsRuleBased3DRenderer::Rule(
+    createRoofPoint3DSymbol( QStringLiteral( "square" ), surfaceColor ),
+    QStringLiteral( "\"type\" = '曲面点'" ),
+    ROOF_POINT_SURFACE ) );
 
   QgsRuleBased3DRenderer *renderer3D = new QgsRuleBased3DRenderer( rootRule );
   renderer3D->setLayer( mPointLayer );
@@ -1240,6 +1382,111 @@ QList<BuildingRoof::RoofPoint> RoofEditTool::currentRoofPoints() const
   return points;
 }
 
+bool RoofEditTool::normalizeCurrentRidgeHeights( bool refreshUi )
+{
+  if ( !mPointLayer || !mCurrentBuilding.isValid() )
+    return false;
+
+  QVector<QPair<QgsFeatureId, QgsPoint>> boundaries;
+  QVector<EditableRidgePoint> ridges;
+
+  QgsFeatureRequest request;
+  request.setFilterExpression( QStringLiteral( "building_fid = %1" ).arg( mCurrentBuilding.id() ) );
+  QgsFeatureIterator it = mPointLayer->getFeatures( request );
+  QgsFeature feature;
+  while ( it.nextFeature( feature ) )
+  {
+    const QgsPoint *point = feature.hasGeometry() ? qgsgeometry_cast<const QgsPoint *>( feature.geometry().constGet() ) : nullptr;
+    if ( !point )
+      continue;
+
+    QgsPoint roofPoint = *point;
+    bool ok = false;
+    const double z = feature.attribute( QStringLiteral( "z" ) ).toDouble( &ok );
+    if ( ok )
+      roofPoint.setZ( z );
+
+    const QString type = feature.attribute( QStringLiteral( "type" ) ).toString();
+    if ( isRoofRidgePointType( type ) )
+      ridges.append( EditableRidgePoint{ feature.id(), roofPoint, 0.0 } );
+    else if ( isRoofBoundaryPointType( type ) )
+      boundaries.append( qMakePair( feature.id(), roofPoint ) );
+  }
+
+  if ( boundaries.isEmpty() || ridges.size() < 2 )
+    return false;
+
+  QVector<QPair<QgsFeatureId, double>> updates;
+  auto appendAverageUpdate = [&updates]( const EditableRidgePoint &first, const EditableRidgePoint &second ) {
+    if ( std::fabs( first.point.z() - second.point.z() ) > BuildingRoof::RIDGE_HEIGHT_AVERAGE_THRESHOLD )
+      return;
+
+    const double averageZ = 0.5 * ( first.point.z() + second.point.z() );
+    updates.append( qMakePair( first.fid, averageZ ) );
+    updates.append( qMakePair( second.fid, averageZ ) );
+  };
+
+  if ( boundaries.size() == 1 && ridges.size() == 2 )
+  {
+    appendAverageUpdate( ridges[0], ridges[1] );
+  }
+  else
+  {
+    const QVector<QgsPointXY> ring = featureExteriorRing( mCurrentBuilding );
+    double dirX = 0.0;
+    double dirY = 0.0;
+    if ( !nearestRoofEditEdgeDirection( ring, boundaries.first().second, dirX, dirY ) )
+      return false;
+
+    const double normalX = -dirY;
+    const double normalY = dirX;
+    for ( EditableRidgePoint &ridge : ridges )
+      ridge.s = roofEditProfileDistance( ridge.point, normalX, normalY );
+
+    std::sort( ridges.begin(), ridges.end(), []( const EditableRidgePoint &lhs, const EditableRidgePoint &rhs ) {
+      return lhs.s < rhs.s;
+    } );
+
+    for ( int left = 0, right = ridges.size() - 1; left < right; ++left, --right )
+      appendAverageUpdate( ridges[left], ridges[right] );
+  }
+
+  if ( updates.isEmpty() )
+    return false;
+
+  const int zIndex = mPointLayer->fields().indexOf( QStringLiteral( "z" ) );
+  if ( !mPointLayer->isEditable() )
+    mPointLayer->startEditing();
+
+  for ( const QPair<QgsFeatureId, double> &update : updates )
+  {
+    QgsFeature pointFeature;
+    if ( !mPointLayer->getFeatures( QgsFeatureRequest( update.first ) ).nextFeature( pointFeature ) || !pointFeature.hasGeometry() )
+      continue;
+
+    const QgsPoint *oldPoint = qgsgeometry_cast<const QgsPoint *>( pointFeature.geometry().constGet() );
+    if ( !oldPoint )
+      continue;
+
+    QgsPoint newPoint = *oldPoint;
+    newPoint.setZ( update.second );
+    QgsGeometry newGeometry( new QgsPoint( newPoint ) );
+    mPointLayer->changeGeometry( update.first, newGeometry );
+    if ( zIndex >= 0 )
+      mPointLayer->changeAttributeValue( update.first, zIndex, update.second );
+  }
+
+  mPointLayer->commitChanges();
+  mPointLayer->triggerRepaint();
+
+  if ( refreshUi )
+    refreshPointTable();
+  ensurePointLayerIn3DView();
+  if ( mCanvas )
+    mCanvas->refresh();
+  return true;
+}
+
 void RoofEditTool::saveCurrentRoofPoints()
 {
   if ( !mCurrentBuilding.isValid() || !mPointLayer )
@@ -1261,6 +1508,9 @@ void RoofEditTool::saveCurrentRoofPoints()
   const QgsRectangle buildingBounds = mCurrentBuilding.geometry().boundingBox();
   const double width = buildingBounds.width();
   const double height = buildingBounds.height();
+  const QString buildingShape = buildingShapeSignature( mCurrentBuilding.geometry() );
+  const double buildingCenterX = buildingBounds.center().x();
+  const double buildingCenterY = buildingBounds.center().y();
   QgsFeatureRequest draftRequest;
   draftRequest.setFilterExpression( QStringLiteral( "building_fid = %1" ).arg( mCurrentBuilding.id() ) );
   QgsFeatureIterator draftIt = mPointLayer->getFeatures( draftRequest );
@@ -1283,6 +1533,9 @@ void RoofEditTool::saveCurrentRoofPoints()
     feature.setAttribute( QStringLiteral( "base_height" ), QVariant() );
     feature.setAttribute( QStringLiteral( "rel_x" ), relX );
     feature.setAttribute( QStringLiteral( "rel_y" ), relY );
+    feature.setAttribute( QStringLiteral( "building_shape" ), buildingShape );
+    feature.setAttribute( QStringLiteral( "building_center_x" ), buildingCenterX );
+    feature.setAttribute( QStringLiteral( "building_center_y" ), buildingCenterY );
     newFeatures.append( feature );
   }
 
@@ -1389,7 +1642,7 @@ bool RoofEditTool::updateRoofLayerFeature( QgsVectorLayer *layer, const QgsGeome
   QgsFeature feature( layer->fields() );
   feature.setGeometry( geometry );
   feature.setAttribute( QStringLiteral( "building_fid" ), mCurrentBuilding.id() );
-  feature.setAttribute( QStringLiteral( "roof_type" ), mUI.roofTypeComboBox ? mUI.roofTypeComboBox->currentText() : tr( "单坡屋顶" ) );
+  feature.setAttribute( QStringLiteral( "roof_type" ), tr( "Roof model" ) );
   feature.setAttribute( QStringLiteral( "preview" ), preview ? 1 : 0 );
   layer->addFeature( feature );
   layer->commitChanges();
@@ -1414,8 +1667,18 @@ void RoofEditTool::previewRoofModel()
     return;
   }
 
+  normalizeCurrentRidgeHeights( true );
   const QList<BuildingRoof::RoofPoint> roofPoints = currentRoofPoints();
-  BuildingRoof::MeshResult roofMesh = BuildingRoof::buildSingleSlopePrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
+  const QString pointCloudLayerId = mUI.pointCloudComboBox ? mUI.pointCloudComboBox->currentData().toString() : QString();
+  mPointCloudLayer = qobject_cast<QgsPointCloudLayer *>( QgsProject::instance()->mapLayer( pointCloudLayerId ) );
+  const QVector<BuildingRoof::RoofSample> pointCloudSamples = collectPointCloudSamplesForGeometry( mCurrentBuilding.geometry() );
+  BuildingRoof::MeshResult roofMesh = BuildingRoof::buildFlatReliefPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
+  if ( !roofMesh.success )
+    roofMesh = BuildingRoof::buildClusteredFlatTopHippedRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
+  if ( !roofMesh.success )
+    roofMesh = BuildingRoof::buildCurvedRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
+  if ( !roofMesh.success )
+    roofMesh = BuildingRoof::buildApexRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
   if ( !roofMesh.success )
     roofMesh = BuildingRoof::buildGabledRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
   if ( !roofMesh.success )
@@ -1455,6 +1718,55 @@ void RoofEditTool::previewRoofModel()
     ensureLayerIn3DView( mRoofPreviewLayer );
 }
 
+void RoofEditTool::deleteRoofModel()
+{
+  if ( !mCurrentBuilding.isValid() )
+  {
+    QMessageBox::warning( mWidget, tr( "Delete roof" ), tr( "Please select a building feature first." ) );
+    return;
+  }
+
+  const QgsFeatureId buildingFid = mCurrentBuilding.id();
+  auto deleteLayerFeaturesForBuilding = [buildingFid]( QgsVectorLayer *layer ) {
+    if ( !layer )
+      return;
+
+    QgsFeatureIds ids;
+    QgsFeatureRequest request;
+    request.setFilterExpression( QStringLiteral( "building_fid = %1" ).arg( buildingFid ) );
+    QgsFeatureIterator it = layer->getFeatures( request );
+    QgsFeature feature;
+    while ( it.nextFeature( feature ) )
+      ids.insert( feature.id() );
+
+    if ( ids.isEmpty() )
+      return;
+
+    if ( !layer->isEditable() )
+      layer->startEditing();
+    layer->deleteFeatures( ids );
+    layer->commitChanges();
+    layer->triggerRepaint();
+  };
+
+  cancelPointEditPreview();
+  clearPointSelection();
+
+  deleteLayerFeaturesForBuilding( mPointLayer );
+  ensureSavedPointLayer();
+  deleteLayerFeaturesForBuilding( mSavedPointLayer );
+  deleteLayerFeaturesForBuilding( mRoofPreviewLayer );
+  deleteLayerFeaturesForBuilding( mRoofModelLayer );
+
+  refreshPointTable();
+  clearPointPreviewDisplay();
+  notifyRoofModelChanged( buildingFid );
+  updatePointEditTip( tr( "Roof model deleted. The building has returned to the original flat roof." ) );
+
+  if ( mCanvas )
+    mCanvas->refresh();
+}
+
 void RoofEditTool::saveRoofModel()
 {
   if ( !mCurrentBuilding.isValid() )
@@ -1469,8 +1781,18 @@ void RoofEditTool::saveRoofModel()
     return;
   }
 
+  normalizeCurrentRidgeHeights( true );
   const QList<BuildingRoof::RoofPoint> roofPoints = currentRoofPoints();
-  BuildingRoof::MeshResult roofMesh = BuildingRoof::buildSingleSlopePrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
+  const QString pointCloudLayerId = mUI.pointCloudComboBox ? mUI.pointCloudComboBox->currentData().toString() : QString();
+  mPointCloudLayer = qobject_cast<QgsPointCloudLayer *>( QgsProject::instance()->mapLayer( pointCloudLayerId ) );
+  const QVector<BuildingRoof::RoofSample> pointCloudSamples = collectPointCloudSamplesForGeometry( mCurrentBuilding.geometry() );
+  BuildingRoof::MeshResult roofMesh = BuildingRoof::buildFlatReliefPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
+  if ( !roofMesh.success )
+    roofMesh = BuildingRoof::buildClusteredFlatTopHippedRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
+  if ( !roofMesh.success )
+    roofMesh = BuildingRoof::buildCurvedRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
+  if ( !roofMesh.success )
+    roofMesh = BuildingRoof::buildApexRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
   if ( !roofMesh.success )
     roofMesh = BuildingRoof::buildGabledRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
   if ( !roofMesh.success )
@@ -1493,12 +1815,6 @@ void RoofEditTool::saveRoofModel()
   clearPointSelection();
   if ( mActiveLayer )
     mActiveLayer->removeSelection();
-  if ( mUI.radioButton_2 )
-    mUI.radioButton_2->setChecked( false );
-  if ( mUI.radioButton )
-    mUI.radioButton->setChecked( false );
-  if ( mUI.editModeRadioButton )
-    mUI.editModeRadioButton->setChecked( false );
   mCurrentBuilding = QgsFeature();
   if ( mUI.pointTableWidget )
     mUI.pointTableWidget->setRowCount( 0 );
@@ -1656,13 +1972,13 @@ void RoofEditTool::onPointSelectionChanged()
     mPointLayer->removeSelection();
 }
 
-double RoofEditTool::estimateHeightFromPointCloud( const QgsPointXY &mapPoint ) const
+double RoofEditTool::estimateHeightFromPointCloud( const QgsPointXY &mapPoint, const QString &pointType ) const
 {
   if ( !mPointCloudLayer || !mPointCloudLayer->dataProvider() )
     return 0.0;
 
   QgsPointCloudIndex index = mPointCloudLayer->dataProvider()->index();
-  const double radius = mCanvas ? std::max( mCanvas->mapUnitsPerPixel() * 8.0, 1.0 ) : 1.0;
+  const double radius = mCanvas ? std::max( mCanvas->mapUnitsPerPixel() * 4.0, 0.5 ) : 0.5;
   QgsRectangle extent( mapPoint.x() - radius, mapPoint.y() - radius, mapPoint.x() + radius, mapPoint.y() + radius );
 
   QList<QgsPointCloudNodeId> nodeIds;
@@ -1682,7 +1998,12 @@ double RoofEditTool::estimateHeightFromPointCloud( const QgsPointXY &mapPoint ) 
   const double yOffset = index.offset().y();
   const double zOffset = index.offset().z();
 
-  QList<double> values;
+  struct HeightCandidate
+  {
+    double distance2 = 0.0;
+    double z = 0.0;
+  };
+  QVector<HeightCandidate> candidates;
   const double radius2 = radius * radius;
 
   for ( const QgsPointCloudNodeId &nodeId : nodeIds )
@@ -1706,20 +2027,98 @@ double RoofEditTool::estimateHeightFromPointCloud( const QgsPointXY &mapPoint ) 
       const double y = iy * yScale + yOffset;
       const double dx = x - mapPoint.x();
       const double dy = y - mapPoint.y();
-      if ( dx * dx + dy * dy <= radius2 )
-        values.append( iz * zScale + zOffset );
+      const double distance2 = dx * dx + dy * dy;
+      if ( distance2 <= radius2 )
+        candidates.append( HeightCandidate{ distance2, iz * zScale + zOffset } );
     }
   }
 
-  if ( values.isEmpty() )
+  if ( candidates.isEmpty() )
     return 0.0;
 
-  std::sort( values.begin(), values.end(), std::greater<double>() );
-  const int sampleCount = std::max( 1, std::min( values.size(), 10 ) );
-  double sum = 0.0;
-  for ( int i = 0; i < sampleCount; ++i )
-    sum += values[i];
-  return sum / sampleCount;
+  std::sort( candidates.begin(), candidates.end(), []( const HeightCandidate &lhs, const HeightCandidate &rhs ) {
+    return lhs.distance2 < rhs.distance2;
+  } );
+
+  QVector<double> values;
+  const int nearestCount = std::min( candidates.size(), 20 );
+  for ( int i = 0; i < nearestCount; ++i )
+    values.append( candidates.at( i ).z );
+
+  std::sort( values.begin(), values.end() );
+  return percentileValue( values, heightPercentileForPointType( pointType ) );
+}
+
+QVector<BuildingRoof::RoofSample> RoofEditTool::collectPointCloudSamplesForGeometry( const QgsGeometry &geometry, int maxSamples ) const
+{
+  QVector<BuildingRoof::RoofSample> samples;
+  if ( geometry.isNull() || geometry.isEmpty() )
+    return samples;
+
+  QgsPointCloudLayer *pointCloudLayer = mPointCloudLayer;
+  if ( !pointCloudLayer && mUI.pointCloudComboBox )
+    pointCloudLayer = qobject_cast<QgsPointCloudLayer *>( QgsProject::instance()->mapLayer( mUI.pointCloudComboBox->currentData().toString() ) );
+  if ( !pointCloudLayer || !pointCloudLayer->dataProvider() )
+    return samples;
+
+  QgsPointCloudIndex index = pointCloudLayer->dataProvider()->index();
+  const QgsRectangle extent = geometry.boundingBox();
+  QList<QgsPointCloudNodeId> nodeIds;
+  collectNodes( index, index.root(), extent, nodeIds );
+  nodeIds = nodeIds.toSet().toList();
+
+  QgsPointCloudRequest request;
+  request.setFilterRect( extent );
+  const QgsPointCloudAttributeCollection attributes = index.attributes();
+  request.setAttributes( attributes );
+  const int recordSize = attributes.pointRecordSize();
+  const double xScale = index.scale().x();
+  const double yScale = index.scale().y();
+  const double zScale = index.scale().z();
+  const double xOffset = index.offset().x();
+  const double yOffset = index.offset().y();
+  const double zOffset = index.offset().z();
+
+  QVector<BuildingRoof::RoofSample> allSamples;
+  const QgsGeometry preparedGeometry = geometry;
+  for ( const QgsPointCloudNodeId &nodeId : nodeIds )
+  {
+    std::unique_ptr<QgsPointCloudBlock> block( index.nodeData( nodeId, request ) );
+    if ( !block )
+      continue;
+
+    const char *data = block->data();
+    for ( int i = 0; i < block->pointCount(); ++i )
+    {
+      const char *ptr = data + i * recordSize;
+      int32_t ix = 0;
+      int32_t iy = 0;
+      int32_t iz = 0;
+      std::memcpy( &ix, ptr, 4 );
+      std::memcpy( &iy, ptr + 4, 4 );
+      std::memcpy( &iz, ptr + 8, 4 );
+
+      const double x = ix * xScale + xOffset;
+      const double y = iy * yScale + yOffset;
+      const QgsPointXY xy( x, y );
+      if ( !preparedGeometry.contains( QgsGeometry::fromPointXY( xy ) ) )
+        continue;
+
+      allSamples.append( BuildingRoof::RoofSample{ QgsPoint( x, y, iz * zScale + zOffset ) } );
+    }
+  }
+
+  if ( maxSamples <= 0 || allSamples.size() <= maxSamples )
+    return allSamples;
+
+  const int stride = std::max( 1, allSamples.size() / maxSamples );
+  for ( int i = 0; i < allSamples.size(); i += stride )
+  {
+    samples.append( allSamples.at( i ) );
+    if ( samples.size() >= maxSamples )
+      break;
+  }
+  return samples;
 }
 
 void RoofEditTool::collectNodes( const QgsPointCloudIndex &index, const QgsPointCloudNodeId &nodeId, const QgsRectangle &extent, QList<QgsPointCloudNodeId> &nodes ) const
