@@ -20,6 +20,7 @@ class QgsPointCloudLayer;
 class QgsRubberBand;
 class QgsVectorLayer;
 class QgisInterface;
+class QEvent;
 class QKeyEvent;
 class QWheelEvent;
 
@@ -48,6 +49,9 @@ class RoofEditTool : public QgsMapTool
     void canvasDoubleClickEvent( QgsMapMouseEvent *e ) override;
     void wheelEvent( QWheelEvent *e ) override;
     void keyPressEvent( QKeyEvent *e ) override;
+
+  protected:
+    bool eventFilter( QObject *obj, QEvent *event ) override;
 
   private slots:
     void deleteSelectedPoint();
@@ -107,6 +111,8 @@ class RoofEditTool : public QgsMapTool
     void clearDraftPointsForBuilding( QgsFeatureId buildingFid, bool refreshUi );
     void notifyRoofModelChanged();
     void notifyRoofModelChanged( QgsFeatureId buildingFid );
+    void setTriangleMeshModeEnabled( bool enabled );
+    void updateTriangleMeshModeForCurrentBuilding();
     void refreshPointTable();
     void setupPointLayerRenderer();
     QString currentPointType() const;

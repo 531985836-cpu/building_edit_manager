@@ -40,6 +40,7 @@
 #include <QBrush>
 #include <QComboBox>
 #include <QCryptographicHash>
+#include <QEvent>
 #include <QHeaderView>
 #include <QKeyEvent>
 #include <QMessageBox>
@@ -283,6 +284,7 @@ RoofEditTool::~RoofEditTool()
   }
   if ( mWidget )
   {
+    mWidget->removeEventFilter( this );
     mWidget->deleteLater();
     mWidget = nullptr;
   }
@@ -298,9 +300,18 @@ void RoofEditTool::deactivate()
 {
   cancelPointEditPreview();
   clearPositionPreview();
+  setTriangleMeshModeEnabled( false );
   if ( mWidget )
     mWidget->hide();
   QgsMapTool::deactivate();
+}
+
+bool RoofEditTool::eventFilter( QObject *obj, QEvent *event )
+{
+  if ( obj == mWidget && event && ( event->type() == QEvent::Hide || event->type() == QEvent::Close ) )
+    setTriangleMeshModeEnabled( false );
+
+  return QgsMapTool::eventFilter( obj, event );
 }
 
 void RoofEditTool::setupUi()
@@ -310,6 +321,7 @@ void RoofEditTool::setupUi()
 
   mWidget = new QWidget();
   mUI.setupUi( mWidget );
+  mWidget->installEventFilter( this );
   mWidget->setWindowTitle( tr( "屋顶编辑" ) );
 
   if ( mUI.pointTableWidget )
@@ -321,6 +333,16 @@ void RoofEditTool::setupUi()
   connect( mUI.clearPointsButton, &QPushButton::clicked, this, &RoofEditTool::clearCurrentBuildingPoints );
   connect( mUI.previewRoofButton, &QPushButton::clicked, this, &RoofEditTool::deleteRoofModel );
   connect( mUI.saveRoofButton, &QPushButton::clicked, this, &RoofEditTool::saveRoofModel );
+  if ( mUI.pointradio )
+  {
+    mUI.pointradio->setAutoExclusive( false );
+    connect( mUI.pointradio, &QRadioButton::toggled, this, [this]( bool checked ) {
+      if ( checked )
+        updateTriangleMeshModeForCurrentBuilding();
+      else
+        emit BuildingEditPreviewBus::instance()->buildingTriangleMeshModeChanged( mActiveLayer, FID_NULL, false );
+    } );
+  }
 
   QShortcut *returnShortcut = new QShortcut( QKeySequence( Qt::Key_Return ), mWidget );
   returnShortcut->setContext( Qt::WidgetWithChildrenShortcut );
@@ -560,6 +582,7 @@ bool RoofEditTool::selectBuildingAt( const QgsPointXY &mapPoint )
   mSelectedPointFid = FID_NULL;
   mCurrentBuilding = bestFeature;
   mActiveLayer->selectByIds( QgsFeatureIds() << bestFeature.id() );
+  updateTriangleMeshModeForCurrentBuilding();
   return true;
 }
 
@@ -1211,10 +1234,10 @@ void RoofEditTool::setupPointLayerRenderer()
   const QColor surfaceColor( 170, 60, 210 );
 
   QgsCategoryList categories;
-  categories << QgsRendererCategory( ROOF_POINT_BOUNDARY, createRoofMarkerSymbol( QStringLiteral( "circle" ), boundaryColor, 2.5 ), ROOF_POINT_BOUNDARY )
-             << QgsRendererCategory( ROOF_POINT_RIDGE, createRoofMarkerSymbol( QStringLiteral( "triangle" ), ridgeColor, 2.8 ), ROOF_POINT_RIDGE )
-             << QgsRendererCategory( ROOF_POINT_VERTEX, createRoofMarkerSymbol( QStringLiteral( "diamond" ), vertexColor, 3.0 ), ROOF_POINT_VERTEX )
-             << QgsRendererCategory( ROOF_POINT_SURFACE, createRoofMarkerSymbol( QStringLiteral( "square" ), surfaceColor, 2.8 ), ROOF_POINT_SURFACE );
+  categories << QgsRendererCategory( ROOF_POINT_BOUNDARY, createRoofMarkerSymbol( QStringLiteral( "circle" ), boundaryColor, 5.0 ), ROOF_POINT_BOUNDARY )
+             << QgsRendererCategory( ROOF_POINT_RIDGE, createRoofMarkerSymbol( QStringLiteral( "triangle" ), ridgeColor, 5.0 ), ROOF_POINT_RIDGE )
+             << QgsRendererCategory( ROOF_POINT_VERTEX, createRoofMarkerSymbol( QStringLiteral( "diamond" ), vertexColor, 5.0 ), ROOF_POINT_VERTEX )
+             << QgsRendererCategory( ROOF_POINT_SURFACE, createRoofMarkerSymbol( QStringLiteral( "square" ), surfaceColor, 5.0 ), ROOF_POINT_SURFACE );
   mPointLayer->setRenderer( new QgsCategorizedSymbolRenderer( QStringLiteral( "type" ), categories ) );
 
   QgsRuleBased3DRenderer::Rule *rootRule = new QgsRuleBased3DRenderer::Rule( nullptr );
@@ -1620,6 +1643,33 @@ void RoofEditTool::notifyRoofModelChanged( QgsFeatureId buildingFid )
     emit BuildingEditPreviewBus::instance()->roofModelChanged( mActiveLayer, buildingFid );
 }
 
+void RoofEditTool::setTriangleMeshModeEnabled( bool enabled )
+{
+  if ( mWidget && mUI.pointradio && mUI.pointradio->isChecked() != enabled )
+  {
+    mUI.pointradio->setChecked( enabled );
+    return;
+  }
+
+  emit BuildingEditPreviewBus::instance()->buildingTriangleMeshModeChanged(
+    mActiveLayer,
+    enabled && mCurrentBuilding.isValid() ? mCurrentBuilding.id() : FID_NULL,
+    enabled && mCurrentBuilding.isValid()
+  );
+}
+
+void RoofEditTool::updateTriangleMeshModeForCurrentBuilding()
+{
+  if ( !mWidget || !mUI.pointradio || !mUI.pointradio->isChecked() )
+    return;
+
+  emit BuildingEditPreviewBus::instance()->buildingTriangleMeshModeChanged(
+    mActiveLayer,
+    mCurrentBuilding.isValid() ? mCurrentBuilding.id() : FID_NULL,
+    mCurrentBuilding.isValid()
+  );
+}
+
 bool RoofEditTool::updateRoofLayerFeature( QgsVectorLayer *layer, const QgsGeometry &geometry, bool preview )
 {
   if ( !layer || !mCurrentBuilding.isValid() || geometry.isNull() || geometry.isEmpty() )
@@ -1680,7 +1730,7 @@ void RoofEditTool::previewRoofModel()
   if ( !roofMesh.success )
     roofMesh = BuildingRoof::buildApexRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
   if ( !roofMesh.success )
-    roofMesh = BuildingRoof::buildGabledRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
+    roofMesh = BuildingRoof::buildGabledRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
   if ( !roofMesh.success )
     roofMesh = BuildingRoof::buildHippedRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
   if ( !roofMesh.success )
@@ -1751,6 +1801,7 @@ void RoofEditTool::deleteRoofModel()
 
   cancelPointEditPreview();
   clearPointSelection();
+  setTriangleMeshModeEnabled( false );
 
   deleteLayerFeaturesForBuilding( mPointLayer );
   ensureSavedPointLayer();
@@ -1794,7 +1845,7 @@ void RoofEditTool::saveRoofModel()
   if ( !roofMesh.success )
     roofMesh = BuildingRoof::buildApexRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
   if ( !roofMesh.success )
-    roofMesh = BuildingRoof::buildGabledRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
+    roofMesh = BuildingRoof::buildGabledRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
   if ( !roofMesh.success )
     roofMesh = BuildingRoof::buildHippedRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
   if ( !roofMesh.success )
@@ -1813,6 +1864,7 @@ void RoofEditTool::saveRoofModel()
 
   cancelPointEditPreview();
   clearPointSelection();
+  setTriangleMeshModeEnabled( false );
   if ( mActiveLayer )
     mActiveLayer->removeSelection();
   mCurrentBuilding = QgsFeature();

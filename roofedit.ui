@@ -140,6 +140,13 @@
      </property>
      <layout class="QVBoxLayout" name="verticalLayout_2">
       <item>
+       <widget class="QRadioButton" name="pointradio">
+        <property name="text">
+         <string>建筑物三角网</string>
+        </property>
+       </widget>
+      </item>
+      <item>
        <layout class="QFormLayout" name="formLayout">
         <item row="0" column="0">
          <widget class="QLabel" name="wheelStepLabel">

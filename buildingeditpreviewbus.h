@@ -16,4 +16,5 @@ class BuildingEditPreviewBus : public QObject
     void heightPreviewChanged( QgsVectorLayer *layer, const QgsFeatureIds &fids, const QString &heightFieldName, double height );
     void heightPreviewFinished( QgsVectorLayer *layer, const QgsFeatureIds &fids, const QString &heightFieldName, double height );
     void roofModelChanged( QgsVectorLayer *layer, QgsFeatureId fid );
+    void buildingTriangleMeshModeChanged( QgsVectorLayer *layer, QgsFeatureId fid, bool enabled );
 };

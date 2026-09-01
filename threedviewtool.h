@@ -38,6 +38,10 @@ struct MeshData
 {
     QVector<QgsPoint> vertices;
     QVector<int> indices;
+    bool flatTopWireframe = false;
+    bool curvedWireframe = false;
+    bool eaveWireframe = false;
+    QVector<QgsPoint> footprintRing;
     bool isEmpty() const { return vertices.isEmpty(); }
 };
 
@@ -78,6 +82,12 @@ class ThreeDViewTool : public QgsMapTool
     void ensureLayerIn3DView( QgsMapLayer *layer );
     void addLoadedPointCloudLayersTo3DView();
     void configurePointCloud3DRenderer( QgsPointCloudLayer *layer );
+    void applyBuildingTriangleMeshMode();
+    void ensureWireframeLayer();
+    void clearWireframeLayer();
+    void updateWireframeLayer( QgsVectorLayer *layer, QgsFeatureId fid );
+    void updateWireframeLayerFromMesh( const MeshData &mesh, QgsFeatureId fid );
+    QgsFeatureList buildSimplifiedWireframeFromMesh( const MeshData &mesh, QgsFeatureId fid, bool flatTopWireframe, bool curvedWireframe, bool eaveWireframe ) const;
     void cleanup3DState();
     void refresh3DCanvases();
     void applyFeature3DUpdate( QgsFeatureId fid );
@@ -101,6 +111,7 @@ class ThreeDViewTool : public QgsMapTool
     void onHeightPreviewChanged( QgsVectorLayer *layer, const QgsFeatureIds &fids, const QString &heightFieldName, double height );
     void onHeightPreviewFinished( QgsVectorLayer *layer, const QgsFeatureIds &fids, const QString &heightFieldName, double height );
     void onRoofModelChanged( QgsVectorLayer *layer, QgsFeatureId fid );
+    void onBuildingTriangleMeshModeChanged( QgsVectorLayer *layer, QgsFeatureId fid, bool enabled );
 
   private:
     // UI 成员
@@ -113,7 +124,10 @@ class ThreeDViewTool : public QgsMapTool
 
     QPointer<QgsVectorLayer> mActiveLayer = nullptr;
     QPointer<QgsVectorLayer> mTempLayer = nullptr;
+    QPointer<QgsVectorLayer> mWireframeLayer = nullptr;
     QString mSelectedHeightField;
+    bool mBuildingTriangleMeshMode = false;
+    QgsFeatureId mWireframeFid = FID_NULL;
 
     // 鼠标交互状态
     QgsRubberBand *mRubberBand = nullptr;
