@@ -652,6 +652,16 @@ namespace
     return std::pow( point.x() - px, 2.0 ) + std::pow( point.y() - py, 2.0 );
   }
 
+  double pointSegmentParameter( const QgsPointXY &point, const QgsPointXY &a, const QgsPointXY &b )
+  {
+    const double dx = b.x() - a.x();
+    const double dy = b.y() - a.y();
+    const double len2 = dx * dx + dy * dy;
+    if ( len2 <= 1e-12 )
+      return 0.5;
+    return std::max( 0.0, std::min( 1.0, ( ( point.x() - a.x() ) * dx + ( point.y() - a.y() ) * dy ) / len2 ) );
+  }
+
   double distanceToRing2( const QVector<QgsPointXY> &ring, const QgsPointXY &point )
   {
     double bestDistance = std::numeric_limits<double>::max();
@@ -2113,7 +2123,7 @@ namespace
     if ( edgePoints.size() < 8 )
       return wallHeights;
 
-    const double neighborRadius = std::max( 0.55, extent * 0.025 );
+    const double neighborRadius = std::min( 1.00, std::max( 0.45, extent * 0.018 ) );
     const double neighborRadius2 = neighborRadius * neighborRadius;
     const int minNeighbors = edgePoints.size() < 18 ? 5 : 7;
 
@@ -2178,6 +2188,85 @@ namespace
     return wallHeights;
   }
 
+  double upperWeightedMean( const QVector<double> &sortedHeights, double lowerPercentile, double upperPercentile, double fallbackHeight )
+  {
+    if ( sortedHeights.isEmpty() )
+      return fallbackHeight;
+
+    const int last = sortedHeights.size() - 1;
+    const int start = std::max( 0, std::min( last, static_cast<int>( std::round( std::max( 0.0, std::min( 1.0, lowerPercentile ) ) * last ) ) ) );
+    const int end = std::max( start, std::min( last, static_cast<int>( std::round( std::max( 0.0, std::min( 1.0, upperPercentile ) ) * last ) ) ) );
+
+    double weightedSum = 0.0;
+    double weightSum = 0.0;
+    const double span = std::max( 1, end - start );
+    for ( int i = start; i <= end; ++i )
+    {
+      const double rank = static_cast<double>( i - start ) / span;
+      const double weight = 1.0 + rank * 2.0;
+      weightedSum += sortedHeights.at( i ) * weight;
+      weightSum += weight;
+    }
+
+    return weightSum > 0.0 ? weightedSum / weightSum : fallbackHeight;
+  }
+
+  double denseUpperWallHeight( const QVector<double> &sortedWallHeights, double fallbackHeight, double ridgeHeight, double heightRange )
+  {
+    if ( sortedWallHeights.isEmpty() )
+      return fallbackHeight;
+    if ( sortedWallHeights.size() < 8 )
+      return sortedPercentile( sortedWallHeights, 0.75 );
+
+    const double ridgeBuffer = std::max( 0.25, heightRange * 0.04 );
+    const double low = sortedPercentile( sortedWallHeights, 0.05 );
+    const double high = std::min( sortedPercentile( sortedWallHeights, 0.98 ), ridgeHeight - ridgeBuffer );
+    if ( high <= low + 1e-6 )
+      return std::min( upperWeightedMean( sortedWallHeights, 0.65, 0.90, sortedPercentile( sortedWallHeights, 0.75 ) ), ridgeHeight - ridgeBuffer );
+
+    const double binWidth = std::max( 0.20, ( high - low ) / 24.0 );
+    const int binCount = std::max( 2, static_cast<int>( std::ceil( ( high - low ) / binWidth ) ) + 1 );
+    QVector<int> counts( binCount, 0 );
+    int filteredCount = 0;
+    for ( double height : sortedWallHeights )
+    {
+      if ( height < low || height > high )
+        continue;
+      const int index = std::max( 0, std::min( binCount - 1, static_cast<int>( std::floor( ( height - low ) / binWidth ) ) ) );
+      ++counts[index];
+      ++filteredCount;
+    }
+
+    if ( filteredCount < 5 )
+      return std::min( upperWeightedMean( sortedWallHeights, 0.65, 0.90, sortedPercentile( sortedWallHeights, 0.75 ) ), ridgeHeight - ridgeBuffer );
+
+    const int minSupport = std::max( 3, filteredCount / 18 );
+    for ( int i = binCount - 1; i >= 0; --i )
+    {
+      const int support = counts.at( i )
+                          + ( i > 0 ? counts.at( i - 1 ) : 0 )
+                          + ( i + 1 < binCount ? counts.at( i + 1 ) : 0 );
+      if ( support < minSupport )
+        continue;
+
+      QVector<double> bandHeights;
+      const double bandLow = low + std::max( 0, i - 1 ) * binWidth;
+      const double bandHigh = low + ( std::min( binCount - 1, i + 1 ) + 1 ) * binWidth;
+      for ( double height : sortedWallHeights )
+      {
+        if ( height >= bandLow && height <= bandHigh )
+          bandHeights.append( height );
+      }
+      if ( !bandHeights.isEmpty() )
+      {
+        std::sort( bandHeights.begin(), bandHeights.end() );
+        return std::min( upperWeightedMean( bandHeights, 0.60, 0.90, sortedPercentile( bandHeights, 0.70 ) ), ridgeHeight - ridgeBuffer );
+      }
+    }
+
+    return std::min( upperWeightedMean( sortedWallHeights, 0.65, 0.90, sortedPercentile( sortedWallHeights, 0.75 ) ), ridgeHeight - ridgeBuffer );
+  }
+
   bool automaticBoundaryPointFromRidgeLine( const QVector<QgsPointXY> &ring, const QVector<BuildingRoof::RoofSample> &pointCloudSamples, const QgsPoint &ridgePoint, double dirX, double dirY, const QgsPoint &fallbackBoundaryPoint, QgsPoint &boundaryPoint )
   {
     const double dirLength = std::hypot( dirX, dirY );
@@ -2190,8 +2279,10 @@ namespace
     const double normalY = dirX;
     const double ridgeOffset = ridgePoint.x() * normalX + ridgePoint.y() * normalY;
     const double extent = ringExtentSize( ring );
-    const double edgeBandDistance = std::max( 0.50, extent * 0.03 );
+    const double edgeBandDistance = std::min( 1.00, std::max( 0.45, extent * 0.015 ) );
     const double edgeBandDistance2 = edgeBandDistance * edgeBandDistance;
+    const double heightEdgeBandDistance = std::min( edgeBandDistance, std::min( 0.35, std::max( 0.18, extent * 0.006 ) ) );
+    const double heightEdgeBandDistance2 = heightEdgeBandDistance * heightEdgeBandDistance;
 
     QVector<double> allHeights;
     allHeights.reserve( pointCloudSamples.size() );
@@ -2242,6 +2333,8 @@ namespace
     int bestEdge = -1;
     double bestScore = -1.0;
     double bestBoundaryZ = fallbackBoundaryPoint.z();
+    QgsPointXY bestBoundaryXY;
+    bool hasBestBoundaryXY = false;
     for ( int i = 0; i < ring.size(); ++i )
     {
       const QgsPointXY &a = ring.at( i );
@@ -2267,20 +2360,30 @@ namespace
 
       QVector<double> edgeHeights;
       QVector<QgsPoint> edgePoints;
+      QVector<double> heightEdgeHeights;
+      QVector<QgsPoint> heightEdgePoints;
       edgeHeights.reserve( pointCloudSamples.size() );
       edgePoints.reserve( pointCloudSamples.size() );
+      heightEdgeHeights.reserve( pointCloudSamples.size() );
+      heightEdgePoints.reserve( pointCloudSamples.size() );
       for ( const BuildingRoof::RoofSample &sample : pointCloudSamples )
       {
         const QgsPoint &point = sample.point;
         const QgsPointXY pointXY( point.x(), point.y() );
         if ( !pointInRing( ring, pointXY ) )
           continue;
-        if ( pointSegmentDistance2( pointXY, a, b ) > edgeBandDistance2 )
+        const double edgeDistance2 = pointSegmentDistance2( pointXY, a, b );
+        if ( edgeDistance2 > edgeBandDistance2 )
           continue;
         if ( point.z() < lowClip || point.z() > highClip )
           continue;
         edgeHeights.append( point.z() );
         edgePoints.append( point );
+        if ( edgeDistance2 <= heightEdgeBandDistance2 )
+        {
+          heightEdgeHeights.append( point.z() );
+          heightEdgePoints.append( point );
+        }
       }
 
       double edgeZ = globalEaveHeight;
@@ -2288,21 +2391,48 @@ namespace
       double wallSupportScore = 0.0;
       const double edgeNormalX = -edgeDirY;
       const double edgeNormalY = edgeDirX;
-      const QVector<double> wallHeights = verticalWallLikeHeightsNearEdge( edgePoints, edgeDirX, edgeDirY, edgeNormalX, edgeNormalY, extent );
+      const QVector<QgsPoint> &boundaryHeightPoints = heightEdgePoints.size() >= 8 ? heightEdgePoints : edgePoints;
+      const QVector<double> &boundaryHeightValues = heightEdgeHeights.size() >= 5 ? heightEdgeHeights : edgeHeights;
+      const QVector<double> wallHeights = verticalWallLikeHeightsNearEdge( boundaryHeightPoints, edgeDirX, edgeDirY, edgeNormalX, edgeNormalY, extent );
       if ( wallHeights.size() >= 5 )
       {
-        edgeZ = sortedPercentile( wallHeights, 0.85 );
-        wallSupportScore = std::min( 1.0, static_cast<double>( wallHeights.size() ) / std::max( 6.0, edgeLength / std::max( edgeBandDistance, 1e-8 ) ) );
+        edgeZ = denseUpperWallHeight( wallHeights, sortedPercentile( wallHeights, 0.75 ), ridgePoint.z(), heightRange );
+        wallSupportScore = std::min( 1.0, static_cast<double>( wallHeights.size() ) / std::max( 6.0, edgeLength / std::max( heightEdgeBandDistance, 1e-8 ) ) );
         supportScore = std::max( supportScore, wallSupportScore );
       }
-      if ( edgeHeights.size() >= 5 )
+      if ( boundaryHeightValues.size() >= 5 )
       {
-        std::sort( edgeHeights.begin(), edgeHeights.end() );
+        QVector<double> sortedBoundaryHeights = boundaryHeightValues;
+        std::sort( sortedBoundaryHeights.begin(), sortedBoundaryHeights.end() );
         if ( wallHeights.size() < 5 )
-          edgeZ = sortedPercentile( edgeHeights, 0.25 );
+          edgeZ = upperWeightedMean( sortedBoundaryHeights, 0.60, 0.85, sortedPercentile( sortedBoundaryHeights, 0.70 ) );
         supportScore = std::min( 1.0, static_cast<double>( edgeHeights.size() ) / std::max( 8.0, edgeLength / std::max( edgeBandDistance, 1e-8 ) * 2.0 ) );
         if ( wallHeights.size() >= 5 )
           supportScore = std::max( supportScore, wallSupportScore );
+      }
+
+      QVector<double> supportParameters;
+      const double supportHeightTolerance = std::max( 0.25, heightRange * 0.035 );
+      supportParameters.reserve( boundaryHeightPoints.size() );
+      for ( const QgsPoint &point : boundaryHeightPoints )
+      {
+        if ( std::fabs( point.z() - edgeZ ) > supportHeightTolerance )
+          continue;
+        supportParameters.append( pointSegmentParameter( QgsPointXY( point.x(), point.y() ), a, b ) );
+      }
+      if ( supportParameters.size() < 5 )
+      {
+        supportParameters.clear();
+        for ( const QgsPoint &point : boundaryHeightPoints )
+          supportParameters.append( pointSegmentParameter( QgsPointXY( point.x(), point.y() ), a, b ) );
+      }
+
+      QgsPointXY candidateBoundaryXY = midPoint;
+      if ( supportParameters.size() >= 5 )
+      {
+        std::sort( supportParameters.begin(), supportParameters.end() );
+        const double supportT = sortedPercentile( supportParameters, 0.50 );
+        candidateBoundaryXY = QgsPointXY( a.x() + ( b.x() - a.x() ) * supportT, a.y() + ( b.y() - a.y() ) * supportT );
       }
 
       const double distanceScore = distance / maxRidgeDistance;
@@ -2314,6 +2444,8 @@ namespace
         bestScore = score;
         bestEdge = i;
         bestBoundaryZ = edgeZ;
+        bestBoundaryXY = candidateBoundaryXY;
+        hasBestBoundaryXY = true;
       }
     }
 
@@ -2330,6 +2462,8 @@ namespace
         {
           bestDistance = distance;
           bestEdge = i;
+          bestBoundaryXY = midPoint;
+          hasBestBoundaryXY = true;
         }
       }
       bestBoundaryZ = globalEaveHeight;
@@ -2340,7 +2474,9 @@ namespace
 
     const QgsPointXY &edgeStart = ring.at( bestEdge );
     const QgsPointXY &edgeEnd = ring.at( ( bestEdge + 1 ) % ring.size() );
-    const QgsPointXY boundaryXY( ( edgeStart.x() + edgeEnd.x() ) * 0.5, ( edgeStart.y() + edgeEnd.y() ) * 0.5 );
+    const QgsPointXY boundaryXY = hasBestBoundaryXY
+                                    ? bestBoundaryXY
+                                    : QgsPointXY( ( edgeStart.x() + edgeEnd.x() ) * 0.5, ( edgeStart.y() + edgeEnd.y() ) * 0.5 );
     double boundaryZ = bestBoundaryZ;
 
     if ( boundaryZ >= ridgePoint.z() - 1e-6 )

@@ -1749,14 +1749,14 @@ void ThreeDViewTool::configurePointCloud3DRenderer( QgsPointCloudLayer *layer )
   QgsColorRampShader shader( zMin, zMax, nullptr, Qgis::ShaderInterpolationMethod::Discrete, Qgis::ShaderClassificationMethod::Continuous );
   const double range = zMax - zMin;
   QList<QgsColorRampShader::ColorRampItem> items;
-  items << QgsColorRampShader::ColorRampItem( zMin, QColor( 49, 54, 149 ), QString::number( zMin, 'f', 2 ) )
-        << QgsColorRampShader::ColorRampItem( zMin + range * 0.14, QColor( 69, 117, 180 ) )
-        << QgsColorRampShader::ColorRampItem( zMin + range * 0.28, QColor( 116, 173, 209 ) )
-        << QgsColorRampShader::ColorRampItem( zMin + range * 0.42, QColor( 171, 217, 233 ) )
-        << QgsColorRampShader::ColorRampItem( zMin + range * 0.56, QColor( 253, 174, 97 ) )
-        << QgsColorRampShader::ColorRampItem( zMin + range * 0.70, QColor( 244, 109, 67 ) )
-        << QgsColorRampShader::ColorRampItem( zMin + range * 0.84, QColor( 215, 48, 39 ) )
-        << QgsColorRampShader::ColorRampItem( zMax, QColor( 211, 47, 47 ), QString::number( zMax, 'f', 2 ) );
+  items << QgsColorRampShader::ColorRampItem( zMin, QColor( 28, 36, 170 ), QString::number( zMin, 'f', 2 ) )
+        << QgsColorRampShader::ColorRampItem( zMin + range * 0.14, QColor( 0, 112, 255 ) )
+        << QgsColorRampShader::ColorRampItem( zMin + range * 0.28, QColor( 0, 205, 255 ) )
+        << QgsColorRampShader::ColorRampItem( zMin + range * 0.42, QColor( 20, 205, 90 ) )
+        << QgsColorRampShader::ColorRampItem( zMin + range * 0.56, QColor( 255, 238, 0 ) )
+        << QgsColorRampShader::ColorRampItem( zMin + range * 0.70, QColor( 255, 132, 0 ) )
+        << QgsColorRampShader::ColorRampItem( zMin + range * 0.84, QColor( 238, 34, 34 ) )
+        << QgsColorRampShader::ColorRampItem( zMax, QColor( 186, 0, 120 ), QString::number( zMax, 'f', 2 ) );
   shader.setColorRampType( Qgis::ShaderInterpolationMethod::Discrete );
   shader.setClassificationMode( Qgis::ShaderClassificationMethod::Continuous );
   shader.setColorRampItemList( items );
@@ -1765,7 +1765,7 @@ void ThreeDViewTool::configurePointCloud3DRenderer( QgsPointCloudLayer *layer )
   symbol->setAttribute( zAttribute );
   symbol->setColorRampShader( shader );
   symbol->setColorRampShaderMinMax( zMin, zMax );
-  symbol->setPointSize( 2.0f );
+  symbol->setPointSize( 5.0f );
 
   QgsPointCloudLayer3DRenderer *renderer = new QgsPointCloudLayer3DRenderer();
   renderer->setLayer( layer );
