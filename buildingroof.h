@@ -4,6 +4,7 @@
 #include <qgspoint.h>
 
 #include <QList>
+#include <QPair>
 #include <QString>
 #include <QVector>
 
@@ -34,6 +35,7 @@ class BuildingRoof
     {
       QVector<QgsPoint> vertices;
       QVector<int> indices;
+      QVector<QPair<QgsPoint, QgsPoint>> structureLines;
       bool isEmpty() const { return vertices.isEmpty() || indices.isEmpty(); }
     };
 
@@ -48,9 +50,9 @@ class BuildingRoof
     static MeshResult buildSingleSlopePrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints );
     static MeshResult buildFlatReliefPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints, const QVector<RoofSample> &pointCloudSamples = QVector<RoofSample>() );
     static MeshResult buildClusteredFlatTopHippedRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints, const QVector<RoofSample> &pointCloudSamples = QVector<RoofSample>() );
-    static MeshResult buildCurvedRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints );
-    static MeshResult buildApexRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints );
+    static MeshResult buildCurvedRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints, const QVector<RoofSample> &pointCloudSamples = QVector<RoofSample>() );
+    static MeshResult buildApexRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints, const QVector<RoofSample> &pointCloudSamples = QVector<RoofSample>() );
     static MeshResult buildGabledRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints, const QVector<RoofSample> &pointCloudSamples = QVector<RoofSample>() );
     static MeshResult buildMultiRidgePrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints );
-    static MeshResult buildHippedRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints );
+    static MeshResult buildHippedRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints, const QVector<RoofSample> &pointCloudSamples = QVector<RoofSample>() );
 };

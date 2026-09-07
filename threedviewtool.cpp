@@ -661,6 +661,12 @@ QgsFeatureList ThreeDViewTool::buildSimplifiedWireframeFromMesh( const MeshData 
     topPoints.append( point );
   }
 
+  for ( const QPair<QgsPoint, QgsPoint> &line : mesh.structureLines )
+    appendWireframeLine( lines, emittedLineKeys, fid, line.first, line.second );
+
+  if ( !flatTopWireframe && topPoints.size() == 2 )
+    appendWireframeLine( lines, emittedLineKeys, fid, topPoints.at( 0 ), topPoints.at( 1 ) );
+
   QVector<const WireframeEdgeRecord *> keptEdges;
   keptEdges.reserve( edges.size() );
   const double sharpEdgeDotThreshold = 0.86;
@@ -1138,6 +1144,7 @@ MeshData ThreeDViewTool::buildMeshForFeature( const QgsFeature &feature, double 
     {
       MeshData mesh{ flatReliefRoof.mesh.vertices, flatReliefRoof.mesh.indices };
       mesh.footprintRing = footprintRing;
+      mesh.structureLines = flatReliefRoof.mesh.structureLines;
       return mesh;
     }
 
@@ -1146,22 +1153,25 @@ MeshData ThreeDViewTool::buildMeshForFeature( const QgsFeature &feature, double 
     {
       MeshData mesh{ clusteredFlatTopHippedRoof.mesh.vertices, clusteredFlatTopHippedRoof.mesh.indices, true };
       mesh.footprintRing = footprintRing;
+      mesh.structureLines = clusteredFlatTopHippedRoof.mesh.structureLines;
       return mesh;
     }
 
-    const BuildingRoof::MeshResult curvedRoof = BuildingRoof::buildCurvedRoofPrismMesh( feature.geometry(), height, points );
+    const BuildingRoof::MeshResult curvedRoof = BuildingRoof::buildCurvedRoofPrismMesh( feature.geometry(), height, points, pointCloudSamples );
     if ( curvedRoof.success )
     {
       MeshData mesh{ curvedRoof.mesh.vertices, curvedRoof.mesh.indices, false, true, true };
       mesh.footprintRing = footprintRing;
+      mesh.structureLines = curvedRoof.mesh.structureLines;
       return mesh;
     }
 
-    const BuildingRoof::MeshResult apexRoof = BuildingRoof::buildApexRoofPrismMesh( feature.geometry(), height, points );
+    const BuildingRoof::MeshResult apexRoof = BuildingRoof::buildApexRoofPrismMesh( feature.geometry(), height, points, pointCloudSamples );
     if ( apexRoof.success )
     {
       MeshData mesh{ apexRoof.mesh.vertices, apexRoof.mesh.indices, false, false, true };
       mesh.footprintRing = footprintRing;
+      mesh.structureLines = apexRoof.mesh.structureLines;
       return mesh;
     }
 
@@ -1170,14 +1180,16 @@ MeshData ThreeDViewTool::buildMeshForFeature( const QgsFeature &feature, double 
     {
       MeshData mesh{ gabledRoof.mesh.vertices, gabledRoof.mesh.indices };
       mesh.footprintRing = footprintRing;
+      mesh.structureLines = gabledRoof.mesh.structureLines;
       return mesh;
     }
 
-    const BuildingRoof::MeshResult hippedRoof = BuildingRoof::buildHippedRoofPrismMesh( feature.geometry(), height, points );
+    const BuildingRoof::MeshResult hippedRoof = BuildingRoof::buildHippedRoofPrismMesh( feature.geometry(), height, points, pointCloudSamples );
     if ( hippedRoof.success )
     {
       MeshData mesh{ hippedRoof.mesh.vertices, hippedRoof.mesh.indices };
       mesh.footprintRing = footprintRing;
+      mesh.structureLines = hippedRoof.mesh.structureLines;
       return mesh;
     }
 
@@ -1186,6 +1198,7 @@ MeshData ThreeDViewTool::buildMeshForFeature( const QgsFeature &feature, double 
     {
       MeshData mesh{ multiRidgeRoof.mesh.vertices, multiRidgeRoof.mesh.indices };
       mesh.footprintRing = footprintRing;
+      mesh.structureLines = multiRidgeRoof.mesh.structureLines;
       return mesh;
     }
   }

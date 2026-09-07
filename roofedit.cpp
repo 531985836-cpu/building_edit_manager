@@ -1726,13 +1726,13 @@ void RoofEditTool::previewRoofModel()
   if ( !roofMesh.success )
     roofMesh = BuildingRoof::buildClusteredFlatTopHippedRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
   if ( !roofMesh.success )
-    roofMesh = BuildingRoof::buildCurvedRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
+    roofMesh = BuildingRoof::buildCurvedRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
   if ( !roofMesh.success )
-    roofMesh = BuildingRoof::buildApexRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
+    roofMesh = BuildingRoof::buildApexRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
   if ( !roofMesh.success )
     roofMesh = BuildingRoof::buildGabledRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
   if ( !roofMesh.success )
-    roofMesh = BuildingRoof::buildHippedRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
+    roofMesh = BuildingRoof::buildHippedRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
   if ( !roofMesh.success )
     roofMesh = BuildingRoof::buildMultiRidgePrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
   if ( !roofMesh.success )
@@ -1841,13 +1841,13 @@ void RoofEditTool::saveRoofModel()
   if ( !roofMesh.success )
     roofMesh = BuildingRoof::buildClusteredFlatTopHippedRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
   if ( !roofMesh.success )
-    roofMesh = BuildingRoof::buildCurvedRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
+    roofMesh = BuildingRoof::buildCurvedRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
   if ( !roofMesh.success )
-    roofMesh = BuildingRoof::buildApexRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
+    roofMesh = BuildingRoof::buildApexRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
   if ( !roofMesh.success )
     roofMesh = BuildingRoof::buildGabledRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
   if ( !roofMesh.success )
-    roofMesh = BuildingRoof::buildHippedRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
+    roofMesh = BuildingRoof::buildHippedRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
   if ( !roofMesh.success )
     roofMesh = BuildingRoof::buildMultiRidgePrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
   if ( !roofMesh.success )

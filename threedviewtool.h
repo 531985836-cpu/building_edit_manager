@@ -6,6 +6,7 @@
 #include <QWidget>
 #include <QPoint>
 #include <QMatrix4x4>
+#include <QPair>
 #include <QPointer>
 #include <QTimer>
 
@@ -42,6 +43,7 @@ struct MeshData
     bool curvedWireframe = false;
     bool eaveWireframe = false;
     QVector<QgsPoint> footprintRing;
+    QVector<QPair<QgsPoint, QgsPoint>> structureLines;
     bool isEmpty() const { return vertices.isEmpty(); }
 };
 
