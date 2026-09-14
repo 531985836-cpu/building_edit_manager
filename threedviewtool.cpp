@@ -7,6 +7,7 @@
 #include <qgspointcloudblock.h>
 #include <qgspointcloudindex.h>
 #include <qgspointcloudrequest.h>
+#include <qgspointcloudattributebyramprenderer.h>
 #include <qgsrasterlayer.h>
 #include <qgsproject.h>
 #include <qgsmapmouseevent.h>
@@ -48,6 +49,8 @@
 #include <qgs3dmapscene.h>
 #include <qgsvector3d.h>
 #include <qgsnullsymbolrenderer.h>
+#include <qgslinesymbol.h>
+#include <qgssinglesymbolrenderer.h>
 #include <qgslayertreelayer.h>
 #include <qgslayertree.h>
 #include <qgslayertreeview.h>
@@ -68,6 +71,58 @@
 // ==================== 构造与析构 ====================
 namespace
 {
+  QList<QgsColorRampShader::ColorRampItem> pointCloudElevationRampItems( double zMin, double zMax )
+  {
+    const QList<QColor> colors = {
+      QColor( 35, 42, 165 ),
+      QColor( 28, 90, 210 ),
+      QColor( 0, 145, 255 ),
+      QColor( 0, 205, 255 ),
+      QColor( 0, 230, 190 ),
+      QColor( 0, 190, 90 ),
+      QColor( 55, 210, 60 ),
+      QColor( 145, 220, 0 ),
+      QColor( 225, 235, 0 ),
+      QColor( 255, 210, 0 ),
+      QColor( 255, 165, 0 ),
+      QColor( 255, 105, 0 ),
+      QColor( 245, 55, 0 ),
+      QColor( 220, 0, 35 ),
+      QColor( 190, 0, 120 ),
+      QColor( 135, 0, 180 )
+    };
+
+    const double range = zMax - zMin;
+    QList<QgsColorRampShader::ColorRampItem> items;
+    items.reserve( colors.size() );
+    for ( int i = 0; i < colors.size(); ++i )
+    {
+      const double t = colors.size() <= 1 ? 0.0 : static_cast<double>( i ) / static_cast<double>( colors.size() - 1 );
+      const double value = i == colors.size() - 1 ? zMax : zMin + range * t;
+      items << QgsColorRampShader::ColorRampItem( value, colors.at( i ), QString::number( value, 'f', 2 ) );
+    }
+    return items;
+  }
+
+  QgsColorRampShader pointCloudElevationShader( double zMin, double zMax )
+  {
+    QgsColorRampShader shader( zMin, zMax, nullptr, Qgis::ShaderInterpolationMethod::Discrete, Qgis::ShaderClassificationMethod::Continuous );
+    shader.setColorRampType( Qgis::ShaderInterpolationMethod::Discrete );
+    shader.setClassificationMode( Qgis::ShaderClassificationMethod::Continuous );
+    shader.setColorRampItemList( pointCloudElevationRampItems( zMin, zMax ) );
+    return shader;
+  }
+
+  QString nonNegativePointCloudSubset( const QString &currentSubset )
+  {
+    const QString zFilter = QStringLiteral( "Z >= 0" );
+    if ( currentSubset.trimmed().isEmpty() )
+      return zFilter;
+    if ( currentSubset.contains( zFilter, Qt::CaseInsensitive ) )
+      return currentSubset;
+    return QStringLiteral( "(%1) AND (%2)" ).arg( currentSubset, zFilter );
+  }
+
   QString buildingShapeSignature( const QgsGeometry &geometry )
   {
     if ( geometry.isNull() || geometry.isEmpty() )
@@ -337,11 +392,15 @@ namespace
 
         const double x = ix * xScale + xOffset;
         const double y = iy * yScale + yOffset;
+        const double z = iz * zScale + zOffset;
+        if ( z < 0.0 )
+          continue;
+
         const QgsPointXY xy( x, y );
         if ( !geometry.contains( QgsGeometry::fromPointXY( xy ) ) )
           continue;
 
-        allSamples.append( BuildingRoof::RoofSample{ QgsPoint( x, y, iz * zScale + zOffset ) } );
+        allSamples.append( BuildingRoof::RoofSample{ QgsPoint( x, y, z ) } );
       }
     }
 
@@ -394,6 +453,7 @@ ThreeDViewTool::~ThreeDViewTool()
 
 void ThreeDViewTool::cleanup3DState()
 {
+  restoreLayerVisibilityAfterTriangleMesh();
   clearPreviewEntity();
   clearWireframeLayer();
 
@@ -433,6 +493,56 @@ void ThreeDViewTool::refresh3DCanvases()
       canvas3D->mapSettings()->setLayers( layers );
     }
   }
+}
+
+void ThreeDViewTool::hideActiveLayerForTriangleMesh()
+{
+  if ( !mActiveLayer )
+    return;
+
+  QgsLayerTree *root = QgsProject::instance()->layerTreeRoot();
+  if ( !root )
+    return;
+
+  if ( mTriangleMeshHasHiddenLayerState )
+  {
+    if ( mTriangleMeshHiddenLayerId == mActiveLayer->id() )
+      return;
+    restoreLayerVisibilityAfterTriangleMesh();
+  }
+
+  QgsLayerTreeLayer *activeNode = root->findLayer( mActiveLayer->id() );
+  if ( !activeNode )
+    return;
+
+  mTriangleMeshHiddenLayerId = mActiveLayer->id();
+  mTriangleMeshHiddenLayerWasVisible = activeNode->itemVisibilityChecked();
+  mTriangleMeshHasHiddenLayerState = true;
+  activeNode->setItemVisibilityChecked( false );
+
+  if ( mCanvas )
+    mCanvas->refresh();
+}
+
+void ThreeDViewTool::restoreLayerVisibilityAfterTriangleMesh()
+{
+  if ( !mTriangleMeshHasHiddenLayerState )
+    return;
+
+  QgsLayerTree *root = QgsProject::instance()->layerTreeRoot();
+  if ( root )
+  {
+    QgsLayerTreeLayer *hiddenNode = root->findLayer( mTriangleMeshHiddenLayerId );
+    if ( hiddenNode )
+      hiddenNode->setItemVisibilityChecked( mTriangleMeshHiddenLayerWasVisible );
+  }
+
+  mTriangleMeshHiddenLayerId.clear();
+  mTriangleMeshHiddenLayerWasVisible = false;
+  mTriangleMeshHasHiddenLayerState = false;
+
+  if ( mCanvas )
+    mCanvas->refresh();
 }
 
 void ThreeDViewTool::applyBuildingTriangleMeshMode()
@@ -484,8 +594,14 @@ void ThreeDViewTool::ensureWireframeLayer()
   if ( !mWireframeLayer || !mWireframeLayer->isValid() )
     return;
 
-  mWireframeLayer->setRenderer( new QgsNullSymbolRenderer() );
-  mWireframeLayer->setOpacity( 0.0 );
+  std::unique_ptr<QgsLineSymbol> wireframe2DSymbol = QgsLineSymbol::createSimple(
+    { { QStringLiteral( "line_color" ), QStringLiteral( "0,0,0,230" ) },
+      { QStringLiteral( "line_width" ), QStringLiteral( "0.65" ) },
+      { QStringLiteral( "line_joinstyle" ), QStringLiteral( "miter" ) },
+      { QStringLiteral( "line_capstyle" ), QStringLiteral( "square" ) } }
+  );
+  mWireframeLayer->setRenderer( new QgsSingleSymbolRenderer( wireframe2DSymbol.release() ) );
+  mWireframeLayer->setOpacity( 1.0 );
   mWireframeLayer->setFlags( mWireframeLayer->flags() & ~QgsMapLayer::Identifiable );
   mWireframeLayer->setFlags( mWireframeLayer->flags() & ~QgsMapLayer::Searchable );
 
@@ -493,7 +609,7 @@ void ThreeDViewTool::ensureWireframeLayer()
   symbol->setAltitudeClamping( Qgis::AltitudeClamping::Absolute );
   symbol->setAltitudeBinding( Qgis::AltitudeBinding::Vertex );
   symbol->setRenderAsSimpleLines( true );
-  symbol->setWidth( 1.0f );
+  symbol->setWidth( 1.8f );
 
   QgsPhongMaterialSettings *material = new QgsPhongMaterialSettings();
   material->setAmbient( QColor( 20, 20, 20 ) );
@@ -510,7 +626,7 @@ void ThreeDViewTool::ensureWireframeLayer()
   QgsProject::instance()->addMapLayer( mWireframeLayer, false );
   QgsLayerTreeLayer *treeLayer = QgsProject::instance()->layerTreeRoot()->addLayer( mWireframeLayer );
   if ( treeLayer )
-    treeLayer->setCustomProperty( "nodeHidden", true );
+    treeLayer->setItemVisibilityChecked( true );
 
   ensureLayerIn3DView( mWireframeLayer );
 }
@@ -1600,6 +1716,15 @@ void ThreeDViewTool::refreshLayerList()
 // 图层切换时刷新字段列表
 void ThreeDViewTool::onLayerChanged( int index )
 {
+  if ( mBuildingTriangleMeshMode || mTriangleMeshHasHiddenLayerState )
+  {
+    restoreLayerVisibilityAfterTriangleMesh();
+    mBuildingTriangleMeshMode = false;
+    mWireframeFid = FID_NULL;
+    clearWireframeLayer();
+    applyBuildingTriangleMeshMode();
+  }
+
   if ( index <= 0 )
   {
     mActiveLayer = nullptr;
@@ -1697,7 +1822,8 @@ void ThreeDViewTool::addPointCloudData()
       continue;
     }
 
-    configurePointCloud3DRenderer( layer );
+    layer->setSubsetString( nonNegativePointCloudSubset( layer->subsetString() ) );
+    configurePointCloudRenderers( layer );
     QPointer<QgsPointCloudLayer> safeLayer = layer;
     connect( layer, &QgsPointCloudLayer::statisticsCalculationStateChanged, this, [this, safeLayer]( QgsPointCloudLayer::PointCloudStatisticsCalculationState state ) {
       if ( state != QgsPointCloudLayer::PointCloudStatisticsCalculationState::Calculated )
@@ -1705,7 +1831,7 @@ void ThreeDViewTool::addPointCloudData()
       if ( !safeLayer || !mIface )
         return;
 
-      configurePointCloud3DRenderer( safeLayer );
+      configurePointCloudRenderers( safeLayer );
       refresh3DCanvases();
     } );
   }
@@ -1734,10 +1860,12 @@ void ThreeDViewTool::addRasterData()
   }
 }
 
-void ThreeDViewTool::configurePointCloud3DRenderer( QgsPointCloudLayer *layer )
+void ThreeDViewTool::configurePointCloudRenderers( QgsPointCloudLayer *layer )
 {
   if ( !layer )
     return;
+
+  layer->setSubsetString( nonNegativePointCloudSubset( layer->subsetString() ) );
 
   if ( QgsPointCloudLayerElevationProperties *elevation =
          qobject_cast<QgsPointCloudLayerElevationProperties *>( layer->elevationProperties() ) )
@@ -1750,29 +1878,28 @@ void ThreeDViewTool::configurePointCloud3DRenderer( QgsPointCloudLayer *layer )
   double zMin = layer->statistics().minimum( zAttribute );
   double zMax = layer->statistics().maximum( zAttribute );
   if ( !std::isfinite( zMin ) )
-    zMin = -50.0;
+    zMin = 0.0;
   if ( !std::isfinite( zMax ) )
     zMax = 50.0;
+  zMin = std::max( 0.0, zMin );
+  if ( zMax < 0.0 )
+    zMax = 1.0;
   if ( zMax <= zMin + 1e-9 )
   {
-    zMin -= 1.0;
+    zMin = std::max( 0.0, zMin - 1.0 );
     zMax += 1.0;
   }
 
-  QgsColorRampShader shader( zMin, zMax, nullptr, Qgis::ShaderInterpolationMethod::Discrete, Qgis::ShaderClassificationMethod::Continuous );
-  const double range = zMax - zMin;
-  QList<QgsColorRampShader::ColorRampItem> items;
-  items << QgsColorRampShader::ColorRampItem( zMin, QColor( 28, 36, 170 ), QString::number( zMin, 'f', 2 ) )
-        << QgsColorRampShader::ColorRampItem( zMin + range * 0.14, QColor( 0, 112, 255 ) )
-        << QgsColorRampShader::ColorRampItem( zMin + range * 0.28, QColor( 0, 205, 255 ) )
-        << QgsColorRampShader::ColorRampItem( zMin + range * 0.42, QColor( 20, 205, 90 ) )
-        << QgsColorRampShader::ColorRampItem( zMin + range * 0.56, QColor( 255, 238, 0 ) )
-        << QgsColorRampShader::ColorRampItem( zMin + range * 0.70, QColor( 255, 132, 0 ) )
-        << QgsColorRampShader::ColorRampItem( zMin + range * 0.84, QColor( 238, 34, 34 ) )
-        << QgsColorRampShader::ColorRampItem( zMax, QColor( 186, 0, 120 ), QString::number( zMax, 'f', 2 ) );
-  shader.setColorRampType( Qgis::ShaderInterpolationMethod::Discrete );
-  shader.setClassificationMode( Qgis::ShaderClassificationMethod::Continuous );
-  shader.setColorRampItemList( items );
+  const QgsColorRampShader shader = pointCloudElevationShader( zMin, zMax );
+
+  QgsPointCloudAttributeByRampRenderer *renderer2D = new QgsPointCloudAttributeByRampRenderer();
+  renderer2D->setAttribute( zAttribute );
+  renderer2D->setMinimum( zMin );
+  renderer2D->setMaximum( zMax );
+  renderer2D->setColorRampShader( shader );
+  renderer2D->setPointSize( 1.2 );
+  renderer2D->setMaximumScreenError( 0.5 );
+  layer->setRenderer( renderer2D );
 
   QgsColorRampPointCloud3DSymbol *symbol = new QgsColorRampPointCloud3DSymbol();
   symbol->setAttribute( zAttribute );
@@ -1786,6 +1913,7 @@ void ThreeDViewTool::configurePointCloud3DRenderer( QgsPointCloudLayer *layer )
   renderer->setMaximumScreenError( 1.0 );
   renderer->setPointRenderingBudget( 5000000 );
   layer->setRenderer3D( renderer );
+  layer->triggerRepaint();
 }
 
 void ThreeDViewTool::ensureLayerIn3DView( QgsMapLayer *layer )
@@ -1825,7 +1953,7 @@ void ThreeDViewTool::addLoadedPointCloudLayersTo3DView()
     if ( !pointCloudLayer || !pointCloudLayer->isValid() )
       continue;
 
-    configurePointCloud3DRenderer( pointCloudLayer );
+    configurePointCloudRenderers( pointCloudLayer );
     ensureLayerIn3DView( pointCloudLayer );
   }
 }
@@ -2213,9 +2341,15 @@ void ThreeDViewTool::onBuildingTriangleMeshModeChanged( QgsVectorLayer *layer, Q
   mWireframeFid = mBuildingTriangleMeshMode ? fid : FID_NULL;
   applyBuildingTriangleMeshMode();
   if ( mBuildingTriangleMeshMode )
+  {
+    hideActiveLayerForTriangleMesh();
     updateWireframeLayer( layer, fid );
+  }
   else
+  {
+    restoreLayerVisibilityAfterTriangleMesh();
     clearWireframeLayer();
+  }
 }
 
 void ThreeDViewTool::refreshMemoryData()

@@ -2152,11 +2152,15 @@ QVector<BuildingRoof::RoofSample> RoofEditTool::collectPointCloudSamplesForGeome
 
       const double x = ix * xScale + xOffset;
       const double y = iy * yScale + yOffset;
+      const double z = iz * zScale + zOffset;
+      if ( z < 0.0 )
+        continue;
+
       const QgsPointXY xy( x, y );
       if ( !preparedGeometry.contains( QgsGeometry::fromPointXY( xy ) ) )
         continue;
 
-      allSamples.append( BuildingRoof::RoofSample{ QgsPoint( x, y, iz * zScale + zOffset ) } );
+      allSamples.append( BuildingRoof::RoofSample{ QgsPoint( x, y, z ) } );
     }
   }
 

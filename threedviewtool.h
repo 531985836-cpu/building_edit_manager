@@ -83,8 +83,10 @@ class ThreeDViewTool : public QgsMapTool
     QgsFeatureList buildBuildingFromMesh( const MeshData &mesh, const QMatrix4x4 &mat );
     void ensureLayerIn3DView( QgsMapLayer *layer );
     void addLoadedPointCloudLayersTo3DView();
-    void configurePointCloud3DRenderer( QgsPointCloudLayer *layer );
+    void configurePointCloudRenderers( QgsPointCloudLayer *layer );
     void applyBuildingTriangleMeshMode();
+    void hideActiveLayerForTriangleMesh();
+    void restoreLayerVisibilityAfterTriangleMesh();
     void ensureWireframeLayer();
     void clearWireframeLayer();
     void updateWireframeLayer( QgsVectorLayer *layer, QgsFeatureId fid );
@@ -129,6 +131,9 @@ class ThreeDViewTool : public QgsMapTool
     QPointer<QgsVectorLayer> mWireframeLayer = nullptr;
     QString mSelectedHeightField;
     bool mBuildingTriangleMeshMode = false;
+    bool mTriangleMeshHiddenLayerWasVisible = false;
+    bool mTriangleMeshHasHiddenLayerState = false;
+    QString mTriangleMeshHiddenLayerId;
     QgsFeatureId mWireframeFid = FID_NULL;
 
     // 鼠标交互状态

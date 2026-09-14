@@ -43,6 +43,16 @@ namespace
     double oppositeLimit = 0.0;
   };
 
+  struct BentGableLayout
+  {
+    bool success = false;
+    QgsPointXY primaryEnd;
+    QgsPointXY bend;
+    QgsPointXY secondaryEnd;
+    double splitNormalX = 0.0;
+    double splitNormalY = 0.0;
+  };
+
   struct ClusterSample
   {
     QgsPointXY point;
@@ -57,6 +67,9 @@ namespace
   bool pointInRing( const QVector<QgsPointXY> &ring, const QgsPointXY &point );
   double cross2d( double ax, double ay, double bx, double by );
   double ringExtentSize( const QVector<QgsPointXY> &ring );
+  bool makeBentSegment( const QgsPointXY &start, const QgsPointXY &end, double ridgeHeight, const QVector<QgsPointXY> &ring, const QgsPoint &boundaryPoint, BentGableSegment &segment );
+  BentGableLayout findBentGabledLayout( const QVector<QgsPointXY> &inputRing, const QgsPointXY &ridgeXY, double dirX, double dirY );
+  QgsPointXY pullPointInsideRing( const QVector<QgsPointXY> &ring, const QgsPointXY &candidate, const QgsPointXY &fallback );
 
   bool isGroundPointType( const QString &type )
   {
@@ -1711,6 +1724,7 @@ namespace
     QgsPoint secondPoint;
     double dirX = 0.0;
     double dirY = 0.0;
+    bool preferredGabledSeed = false;
   };
 
   struct HippedRidgeBandSample
@@ -1718,6 +1732,25 @@ namespace
     double t = 0.0;
     QgsPointXY point;
     double z = 0.0;
+  };
+
+  struct HippedNormalRoofSample
+  {
+    QgsPoint point;
+    double horizontalNormalX = 0.0;
+    double horizontalNormalY = 0.0;
+    double normalZ = 0.0;
+  };
+
+  struct HippedConstrainedRidgeFit
+  {
+    bool success = false;
+    double lineOffset = 0.0;
+    double startT = 0.0;
+    double endT = 0.0;
+    double ridgeHeight = 0.0;
+    double angleOffset = 0.0;
+    double score = std::numeric_limits<double>::max();
   };
 
   struct AutoHeightBand
@@ -2525,6 +2558,773 @@ namespace
     return true;
   }
 
+  struct LeastSquaresRoofPlane
+  {
+    bool success = false;
+    double a = 0.0;
+    double b = 0.0;
+    double c = 0.0;
+    double rmse = 0.0;
+    int count = 0;
+  };
+
+  struct GabledBoundarySlopePlanes
+  {
+    bool success = false;
+    LeastSquaresRoofPlane firstPlane;
+    LeastSquaresRoofPlane secondPlane;
+    bool hasSideSigns = false;
+    double firstPlaneSideSign = 0.0;
+    double secondPlaneSideSign = 0.0;
+  };
+
+  bool solveSymmetric3x3( double matrix[3][4], double &x, double &y, double &z )
+  {
+    for ( int pivot = 0; pivot < 3; ++pivot )
+    {
+      int bestRow = pivot;
+      double bestAbs = std::fabs( matrix[pivot][pivot] );
+      for ( int row = pivot + 1; row < 3; ++row )
+      {
+        const double value = std::fabs( matrix[row][pivot] );
+        if ( value > bestAbs )
+        {
+          bestAbs = value;
+          bestRow = row;
+        }
+      }
+
+      if ( bestAbs <= 1e-10 )
+        return false;
+
+      if ( bestRow != pivot )
+      {
+        for ( int col = pivot; col < 4; ++col )
+          std::swap( matrix[pivot][col], matrix[bestRow][col] );
+      }
+
+      const double divisor = matrix[pivot][pivot];
+      for ( int col = pivot; col < 4; ++col )
+        matrix[pivot][col] /= divisor;
+
+      for ( int row = 0; row < 3; ++row )
+      {
+        if ( row == pivot )
+          continue;
+        const double factor = matrix[row][pivot];
+        for ( int col = pivot; col < 4; ++col )
+          matrix[row][col] -= factor * matrix[pivot][col];
+      }
+    }
+
+    x = matrix[0][3];
+    y = matrix[1][3];
+    z = matrix[2][3];
+    return std::isfinite( x ) && std::isfinite( y ) && std::isfinite( z );
+  }
+
+  double roofPlaneZ( const LeastSquaresRoofPlane &plane, const QgsPointXY &point )
+  {
+    return plane.a * point.x() + plane.b * point.y() + plane.c;
+  }
+
+  bool refineBoundaryPointHeightFromSlopePlane( QgsPoint &boundaryPoint, double slopeHeight, const QgsPoint &ridgePoint, double extent )
+  {
+    if ( !std::isfinite( slopeHeight ) || slopeHeight <= 0.0 )
+      return false;
+
+    const double ridgeBuffer = std::max( 0.25, extent * 0.008 );
+    const double maxHeight = ridgePoint.z() - ridgeBuffer;
+    if ( slopeHeight >= maxHeight )
+      slopeHeight = maxHeight;
+    if ( slopeHeight <= 0.0 )
+      return false;
+
+    const double oldHeight = boundaryPoint.z();
+    double refinedHeight = slopeHeight;
+    if ( std::isfinite( oldHeight ) && oldHeight > 0.0 )
+    {
+      const double rise = std::max( 0.30, ridgePoint.z() - oldHeight );
+      const double maxAdjustment = std::max( 0.45, std::min( 1.25, rise * 0.35 ) );
+      const double diff = slopeHeight - oldHeight;
+      if ( std::fabs( diff ) > maxAdjustment )
+        slopeHeight = oldHeight + ( diff > 0.0 ? maxAdjustment : -maxAdjustment );
+      refinedHeight = slopeHeight * 0.55 + oldHeight * 0.45;
+    }
+
+    if ( refinedHeight >= maxHeight )
+      refinedHeight = maxHeight;
+    if ( refinedHeight <= 0.0 )
+      return false;
+
+    boundaryPoint.setZ( refinedHeight );
+    return true;
+  }
+
+  LeastSquaresRoofPlane fitLeastSquaresRoofPlane( const QVector<QgsPoint> &points )
+  {
+    LeastSquaresRoofPlane plane;
+    if ( points.size() < 8 )
+      return plane;
+
+    double originX = 0.0;
+    double originY = 0.0;
+    for ( const QgsPoint &point : points )
+    {
+      originX += point.x();
+      originY += point.y();
+    }
+    originX /= points.size();
+    originY /= points.size();
+
+    double sumX = 0.0;
+    double sumY = 0.0;
+    double sumZ = 0.0;
+    double sumXX = 0.0;
+    double sumXY = 0.0;
+    double sumYY = 0.0;
+    double sumXZ = 0.0;
+    double sumYZ = 0.0;
+    for ( const QgsPoint &point : points )
+    {
+      const double x = point.x() - originX;
+      const double y = point.y() - originY;
+      const double z = point.z();
+      sumX += x;
+      sumY += y;
+      sumZ += z;
+      sumXX += x * x;
+      sumXY += x * y;
+      sumYY += y * y;
+      sumXZ += x * z;
+      sumYZ += y * z;
+    }
+
+    double matrix[3][4] = {
+      { sumXX, sumXY, sumX, sumXZ },
+      { sumXY, sumYY, sumY, sumYZ },
+      { sumX, sumY, static_cast<double>( points.size() ), sumZ }
+    };
+
+    double localA = 0.0;
+    double localB = 0.0;
+    double localC = 0.0;
+    if ( !solveSymmetric3x3( matrix, localA, localB, localC ) )
+      return plane;
+
+    double squaredErrorSum = 0.0;
+    for ( const QgsPoint &point : points )
+    {
+      const double predictedZ = localA * ( point.x() - originX ) + localB * ( point.y() - originY ) + localC;
+      const double error = point.z() - predictedZ;
+      squaredErrorSum += error * error;
+    }
+
+    plane.success = true;
+    plane.a = localA;
+    plane.b = localB;
+    plane.c = localC - localA * originX - localB * originY;
+    plane.rmse = std::sqrt( squaredErrorSum / points.size() );
+    plane.count = points.size();
+    return plane;
+  }
+
+  bool planeFromThreePoints( const QgsPoint &p0, const QgsPoint &p1, const QgsPoint &p2, LeastSquaresRoofPlane &plane )
+  {
+    const double ux = p1.x() - p0.x();
+    const double uy = p1.y() - p0.y();
+    const double uz = p1.z() - p0.z();
+    const double vx = p2.x() - p0.x();
+    const double vy = p2.y() - p0.y();
+    const double vz = p2.z() - p0.z();
+
+    const double nx = uy * vz - uz * vy;
+    const double ny = uz * vx - ux * vz;
+    const double nz = ux * vy - uy * vx;
+    const double normalLength = std::sqrt( nx * nx + ny * ny + nz * nz );
+    if ( normalLength <= 1e-10 )
+      return false;
+
+    const double verticalComponent = std::fabs( nz ) / normalLength;
+    if ( verticalComponent < 0.20 )
+      return false;
+
+    plane.success = true;
+    plane.a = -nx / nz;
+    plane.b = -ny / nz;
+    plane.c = ( nx * p0.x() + ny * p0.y() + nz * p0.z() ) / nz;
+    plane.rmse = 0.0;
+    plane.count = 3;
+    return std::isfinite( plane.a ) && std::isfinite( plane.b ) && std::isfinite( plane.c );
+  }
+
+  struct HippedCandidateRoofTriangle
+  {
+    QgsPointXY a;
+    QgsPointXY b;
+    QgsPointXY c;
+    LeastSquaresRoofPlane plane;
+  };
+
+  struct HippedWeightedRoofSample
+  {
+    QgsPoint point;
+    double weight = 1.0;
+  };
+
+  bool pointInsideTriangle2d( const QgsPointXY &point, const QgsPointXY &a, const QgsPointXY &b, const QgsPointXY &c )
+  {
+    const double ab = cross2d( b.x() - a.x(), b.y() - a.y(), point.x() - a.x(), point.y() - a.y() );
+    const double bc = cross2d( c.x() - b.x(), c.y() - b.y(), point.x() - b.x(), point.y() - b.y() );
+    const double ca = cross2d( a.x() - c.x(), a.y() - c.y(), point.x() - c.x(), point.y() - c.y() );
+    const double tolerance = 1e-8 * std::max( 1.0, std::fabs( ab ) + std::fabs( bc ) + std::fabs( ca ) );
+    const bool hasNegative = ab < -tolerance || bc < -tolerance || ca < -tolerance;
+    const bool hasPositive = ab > tolerance || bc > tolerance || ca > tolerance;
+    return !( hasNegative && hasPositive );
+  }
+
+  double hippedCandidateAnchorHeight( const QgsPointXY &point, const QgsPointXY &firstRidge, const QgsPointXY &secondRidge, double eaveHeight, double ridgeHeight, double toleranceSquared )
+  {
+    const double firstDx = point.x() - firstRidge.x();
+    const double firstDy = point.y() - firstRidge.y();
+    const double secondDx = point.x() - secondRidge.x();
+    const double secondDy = point.y() - secondRidge.y();
+    if ( firstDx * firstDx + firstDy * firstDy <= toleranceSquared
+         || secondDx * secondDx + secondDy * secondDy <= toleranceSquared )
+      return ridgeHeight;
+    return eaveHeight;
+  }
+
+  QVector<HippedCandidateRoofTriangle> hippedCandidateRoofTriangles( const QVector<QgsPointXY> &ring, const QgsPointXY &firstRidge, const QgsPointXY &secondRidge, double eaveHeight, double ridgeHeight )
+  {
+    QVector<HippedCandidateRoofTriangle> result;
+    if ( ring.size() < 3 || !pointInRing( ring, firstRidge ) || !pointInRing( ring, secondRidge ) )
+      return result;
+
+    QgsMultiPointXY pointSet;
+    for ( const QgsPointXY &point : ring )
+      pointSet.append( point );
+    pointSet.append( firstRidge );
+    pointSet.append( secondRidge );
+
+    const QgsGeometry tin = QgsGeometry::fromMultiPointXY( pointSet ).delaunayTriangulation( 0.0, false );
+    QVector<QgsGeometry> geometries = tin.asGeometryCollection();
+    if ( geometries.isEmpty() && !tin.isNull() )
+      geometries.append( tin );
+
+    const double extent = ringExtentSize( ring );
+    const double xyTolerance = std::max( 1e-7, extent * 1e-8 );
+    const double toleranceSquared = xyTolerance * xyTolerance;
+    result.reserve( geometries.size() );
+    for ( const QgsGeometry &geometry : geometries )
+    {
+      const QgsPolygonXY triangle = geometry.asPolygon();
+      if ( triangle.isEmpty() || triangle.first().size() < 4 )
+        continue;
+
+      const QgsPolylineXY triangleRing = triangle.first();
+      const QgsPointXY a = triangleRing.at( 0 );
+      const QgsPointXY b = triangleRing.at( 1 );
+      const QgsPointXY c = triangleRing.at( 2 );
+      const QgsPointXY centroid( ( a.x() + b.x() + c.x() ) / 3.0,
+                                 ( a.y() + b.y() + c.y() ) / 3.0 );
+      if ( !pointInRing( ring, centroid ) )
+        continue;
+
+      const QgsPoint pointA( a.x(), a.y(), hippedCandidateAnchorHeight( a, firstRidge, secondRidge, eaveHeight, ridgeHeight, toleranceSquared ) );
+      const QgsPoint pointB( b.x(), b.y(), hippedCandidateAnchorHeight( b, firstRidge, secondRidge, eaveHeight, ridgeHeight, toleranceSquared ) );
+      const QgsPoint pointC( c.x(), c.y(), hippedCandidateAnchorHeight( c, firstRidge, secondRidge, eaveHeight, ridgeHeight, toleranceSquared ) );
+      LeastSquaresRoofPlane plane;
+      if ( !planeFromThreePoints( pointA, pointB, pointC, plane ) )
+        continue;
+      result.append( HippedCandidateRoofTriangle{ a, b, c, plane } );
+    }
+    return result;
+  }
+
+  double hippedCandidateRoofLoss( const QVector<QgsPointXY> &ring, const QVector<HippedWeightedRoofSample> &roofPoints, const QgsPointXY &firstRidge, const QgsPointXY &secondRidge, double eaveHeight, double ridgeHeight, double robustDelta )
+  {
+    const QVector<HippedCandidateRoofTriangle> triangles = hippedCandidateRoofTriangles( ring, firstRidge, secondRidge, eaveHeight, ridgeHeight );
+    if ( triangles.isEmpty() )
+      return std::numeric_limits<double>::max();
+
+    double loss = 0.0;
+    double weightSum = 0.0;
+    int count = 0;
+    for ( const HippedWeightedRoofSample &sample : roofPoints )
+    {
+      const QgsPoint &point = sample.point;
+      const QgsPointXY pointXY( point.x(), point.y() );
+      double bestDistance = std::numeric_limits<double>::max();
+      for ( const HippedCandidateRoofTriangle &triangle : triangles )
+      {
+        if ( !pointInsideTriangle2d( pointXY, triangle.a, triangle.b, triangle.c ) )
+          continue;
+        const double verticalResidual = point.z() - roofPlaneZ( triangle.plane, pointXY );
+        const double normalLength = std::sqrt( triangle.plane.a * triangle.plane.a + triangle.plane.b * triangle.plane.b + 1.0 );
+        bestDistance = std::min( bestDistance, std::fabs( verticalResidual ) / normalLength );
+      }
+      if ( !std::isfinite( bestDistance ) || bestDistance == std::numeric_limits<double>::max() )
+        continue;
+
+      const double robustLoss = bestDistance <= robustDelta
+                                  ? 0.5 * bestDistance * bestDistance
+                                  : robustDelta * ( bestDistance - 0.5 * robustDelta );
+      loss += sample.weight * robustLoss;
+      weightSum += sample.weight;
+      ++count;
+    }
+
+    const int minCount = std::max( 20, roofPoints.size() / 2 );
+    return count >= minCount && weightSum > 0.0 ? loss / weightSum : std::numeric_limits<double>::max();
+  }
+
+  double roofPlaneResidual( const LeastSquaresRoofPlane &plane, const QgsPoint &point )
+  {
+    return std::fabs( point.z() - ( plane.a * point.x() + plane.b * point.y() + plane.c ) );
+  }
+
+  double robustPlaneThreshold( const QVector<QgsPoint> &points )
+  {
+    if ( points.isEmpty() )
+      return 0.25;
+
+    double minZ = std::numeric_limits<double>::max();
+    double maxZ = std::numeric_limits<double>::lowest();
+    for ( const QgsPoint &point : points )
+    {
+      minZ = std::min( minZ, point.z() );
+      maxZ = std::max( maxZ, point.z() );
+    }
+
+    const double heightRange = std::max( 0.0, maxZ - minZ );
+    return std::max( 0.15, std::min( 0.45, heightRange * 0.06 ) );
+  }
+
+  double pointCloudXySpread( const QVector<QgsPoint> &points )
+  {
+    if ( points.isEmpty() )
+      return 0.0;
+
+    double minX = std::numeric_limits<double>::max();
+    double maxX = std::numeric_limits<double>::lowest();
+    double minY = std::numeric_limits<double>::max();
+    double maxY = std::numeric_limits<double>::lowest();
+    for ( const QgsPoint &point : points )
+    {
+      minX = std::min( minX, point.x() );
+      maxX = std::max( maxX, point.x() );
+      minY = std::min( minY, point.y() );
+      maxY = std::max( maxY, point.y() );
+    }
+    return std::hypot( maxX - minX, maxY - minY );
+  }
+
+  QVector<QgsPoint> robustPlaneInliers( const QVector<QgsPoint> &points, const LeastSquaresRoofPlane &plane, double threshold )
+  {
+    QVector<QgsPoint> inliers;
+    inliers.reserve( points.size() );
+    for ( const QgsPoint &point : points )
+    {
+      if ( roofPlaneResidual( plane, point ) <= threshold )
+        inliers.append( point );
+    }
+    return inliers;
+  }
+
+  double chooseBoundarySlopeHeight( const GabledBoundarySlopePlanes &planes, const QgsPoint &boundaryPoint, const QgsPoint &ridgePoint, double extent )
+  {
+    if ( !planes.success )
+      return std::numeric_limits<double>::quiet_NaN();
+
+    const QgsPointXY boundaryXY( boundaryPoint.x(), boundaryPoint.y() );
+    const double ridgeBuffer = std::max( 0.25, extent * 0.008 );
+    const double maxHeight = ridgePoint.z() - ridgeBuffer;
+    const double oldHeight = boundaryPoint.z();
+    QVector<double> candidates;
+    if ( planes.firstPlane.success )
+      candidates.append( roofPlaneZ( planes.firstPlane, boundaryXY ) );
+    if ( planes.secondPlane.success )
+      candidates.append( roofPlaneZ( planes.secondPlane, boundaryXY ) );
+
+    double bestHeight = std::numeric_limits<double>::quiet_NaN();
+    double bestScore = std::numeric_limits<double>::max();
+    for ( double height : candidates )
+    {
+      if ( !std::isfinite( height ) || height <= 0.0 || height >= maxHeight )
+        continue;
+
+      double score = std::fabs( height - oldHeight );
+      if ( height > oldHeight )
+        score *= 1.35;
+      if ( score < bestScore )
+      {
+        bestScore = score;
+        bestHeight = height;
+      }
+    }
+
+    return bestHeight;
+  }
+
+  double dominantSideSign( const QVector<QgsPoint> &points, const QgsPoint &ridgePoint, double normalX, double normalY )
+  {
+    QVector<double> distances;
+    distances.reserve( points.size() );
+    for ( const QgsPoint &point : points )
+    {
+      const double distance = signedDistanceToLine( QgsPointXY( point.x(), point.y() ), ridgePoint, normalX, normalY );
+      if ( std::fabs( distance ) > 1e-7 )
+        distances.append( distance );
+    }
+
+    if ( distances.isEmpty() )
+      return 0.0;
+
+    std::sort( distances.begin(), distances.end() );
+    const double medianDistance = sortedPercentile( distances, 0.50 );
+    if ( std::fabs( medianDistance ) <= 1e-8 )
+      return 0.0;
+    return medianDistance > 0.0 ? 1.0 : -1.0;
+  }
+
+  const LeastSquaresRoofPlane *planeForRidgeSide( const GabledBoundarySlopePlanes &planes, bool positiveSide )
+  {
+    if ( !planes.success || !planes.firstPlane.success || !planes.secondPlane.success || !planes.hasSideSigns )
+      return nullptr;
+
+    const double sideSign = positiveSide ? 1.0 : -1.0;
+    if ( planes.firstPlaneSideSign * sideSign > 0.0 )
+      return &planes.firstPlane;
+    if ( planes.secondPlaneSideSign * sideSign > 0.0 )
+      return &planes.secondPlane;
+    return nullptr;
+  }
+
+  double constrainedGabledPlaneRoofZ( const LeastSquaresRoofPlane &plane, const QgsPointXY &point, const QgsPoint &ridgePoint, double normalX, double normalY, double fallbackZ )
+  {
+    const double distance = signedDistanceToLine( point, ridgePoint, normalX, normalY );
+    const double slopeAcrossRidge = plane.a * normalX + plane.b * normalY;
+    double z = ridgePoint.z() + slopeAcrossRidge * distance;
+    if ( !std::isfinite( z ) || z <= 0.0 )
+      return fallbackZ;
+    if ( z > ridgePoint.z() )
+      z = ridgePoint.z();
+    return z;
+  }
+
+  double leastSquaresGabledTopZForSide( const QgsPointXY &point, const GabledBoundarySlopePlanes &planes, const QgsPoint &ridgePoint, double normalX, double normalY, double fallbackZ )
+  {
+    const double distance = signedDistanceToLine( point, ridgePoint, normalX, normalY );
+    if ( std::fabs( distance ) <= 1e-7 )
+      return ridgePoint.z();
+
+    const LeastSquaresRoofPlane *plane = planeForRidgeSide( planes, distance > 0.0 );
+    if ( !plane )
+      return fallbackZ;
+    return constrainedGabledPlaneRoofZ( *plane, point, ridgePoint, normalX, normalY, fallbackZ );
+  }
+
+  bool leastSquaresPlanesReliableForClippedMesh( const GabledBoundarySlopePlanes &planes, const QgsPoint &boundaryPoint, const QgsPoint &ridgePoint, double normalX, double normalY )
+  {
+    const LeastSquaresRoofPlane *positivePlane = planeForRidgeSide( planes, true );
+    const LeastSquaresRoofPlane *negativePlane = planeForRidgeSide( planes, false );
+    if ( !positivePlane || !negativePlane )
+      return false;
+
+    const double positiveSlope = positivePlane->a * normalX + positivePlane->b * normalY;
+    const double negativeSlope = negativePlane->a * normalX + negativePlane->b * normalY;
+    if ( positiveSlope >= -1e-5 || negativeSlope <= 1e-5 )
+      return false;
+
+    const double rise = ridgePoint.z() - boundaryPoint.z();
+    if ( !std::isfinite( rise ) || rise <= 0.20 )
+      return false;
+
+    const double maxRmse = std::max( 0.18, std::min( 0.55, rise * 0.18 ) );
+    if ( positivePlane->rmse > maxRmse || negativePlane->rmse > maxRmse )
+      return false;
+
+    const QgsPointXY boundaryXY( boundaryPoint.x(), boundaryPoint.y() );
+    const bool positiveBoundarySide = signedDistanceToLine( boundaryXY, ridgePoint, normalX, normalY ) > 0.0;
+    const LeastSquaresRoofPlane *boundaryPlane = planeForRidgeSide( planes, positiveBoundarySide );
+    if ( !boundaryPlane )
+      return false;
+
+    const double boundaryPlaneZ = constrainedGabledPlaneRoofZ( *boundaryPlane, boundaryXY, ridgePoint, normalX, normalY, boundaryPoint.z() );
+    if ( !std::isfinite( boundaryPlaneZ ) || boundaryPlaneZ <= 0.0 || boundaryPlaneZ >= ridgePoint.z() - 0.10 )
+      return false;
+    if ( std::fabs( boundaryPlaneZ - boundaryPoint.z() ) > std::max( 0.70, rise * 0.45 ) )
+      return false;
+
+    return true;
+  }
+
+  void appendTriangulatedLeastSquaresRoofSurface( BuildingRoof::Mesh &mesh, const QVector<QgsPointXY> &polygon, const LeastSquaresRoofPlane &plane, const QgsPoint &ridgePoint, double normalX, double normalY, double fallbackZ )
+  {
+    if ( polygon.size() < 3 )
+      return;
+
+    QVector<QgsPointXY> localRing = polygon;
+    double area = 0.0;
+    for ( int i = 0; i < localRing.size(); ++i )
+    {
+      const QgsPointXY &a = localRing[i];
+      const QgsPointXY &b = localRing[( i + 1 ) % localRing.size()];
+      area += a.x() * b.y() - b.x() * a.y();
+    }
+    if ( area < 0.0 )
+      std::reverse( localRing.begin(), localRing.end() );
+
+    const int vertexOffset = mesh.vertices.size();
+    for ( const QgsPointXY &point : localRing )
+      mesh.vertices.append( QgsPoint( point.x(), point.y(), constrainedGabledPlaneRoofZ( plane, point, ridgePoint, normalX, normalY, fallbackZ ) ) );
+
+    const QVector<int> triangles = triangulateRing( localRing );
+    for ( int i = 0; i + 2 < triangles.size(); i += 3 )
+      mesh.indices << vertexOffset + triangles[i] << vertexOffset + triangles[i + 1] << vertexOffset + triangles[i + 2];
+  }
+
+  LeastSquaresRoofPlane fitRobustRoofPlane( const QVector<QgsPoint> &points )
+  {
+    LeastSquaresRoofPlane fallbackPlane = fitLeastSquaresRoofPlane( points );
+    if ( points.size() < 24 )
+      return fallbackPlane;
+
+    const double threshold = robustPlaneThreshold( points );
+    const double candidateSpread = pointCloudXySpread( points );
+    const double minInlierSpread = candidateSpread * 0.25;
+    const int minInliers = std::max( 8, static_cast<int>( std::ceil( points.size() * 0.28 ) ) );
+    const int iterations = points.size() > 120 ? 260 : 160;
+    quint32 state = 2166136261u ^ static_cast<quint32>( points.size() * 16777619u );
+    auto nextIndex = [&state, &points]() -> int {
+      state = state * 1664525u + 1013904223u;
+      return static_cast<int>( state % static_cast<quint32>( points.size() ) );
+    };
+
+    QVector<QgsPoint> bestInliers;
+    double bestScore = std::numeric_limits<double>::max();
+    int bestCount = 0;
+
+    for ( int iter = 0; iter < iterations; ++iter )
+    {
+      const int i0 = nextIndex();
+      int i1 = nextIndex();
+      int i2 = nextIndex();
+      if ( i1 == i0 )
+        i1 = ( i1 + 1 ) % points.size();
+      if ( i2 == i0 || i2 == i1 )
+        i2 = ( i2 + points.size() / 2 + 1 ) % points.size();
+      if ( i2 == i0 || i2 == i1 )
+        continue;
+
+      LeastSquaresRoofPlane candidatePlane;
+      if ( !planeFromThreePoints( points.at( i0 ), points.at( i1 ), points.at( i2 ), candidatePlane ) )
+        continue;
+
+      QVector<QgsPoint> inliers;
+      inliers.reserve( points.size() );
+      double squaredError = 0.0;
+      for ( const QgsPoint &point : points )
+      {
+        const double residual = roofPlaneResidual( candidatePlane, point );
+        if ( residual <= threshold )
+        {
+          inliers.append( point );
+          squaredError += residual * residual;
+        }
+      }
+
+      if ( inliers.size() < minInliers )
+        continue;
+      if ( pointCloudXySpread( inliers ) < minInlierSpread )
+        continue;
+
+      const double meanError = squaredError / std::max( 1, inliers.size() );
+      const double coverage = candidateSpread <= 1e-8 ? 1.0 : std::min( 1.0, pointCloudXySpread( inliers ) / candidateSpread );
+      const double score = meanError + ( 1.0 - coverage ) * threshold * 0.25 - inliers.size() * 0.0005;
+      if ( inliers.size() > bestCount || ( inliers.size() == bestCount && score < bestScore ) )
+      {
+        bestCount = inliers.size();
+        bestScore = score;
+        bestInliers = inliers;
+      }
+    }
+
+    if ( bestInliers.size() < minInliers )
+      return fallbackPlane;
+
+    LeastSquaresRoofPlane refinedPlane = fitLeastSquaresRoofPlane( bestInliers );
+    if ( !refinedPlane.success )
+      return fallbackPlane;
+
+    QVector<QgsPoint> refinedInliers = robustPlaneInliers( points, refinedPlane, threshold * 1.15 );
+    if ( refinedInliers.size() >= minInliers )
+    {
+      const LeastSquaresRoofPlane secondRefinedPlane = fitLeastSquaresRoofPlane( refinedInliers );
+      if ( secondRefinedPlane.success )
+        refinedPlane = secondRefinedPlane;
+    }
+
+    if ( fallbackPlane.success && refinedPlane.count < std::max( minInliers, static_cast<int>( std::ceil( points.size() * 0.22 ) ) ) )
+      return fallbackPlane;
+
+    return refinedPlane;
+  }
+
+  bool leastSquaresGabledRidgePointFromPointCloud( const QVector<QgsPointXY> &ring, const QVector<BuildingRoof::RoofSample> &pointCloudSamples, const QgsPoint &boundaryPoint, QgsPoint &ridgePoint, double *ridgeDirX = nullptr, double *ridgeDirY = nullptr, GabledBoundarySlopePlanes *boundarySlopePlanes = nullptr )
+  {
+    double baseDirX = 0.0;
+    double baseDirY = 0.0;
+    if ( !nearestEdgeDirection( ring, boundaryPoint, baseDirX, baseDirY ) )
+      return false;
+
+    const double baseDirLength = std::hypot( baseDirX, baseDirY );
+    if ( baseDirLength <= 1e-10 )
+      return false;
+    baseDirX /= baseDirLength;
+    baseDirY /= baseDirLength;
+    const double normalX = -baseDirY;
+    const double normalY = baseDirX;
+
+    const AutoHeightBand heightBand = inferAutoGabledHeightBand( ring, pointCloudSamples );
+    if ( !heightBand.success || heightBand.filteredHeights.size() < 20 )
+      return false;
+
+    const double extent = ringExtentSize( ring );
+    const double roofFloor = std::max( sortedPercentile( heightBand.filteredHeights, 0.35 ),
+                                      heightBand.baseHeight + std::max( 0.20, ( heightBand.ridgeHeight - heightBand.baseHeight ) * 0.16 ) );
+    QVector<QgsPoint> roofPoints;
+    QVector<double> offsets;
+    roofPoints.reserve( pointCloudSamples.size() );
+    offsets.reserve( pointCloudSamples.size() );
+    for ( const BuildingRoof::RoofSample &sample : pointCloudSamples )
+    {
+      const QgsPoint &point = sample.point;
+      if ( point.z() < roofFloor || point.z() < heightBand.lowHeight || point.z() > heightBand.highHeight )
+        continue;
+      if ( !pointInRing( ring, QgsPointXY( point.x(), point.y() ) ) )
+        continue;
+
+      roofPoints.append( point );
+      offsets.append( point.x() * normalX + point.y() * normalY );
+    }
+
+    if ( roofPoints.size() < 40 )
+      return false;
+
+    std::sort( offsets.begin(), offsets.end() );
+    const int minSideCount = std::max( 12, static_cast<int>( std::ceil( roofPoints.size() * 0.18 ) ) );
+    double bestScore = std::numeric_limits<double>::max();
+    QgsPoint bestRidgePoint;
+    double bestDirX = baseDirX;
+    double bestDirY = baseDirY;
+    GabledBoundarySlopePlanes bestBoundarySlopePlanes;
+    bool found = false;
+
+    QVector<double> splitPercentiles;
+    splitPercentiles << 0.35 << 0.40 << 0.45 << 0.50 << 0.55 << 0.60 << 0.65;
+    for ( double percentile : splitPercentiles )
+    {
+      const double splitOffset = sortedPercentile( offsets, percentile );
+      QVector<QgsPoint> firstSide;
+      QVector<QgsPoint> secondSide;
+      firstSide.reserve( roofPoints.size() );
+      secondSide.reserve( roofPoints.size() );
+      for ( const QgsPoint &point : roofPoints )
+      {
+        const double offset = point.x() * normalX + point.y() * normalY;
+        if ( offset <= splitOffset )
+          firstSide.append( point );
+        else
+          secondSide.append( point );
+      }
+
+      if ( firstSide.size() < minSideCount || secondSide.size() < minSideCount )
+        continue;
+
+      const LeastSquaresRoofPlane firstPlane = fitRobustRoofPlane( firstSide );
+      const LeastSquaresRoofPlane secondPlane = fitRobustRoofPlane( secondSide );
+      if ( !firstPlane.success || !secondPlane.success )
+        continue;
+
+      const double lineA = firstPlane.a - secondPlane.a;
+      const double lineB = firstPlane.b - secondPlane.b;
+      const double lineC = firstPlane.c - secondPlane.c;
+      const double lineLength = std::hypot( lineA, lineB );
+      if ( lineLength <= 1e-10 )
+        continue;
+
+      double dirX = -lineB / lineLength;
+      double dirY = lineA / lineLength;
+      const double alignment = std::fabs( dirX * baseDirX + dirY * baseDirY );
+      if ( alignment < 0.45 )
+        continue;
+      if ( dirX * baseDirX + dirY * baseDirY < 0.0 )
+      {
+        dirX = -dirX;
+        dirY = -dirY;
+      }
+
+      const double denominator = lineA * lineA + lineB * lineB;
+      const QgsPointXY lineOrigin( -lineA * lineC / denominator, -lineB * lineC / denominator );
+      const QVector<LineInterval> intervals = lineInsideRingIntervals( ring, lineOrigin, dirX, dirY );
+      if ( intervals.isEmpty() )
+        continue;
+
+      LineInterval bestInterval = intervals.first();
+      for ( const LineInterval &interval : intervals )
+      {
+        if ( interval.end - interval.start > bestInterval.end - bestInterval.start )
+          bestInterval = interval;
+      }
+      if ( bestInterval.end - bestInterval.start < std::max( 0.8, extent * 0.12 ) )
+        continue;
+
+      const QgsPointXY ridgeXY = pointOnLine( lineOrigin, dirX, dirY, ( bestInterval.start + bestInterval.end ) * 0.5 );
+      double ridgeHeight = 0.5 * ( roofPlaneZ( firstPlane, ridgeXY ) + roofPlaneZ( secondPlane, ridgeXY ) );
+      if ( !std::isfinite( ridgeHeight ) )
+        continue;
+      if ( ridgeHeight <= heightBand.baseHeight + std::max( 0.20, heightBand.binWidth ) )
+        continue;
+
+      const double balance = static_cast<double>( std::min( firstSide.size(), secondSide.size() ) ) / std::max( firstSide.size(), secondSide.size() );
+      const double ridgeHeightPenalty = std::fabs( ridgeHeight - heightBand.ridgeHeight ) / std::max( 0.30, heightBand.highHeight - heightBand.lowHeight );
+      const double score = ( firstPlane.rmse * firstSide.size() + secondPlane.rmse * secondSide.size() ) / roofPoints.size()
+                           + ridgeHeightPenalty * 0.35
+                           + ( 1.0 - alignment ) * 0.50
+                           + ( 1.0 - balance ) * 0.20;
+      if ( score < bestScore )
+      {
+        bestScore = score;
+        bestRidgePoint = QgsPoint( ridgeXY.x(), ridgeXY.y(), ridgeHeight );
+        bestDirX = dirX;
+        bestDirY = dirY;
+        bestBoundarySlopePlanes.success = true;
+        bestBoundarySlopePlanes.firstPlane = firstPlane;
+        bestBoundarySlopePlanes.secondPlane = secondPlane;
+        const double ridgeNormalX = -dirY;
+        const double ridgeNormalY = dirX;
+        bestBoundarySlopePlanes.firstPlaneSideSign = dominantSideSign( firstSide, bestRidgePoint, ridgeNormalX, ridgeNormalY );
+        bestBoundarySlopePlanes.secondPlaneSideSign = dominantSideSign( secondSide, bestRidgePoint, ridgeNormalX, ridgeNormalY );
+        bestBoundarySlopePlanes.hasSideSigns = bestBoundarySlopePlanes.firstPlaneSideSign * bestBoundarySlopePlanes.secondPlaneSideSign < 0.0;
+        found = true;
+      }
+    }
+
+    if ( !found )
+      return false;
+
+    ridgePoint = bestRidgePoint;
+    if ( ridgeDirX )
+      *ridgeDirX = bestDirX;
+    if ( ridgeDirY )
+      *ridgeDirY = bestDirY;
+    if ( boundarySlopePlanes )
+      *boundarySlopePlanes = bestBoundarySlopePlanes;
+    return true;
+  }
+
   bool topHeightRidgePointFromPointCloud( const QVector<QgsPointXY> &ring, const QVector<BuildingRoof::RoofSample> &pointCloudSamples, const QgsPoint &boundaryPoint, QgsPoint &ridgePoint, double *ridgeDirX = nullptr, double *ridgeDirY = nullptr )
   {
     QVector<QgsPoint> points;
@@ -2765,7 +3565,196 @@ namespace
     return true;
   }
 
-  QList<BuildingRoof::RoofPoint> topHeightGabledRoofPoints( const QVector<QgsPointXY> &ring, const QList<BuildingRoof::RoofPoint> &boundaries, const QList<BuildingRoof::RoofPoint> &ridges, const QVector<BuildingRoof::RoofSample> &pointCloudSamples )
+  struct LeastSquaresBentSegmentRidge
+  {
+    bool success = false;
+    QgsPoint point;
+    bool boundaryHeightSuccess = false;
+    double boundaryHeight = 0.0;
+    double score = 0.0;
+    int supportCount = 0;
+  };
+
+  LeastSquaresBentSegmentRidge fitLeastSquaresBentSegmentRidge( const QVector<QgsPointXY> &ring, const BentGableSegment &segment, const QVector<QgsPoint> &points, const QgsPoint &boundaryPoint )
+  {
+    LeastSquaresBentSegmentRidge result;
+    if ( points.size() < 24 )
+      return result;
+
+    QVector<QgsPoint> firstSide;
+    QVector<QgsPoint> secondSide;
+    firstSide.reserve( points.size() );
+    secondSide.reserve( points.size() );
+    for ( const QgsPoint &point : points )
+    {
+      const QgsPointXY pointXY( point.x(), point.y() );
+      const double along = lineParameter( segment.start, segment.dirX, segment.dirY, pointXY );
+      if ( along < -0.25 || along > segment.length + 0.25 )
+        continue;
+
+      const double distance = signedDistanceToLine( pointXY, segment.ridgePoint, segment.normalX, segment.normalY );
+      if ( std::fabs( distance ) < std::max( 0.08, ringExtentSize( ring ) * 0.002 ) )
+        continue;
+      if ( distance <= 0.0 )
+        firstSide.append( point );
+      else
+        secondSide.append( point );
+    }
+
+    const int minSideCount = std::max( 8, static_cast<int>( std::ceil( points.size() * 0.16 ) ) );
+    if ( firstSide.size() < minSideCount || secondSide.size() < minSideCount )
+      return result;
+
+    const LeastSquaresRoofPlane firstPlane = fitRobustRoofPlane( firstSide );
+    const LeastSquaresRoofPlane secondPlane = fitRobustRoofPlane( secondSide );
+    if ( !firstPlane.success || !secondPlane.success )
+      return result;
+
+    const double lineA = firstPlane.a - secondPlane.a;
+    const double lineB = firstPlane.b - secondPlane.b;
+    const double lineC = firstPlane.c - secondPlane.c;
+    const double lineLength = std::hypot( lineA, lineB );
+    if ( lineLength <= 1e-10 )
+      return result;
+
+    double intersectionDirX = -lineB / lineLength;
+    double intersectionDirY = lineA / lineLength;
+    const double alignment = std::fabs( intersectionDirX * segment.dirX + intersectionDirY * segment.dirY );
+    if ( alignment < 0.35 )
+      return result;
+
+    const QgsPointXY preferredPoint( ( segment.start.x() + segment.end.x() ) * 0.5, ( segment.start.y() + segment.end.y() ) * 0.5 );
+    const double denominator = lineA * lineA + lineB * lineB;
+    QgsPointXY fittedPoint( preferredPoint.x() - lineA * ( lineA * preferredPoint.x() + lineB * preferredPoint.y() + lineC ) / denominator,
+                            preferredPoint.y() - lineB * ( lineA * preferredPoint.x() + lineB * preferredPoint.y() + lineC ) / denominator );
+    if ( !pointInRing( ring, fittedPoint ) )
+      fittedPoint = pullPointInsideRing( ring, fittedPoint, preferredPoint );
+
+    const double fittedAlong = lineParameter( segment.start, segment.dirX, segment.dirY, fittedPoint );
+    const double clampedAlong = std::max( 0.0, std::min( segment.length, fittedAlong ) );
+    const double crossOffset = signedDistanceToLine( fittedPoint, segment.ridgePoint, segment.normalX, segment.normalY );
+    const double maxCrossOffset = std::max( 0.20, ringExtentSize( ring ) * 0.05 );
+    const double clampedCrossOffset = std::max( -maxCrossOffset, std::min( maxCrossOffset, crossOffset ) );
+    const QgsPointXY segmentPoint = pointOnLine( segment.start, segment.dirX, segment.dirY, clampedAlong );
+    fittedPoint = QgsPointXY( segmentPoint.x() + segment.normalX * clampedCrossOffset,
+                              segmentPoint.y() + segment.normalY * clampedCrossOffset );
+    fittedPoint = pullPointInsideRing( ring, fittedPoint, preferredPoint );
+
+    const double height = 0.5 * ( roofPlaneZ( firstPlane, fittedPoint ) + roofPlaneZ( secondPlane, fittedPoint ) );
+    if ( !std::isfinite( height ) )
+      return result;
+
+    result.success = true;
+    result.point = QgsPoint( fittedPoint.x(), fittedPoint.y(), height );
+    result.supportCount = firstSide.size() + secondSide.size();
+    const QgsPointXY boundaryXY( boundaryPoint.x(), boundaryPoint.y() );
+    const double boundaryAlong = lineParameter( segment.start, segment.dirX, segment.dirY, boundaryXY );
+    if ( boundaryAlong >= -0.50 && boundaryAlong <= segment.length + 0.50 )
+    {
+      const double boundaryDistance = signedDistanceToLine( boundaryXY, segment.ridgePoint, segment.normalX, segment.normalY );
+      const LeastSquaresRoofPlane &boundaryPlane = boundaryDistance <= 0.0 ? firstPlane : secondPlane;
+      const double boundaryHeight = roofPlaneZ( boundaryPlane, boundaryXY );
+      if ( std::isfinite( boundaryHeight ) && boundaryHeight > 0.0 && boundaryHeight < height )
+      {
+        result.boundaryHeightSuccess = true;
+        result.boundaryHeight = boundaryHeight;
+      }
+    }
+    result.score = ( firstPlane.rmse * firstSide.size() + secondPlane.rmse * secondSide.size() ) / std::max( 1, result.supportCount )
+                   + ( 1.0 - alignment ) * 0.35;
+    return result;
+  }
+
+  bool leastSquaresBentGabledRidgePointFromPointCloud( const QVector<QgsPointXY> &inputRing, const QVector<BuildingRoof::RoofSample> &pointCloudSamples, const QgsPoint &boundaryPoint, QgsPoint &ridgePoint, double *ridgeDirX = nullptr, double *ridgeDirY = nullptr, double *boundaryHeightFromSlope = nullptr )
+  {
+    double dirX = 0.0;
+    double dirY = 0.0;
+    if ( !nearestEdgeDirection( inputRing, boundaryPoint, dirX, dirY ) )
+      return false;
+
+    QgsPoint roughRidgePoint;
+    if ( !topHeightBentRidgePointFromPointCloud( inputRing, pointCloudSamples, boundaryPoint, roughRidgePoint ) )
+      return false;
+
+    const BentGableLayout layout = findBentGabledLayout( inputRing, QgsPointXY( roughRidgePoint.x(), roughRidgePoint.y() ), dirX, dirY );
+    if ( !layout.success )
+      return false;
+
+    QVector<QgsPointXY> ring = ringWithInsertedBoundaryPoints( inputRing, QVector<QgsPointXY>{ layout.primaryEnd, layout.secondaryEnd } );
+    BentGableSegment primarySegment;
+    BentGableSegment secondarySegment;
+    if ( !makeBentSegment( layout.primaryEnd, layout.bend, roughRidgePoint.z(), ring, boundaryPoint, primarySegment ) )
+      return false;
+    if ( !makeBentSegment( layout.bend, layout.secondaryEnd, roughRidgePoint.z(), ring, boundaryPoint, secondarySegment ) )
+      return false;
+
+    const AutoHeightBand heightBand = inferAutoGabledHeightBand( ring, pointCloudSamples );
+    if ( !heightBand.success || heightBand.filteredHeights.size() < 20 )
+      return false;
+
+    const double roofFloor = std::max( sortedPercentile( heightBand.filteredHeights, 0.35 ),
+                                      heightBand.baseHeight + std::max( 0.20, ( heightBand.ridgeHeight - heightBand.baseHeight ) * 0.16 ) );
+    const QgsPointXY splitXY( layout.bend.x(), layout.bend.y() );
+    const double primarySide = signedDistanceToLine( layout.primaryEnd, QgsPoint( splitXY.x(), splitXY.y(), roughRidgePoint.z() ), layout.splitNormalX, layout.splitNormalY );
+    if ( std::fabs( primarySide ) <= 1e-8 )
+      return false;
+
+    QVector<QgsPoint> primaryPoints;
+    QVector<QgsPoint> secondaryPoints;
+    primaryPoints.reserve( pointCloudSamples.size() );
+    secondaryPoints.reserve( pointCloudSamples.size() );
+    for ( const BuildingRoof::RoofSample &sample : pointCloudSamples )
+    {
+      const QgsPoint &point = sample.point;
+      const QgsPointXY pointXY( point.x(), point.y() );
+      if ( point.z() < roofFloor || point.z() < heightBand.lowHeight || point.z() > heightBand.highHeight )
+        continue;
+      if ( !pointInRing( ring, pointXY ) )
+        continue;
+
+      const double splitSide = signedDistanceToLine( pointXY, QgsPoint( splitXY.x(), splitXY.y(), roughRidgePoint.z() ), layout.splitNormalX, layout.splitNormalY );
+      if ( splitSide * primarySide >= 0.0 )
+        primaryPoints.append( point );
+      else
+        secondaryPoints.append( point );
+    }
+
+    const LeastSquaresBentSegmentRidge primaryRidge = fitLeastSquaresBentSegmentRidge( ring, primarySegment, primaryPoints, boundaryPoint );
+    const LeastSquaresBentSegmentRidge secondaryRidge = fitLeastSquaresBentSegmentRidge( ring, secondarySegment, secondaryPoints, boundaryPoint );
+    if ( !primaryRidge.success || !secondaryRidge.success )
+      return false;
+
+    const double weightedHeight = ( primaryRidge.point.z() * primaryRidge.supportCount + secondaryRidge.point.z() * secondaryRidge.supportCount )
+                                  / std::max( 1, primaryRidge.supportCount + secondaryRidge.supportCount );
+    if ( weightedHeight <= heightBand.baseHeight + std::max( 0.20, heightBand.binWidth ) )
+      return false;
+
+    ridgePoint = QgsPoint( primaryRidge.point.x(), primaryRidge.point.y(), weightedHeight );
+    if ( ridgeDirX )
+      *ridgeDirX = dirX;
+    if ( ridgeDirY )
+      *ridgeDirY = dirY;
+    if ( boundaryHeightFromSlope )
+    {
+      double heightSum = 0.0;
+      int heightWeight = 0;
+      if ( primaryRidge.boundaryHeightSuccess )
+      {
+        heightSum += primaryRidge.boundaryHeight * primaryRidge.supportCount;
+        heightWeight += primaryRidge.supportCount;
+      }
+      if ( secondaryRidge.boundaryHeightSuccess )
+      {
+        heightSum += secondaryRidge.boundaryHeight * secondaryRidge.supportCount;
+        heightWeight += secondaryRidge.supportCount;
+      }
+      if ( heightWeight > 0 )
+        *boundaryHeightFromSlope = heightSum / heightWeight;
+    }
+    return true;
+  }
+
+  QList<BuildingRoof::RoofPoint> topHeightGabledRoofPoints( const QVector<QgsPointXY> &ring, const QList<BuildingRoof::RoofPoint> &boundaries, const QList<BuildingRoof::RoofPoint> &ridges, const QVector<BuildingRoof::RoofSample> &pointCloudSamples, GabledBoundarySlopePlanes *slopePlanesOut = nullptr, double *ridgeDirXOut = nullptr, double *ridgeDirYOut = nullptr )
   {
     QList<BuildingRoof::RoofPoint> points;
     if ( boundaries.size() != 1 || ( ridges.size() != 1 && ridges.size() != 3 ) )
@@ -2774,9 +3763,21 @@ namespace
     QgsPoint ridgePoint;
     double ridgeDirX = 0.0;
     double ridgeDirY = 0.0;
-    const bool ridgePointFound = ridges.size() == 3
-                                   ? topHeightBentRidgePointFromPointCloud( ring, pointCloudSamples, boundaries.first().point, ridgePoint, &ridgeDirX, &ridgeDirY )
-                                   : topHeightRidgePointFromPointCloud( ring, pointCloudSamples, boundaries.first().point, ridgePoint, &ridgeDirX, &ridgeDirY );
+    GabledBoundarySlopePlanes boundarySlopePlanes;
+    double bentBoundaryHeightFromSlope = std::numeric_limits<double>::quiet_NaN();
+    bool ridgePointFound = false;
+    if ( ridges.size() == 3 )
+    {
+      ridgePointFound = leastSquaresBentGabledRidgePointFromPointCloud( ring, pointCloudSamples, boundaries.first().point, ridgePoint, &ridgeDirX, &ridgeDirY, &bentBoundaryHeightFromSlope );
+      if ( !ridgePointFound )
+        ridgePointFound = topHeightBentRidgePointFromPointCloud( ring, pointCloudSamples, boundaries.first().point, ridgePoint, &ridgeDirX, &ridgeDirY );
+    }
+    else
+    {
+      ridgePointFound = leastSquaresGabledRidgePointFromPointCloud( ring, pointCloudSamples, boundaries.first().point, ridgePoint, &ridgeDirX, &ridgeDirY, &boundarySlopePlanes );
+      if ( !ridgePointFound )
+        ridgePointFound = topHeightRidgePointFromPointCloud( ring, pointCloudSamples, boundaries.first().point, ridgePoint, &ridgeDirX, &ridgeDirY );
+    }
     if ( !ridgePointFound )
       return points;
 
@@ -2793,10 +3794,29 @@ namespace
     {
       boundaryPoint = boundaries.first().point;
     }
+
+    double slopeBoundaryHeight = std::numeric_limits<double>::quiet_NaN();
+    if ( ridges.size() == 3 )
+    {
+      slopeBoundaryHeight = bentBoundaryHeightFromSlope;
+    }
+    else if ( boundarySlopePlanes.success )
+    {
+      slopeBoundaryHeight = chooseBoundarySlopeHeight( boundarySlopePlanes, boundaryPoint, ridgePoint, ringExtentSize( ring ) );
+    }
+    refineBoundaryPointHeightFromSlopePlane( boundaryPoint, slopeBoundaryHeight, ridgePoint, ringExtentSize( ring ) );
+
     points.append( BuildingRoof::RoofPoint{ boundaryPoint, boundaries.first().type } );
     points.append( BuildingRoof::RoofPoint{ ridgePoint, ridges.first().type } );
     for ( int i = 1; i < ridges.size(); ++i )
       points.append( ridges.at( i ) );
+
+    if ( slopePlanesOut && ridges.size() != 3 && boundarySlopePlanes.success )
+      *slopePlanesOut = boundarySlopePlanes;
+    if ( ridgeDirXOut )
+      *ridgeDirXOut = ridgeDirX;
+    if ( ridgeDirYOut )
+      *ridgeDirYOut = ridgeDirY;
     return points;
   }
 
@@ -2986,6 +4006,1300 @@ namespace
     return true;
   }
 
+  bool fitHippedRidgeCandidateOnKnownLine( const QVector<QgsPointXY> &ring, const QVector<QgsPoint> &roofPoints, const QVector<QgsPoint> &highPoints, const QgsPoint &ridgePoint, double dirX, double dirY, double fallbackRidgeHeight, AutoHippedRidge &candidate, double &score )
+  {
+    if ( highPoints.size() < 8 )
+      return false;
+
+    const double dirLength = std::hypot( dirX, dirY );
+    if ( dirLength <= 1e-10 )
+      return false;
+    dirX /= dirLength;
+    dirY /= dirLength;
+    const double normalX = -dirY;
+    const double normalY = dirX;
+    const double extent = ringExtentSize( ring );
+    const QgsPointXY lineOrigin( ridgePoint.x(), ridgePoint.y() );
+
+    const QVector<LineInterval> intervals = lineInsideRingIntervals( ring, lineOrigin, dirX, dirY );
+    if ( intervals.isEmpty() )
+      return false;
+
+    LineInterval bestInterval = intervals.first();
+    bool foundZeroInterval = false;
+    for ( const LineInterval &interval : intervals )
+    {
+      if ( intervalContains( interval, 0.0 ) )
+      {
+        bestInterval = interval;
+        foundZeroInterval = true;
+        break;
+      }
+      if ( !foundZeroInterval && interval.end - interval.start > bestInterval.end - bestInterval.start )
+        bestInterval = interval;
+    }
+
+    const double intervalLength = bestInterval.end - bestInterval.start;
+    if ( intervalLength < std::max( 1.0, extent * 0.12 ) )
+      return false;
+
+    const double trim = std::min( intervalLength * 0.24, std::max( 0.35, extent * 0.08 ) );
+    const double minT = bestInterval.start + trim;
+    const double maxT = bestInterval.end - trim;
+    if ( maxT <= minT + 1e-6 )
+      return false;
+
+    QVector<double> parameters;
+    QVector<double> heights;
+    QVector<HippedRidgeBandSample> bandSamples;
+    parameters.reserve( highPoints.size() );
+    heights.reserve( highPoints.size() );
+    bandSamples.reserve( highPoints.size() );
+    const double tolerance = std::max( 0.24, std::min( 0.75, extent * 0.025 ) );
+    for ( const QgsPoint &point : highPoints )
+    {
+      const QgsPointXY pointXY( point.x(), point.y() );
+      const double sideDistance = signedDistanceToLine( pointXY, ridgePoint, normalX, normalY );
+      if ( std::fabs( sideDistance ) > tolerance )
+        continue;
+
+      const double parameter = lineParameter( lineOrigin, dirX, dirY, pointXY );
+      if ( parameter < bestInterval.start - tolerance || parameter > bestInterval.end + tolerance )
+        continue;
+
+      parameters.append( parameter );
+      heights.append( point.z() );
+      bandSamples.append( HippedRidgeBandSample{ parameter, pointXY, point.z() } );
+    }
+
+    const int minSupport = std::max( 6, highPoints.size() / 20 );
+    if ( parameters.size() < minSupport || bandSamples.size() < 6 )
+      return false;
+
+    std::sort( parameters.begin(), parameters.end() );
+    std::sort( heights.begin(), heights.end() );
+    std::sort( bandSamples.begin(), bandSamples.end(), []( const HippedRidgeBandSample &left, const HippedRidgeBandSample &right ) {
+      return left.t < right.t;
+    } );
+
+    const double preferredT = sortedPercentile( parameters, 0.50 );
+    const double fallbackStartT = sortedPercentile( parameters, 0.12 );
+    const double fallbackEndT = sortedPercentile( parameters, 0.88 );
+    double startT = averagedHippedRidgeEndParameter( bandSamples, true, lineOrigin, dirX, dirY, fallbackStartT, minT, maxT );
+    double endT = averagedHippedRidgeEndParameter( bandSamples, false, lineOrigin, dirX, dirY, fallbackEndT, minT, maxT );
+    if ( endT < startT )
+      std::swap( startT, endT );
+
+    const double ridgeHeight = upperWeightedMean( heights, 0.55, 0.92, fallbackRidgeHeight );
+    const double candidateHeight = std::isfinite( ridgePoint.z() ) && ridgePoint.z() > 0.0
+                                     ? ridgePoint.z()
+                                     : ridgeHeight;
+
+    const double footprintHalfWidth = [&]() {
+      double halfWidth = 0.0;
+      for ( const QgsPointXY &ringPoint : ring )
+        halfWidth = std::max( halfWidth, std::fabs( signedDistanceToLine( ringPoint, ridgePoint, normalX, normalY ) ) );
+      return halfWidth;
+    }();
+
+    if ( roofPoints.size() >= 24 && footprintHalfWidth > 1e-8 )
+    {
+      const double endpointBand = std::max( 0.35, std::min( intervalLength * 0.18, extent * 0.10 ) );
+      const double endFaceWidthTolerance = std::max( 0.20, footprintHalfWidth * 0.08 );
+      QVector<QgsPoint> startEndPoints;
+      QVector<QgsPoint> finishEndPoints;
+      startEndPoints.reserve( roofPoints.size() / 2 );
+      finishEndPoints.reserve( roofPoints.size() / 2 );
+
+      for ( const QgsPoint &point : roofPoints )
+      {
+        const QgsPointXY pointXY( point.x(), point.y() );
+        const double along = lineParameter( lineOrigin, dirX, dirY, pointXY );
+        const double sideDistance = std::fabs( signedDistanceToLine( pointXY, ridgePoint, normalX, normalY ) );
+        const double startFaceWidth = footprintHalfWidth * std::max( 0.0, std::min( 1.0, ( startT + endpointBand - along ) / ( std::max( 0.30, startT - bestInterval.start ) + endpointBand ) ) ) + endFaceWidthTolerance;
+        const double finishFaceWidth = footprintHalfWidth * std::max( 0.0, std::min( 1.0, ( along - ( endT - endpointBand ) ) / ( std::max( 0.30, bestInterval.end - endT ) + endpointBand ) ) ) + endFaceWidthTolerance;
+        if ( along >= bestInterval.start - endpointBand * 0.35 && along <= startT + endpointBand && sideDistance <= startFaceWidth )
+          startEndPoints.append( point );
+        if ( along >= endT - endpointBand && along <= bestInterval.end + endpointBand * 0.35 && sideDistance <= finishFaceWidth )
+          finishEndPoints.append( point );
+      }
+
+      const int minEndPlaneCount = std::max( 8, static_cast<int>( std::ceil( roofPoints.size() * 0.035 ) ) );
+      if ( startEndPoints.size() >= minEndPlaneCount && finishEndPoints.size() >= minEndPlaneCount )
+      {
+        const LeastSquaresRoofPlane startPlane = fitRobustRoofPlane( startEndPoints );
+        const LeastSquaresRoofPlane finishPlane = fitRobustRoofPlane( finishEndPoints );
+        const double startDenominator = startPlane.a * dirX + startPlane.b * dirY;
+        const double finishDenominator = finishPlane.a * dirX + finishPlane.b * dirY;
+        if ( startPlane.success && finishPlane.success
+             && startDenominator > 1e-8 && finishDenominator < -1e-8 )
+        {
+          const double fittedStartT = ( candidateHeight - startPlane.a * lineOrigin.x() - startPlane.b * lineOrigin.y() - startPlane.c ) / startDenominator;
+          const double fittedEndT = ( candidateHeight - finishPlane.a * lineOrigin.x() - finishPlane.b * lineOrigin.y() - finishPlane.c ) / finishDenominator;
+          const double endpointTolerance = std::max( 0.45, std::min( intervalLength * 0.22, extent * 0.14 ) );
+          if ( std::isfinite( fittedStartT ) && fittedStartT >= minT - endpointTolerance && fittedStartT <= maxT + endpointTolerance )
+            startT = std::max( minT, std::min( maxT, fittedStartT * 0.80 + startT * 0.20 ) );
+          if ( std::isfinite( fittedEndT ) && fittedEndT >= minT - endpointTolerance && fittedEndT <= maxT + endpointTolerance )
+            endT = std::max( minT, std::min( maxT, fittedEndT * 0.80 + endT * 0.20 ) );
+          if ( endT < startT )
+            std::swap( startT, endT );
+
+        }
+      }
+    }
+
+    const double minRidgeLength = std::max( 0.70, intervalLength * 0.12 );
+    if ( endT - startT < minRidgeLength )
+    {
+      const double centerT = std::max( minT, std::min( maxT, preferredT ) );
+      startT = std::max( minT, centerT - minRidgeLength * 0.5 );
+      endT = std::min( maxT, centerT + minRidgeLength * 0.5 );
+      if ( endT - startT < minRidgeLength * 0.65 )
+        return false;
+    }
+
+    const double maxRidgeLength = ( maxT - minT ) * 0.96;
+    if ( endT - startT > maxRidgeLength )
+    {
+      const double centerT = ( startT + endT ) * 0.5;
+      startT = std::max( minT, centerT - maxRidgeLength * 0.5 );
+      endT = std::min( maxT, centerT + maxRidgeLength * 0.5 );
+    }
+
+    const QgsPointXY firstXY = pointOnLine( lineOrigin, dirX, dirY, startT );
+    const QgsPointXY secondXY = pointOnLine( lineOrigin, dirX, dirY, endT );
+    if ( !pointInRing( ring, firstXY ) || !pointInRing( ring, secondXY ) )
+      return false;
+
+    candidate.success = true;
+    candidate.firstPoint = QgsPoint( firstXY.x(), firstXY.y(), candidateHeight );
+    candidate.secondPoint = QgsPoint( secondXY.x(), secondXY.y(), candidate.firstPoint.z() );
+    candidate.dirX = dirX;
+    candidate.dirY = dirY;
+    candidate.preferredGabledSeed = true;
+
+    const double observedLength = sortedPercentile( parameters, 0.95 ) - sortedPercentile( parameters, 0.05 );
+    const double ridgeLengthScore = std::max( 0.1, std::min( 1.0, ( endT - startT ) / std::max( intervalLength, 1e-8 ) ) );
+    const double supportScore = static_cast<double>( parameters.size() ) / highPoints.size();
+    score = parameters.size() * ridgeLengthScore * std::min( 2.0, observedLength / std::max( 1.0, extent * 0.15 ) ) * std::max( 0.25, supportScore ) + 1000.0;
+    return true;
+  }
+
+  LeastSquaresRoofPlane averagedRoofPlane( const LeastSquaresRoofPlane &firstPlane, const LeastSquaresRoofPlane &secondPlane )
+  {
+    LeastSquaresRoofPlane plane;
+    if ( !firstPlane.success || !secondPlane.success )
+      return plane;
+
+    plane.success = true;
+    plane.a = ( firstPlane.a + secondPlane.a ) * 0.5;
+    plane.b = ( firstPlane.b + secondPlane.b ) * 0.5;
+    plane.c = ( firstPlane.c + secondPlane.c ) * 0.5;
+    plane.rmse = ( firstPlane.rmse + secondPlane.rmse ) * 0.5;
+    plane.count = firstPlane.count + secondPlane.count;
+    return plane;
+  }
+
+  bool planeIntersectionParameterOnLine( const LeastSquaresRoofPlane &ridgePlane, const LeastSquaresRoofPlane &endPlane, const QgsPointXY &lineOrigin, double dirX, double dirY, double &t )
+  {
+    if ( !ridgePlane.success || !endPlane.success )
+      return false;
+
+    const double diffA = ridgePlane.a - endPlane.a;
+    const double diffB = ridgePlane.b - endPlane.b;
+    const double diffC = ridgePlane.c - endPlane.c;
+    const double denominator = diffA * dirX + diffB * dirY;
+    if ( std::fabs( denominator ) <= 1e-10 )
+      return false;
+
+    const double numerator = diffA * lineOrigin.x() + diffB * lineOrigin.y() + diffC;
+    t = -numerator / denominator;
+    return std::isfinite( t );
+  }
+
+  double averagedFiniteHeight( const QVector<double> &heights, double fallbackHeight )
+  {
+    double sum = 0.0;
+    int count = 0;
+    for ( double height : heights )
+    {
+      if ( std::isfinite( height ) && height > 0.0 )
+      {
+        sum += height;
+        ++count;
+      }
+    }
+    return count > 0 ? sum / count : fallbackHeight;
+  }
+
+  QVector<HippedNormalRoofSample> estimateHippedRoofNormalSamples( const QVector<QgsPoint> &roofPoints, double extent )
+  {
+    QVector<HippedNormalRoofSample> normalSamples;
+    if ( roofPoints.size() < 16 )
+      return normalSamples;
+
+    const int maxCenters = 3600;
+    const int centerStride = std::max( 1, static_cast<int>( std::ceil( static_cast<double>( roofPoints.size() ) / maxCenters ) ) );
+    const double neighborRadius = std::min( 1.30, std::max( 0.45, extent * 0.024 ) );
+    const double neighborRadius2 = neighborRadius * neighborRadius;
+    const int minNeighbors = roofPoints.size() < 80 ? 7 : 9;
+    normalSamples.reserve( std::min( roofPoints.size(), maxCenters ) );
+
+    for ( int i = 0; i < roofPoints.size(); i += centerStride )
+    {
+      const QgsPoint &center = roofPoints.at( i );
+      QVector<QgsPoint> neighbors;
+      neighbors.reserve( 48 );
+      for ( const QgsPoint &neighbor : roofPoints )
+      {
+        const double dx = neighbor.x() - center.x();
+        const double dy = neighbor.y() - center.y();
+        if ( dx * dx + dy * dy <= neighborRadius2 )
+          neighbors.append( neighbor );
+      }
+
+      if ( neighbors.size() < minNeighbors )
+        continue;
+
+      const LeastSquaresRoofPlane localPlane = fitLeastSquaresRoofPlane( neighbors );
+      if ( !localPlane.success )
+        continue;
+
+      const double localThreshold = std::max( 0.12, std::min( 0.42, robustPlaneThreshold( neighbors ) * 1.35 ) );
+      if ( localPlane.rmse > localThreshold )
+        continue;
+
+      double nx = -localPlane.a;
+      double ny = -localPlane.b;
+      double nz = 1.0;
+      const double length = std::sqrt( nx * nx + ny * ny + nz * nz );
+      if ( length <= 1e-10 )
+        continue;
+      nx /= length;
+      ny /= length;
+      nz /= length;
+      if ( nz < 0.42 )
+        continue;
+
+      const double horizontalLength = std::hypot( nx, ny );
+      if ( horizontalLength < 0.035 )
+        continue;
+
+      normalSamples.append( HippedNormalRoofSample{ center, nx / horizontalLength, ny / horizontalLength, nz } );
+    }
+
+    return normalSamples;
+  }
+
+  int hippedNormalGroup( const HippedNormalRoofSample &sample, double dirX, double dirY, double normalX, double normalY )
+  {
+    const double scores[4] = {
+      sample.horizontalNormalX * normalX + sample.horizontalNormalY * normalY,
+      -( sample.horizontalNormalX * normalX + sample.horizontalNormalY * normalY ),
+      -( sample.horizontalNormalX * dirX + sample.horizontalNormalY * dirY ),
+      sample.horizontalNormalX * dirX + sample.horizontalNormalY * dirY
+    };
+
+    int bestIndex = -1;
+    double bestScore = 0.0;
+    for ( int i = 0; i < 4; ++i )
+    {
+      if ( scores[i] > bestScore )
+      {
+        bestScore = scores[i];
+        bestIndex = i;
+      }
+    }
+
+    return bestScore >= 0.38 ? bestIndex : -1;
+  }
+
+  bool refineHippedRidgeWithLeastSquaresPlanes( const QVector<QgsPointXY> &ring, const QVector<BuildingRoof::RoofSample> &pointCloudSamples, const AutoHeightBand &heightBand, const AutoHippedRidge &roughRidge, AutoHippedRidge &refinedRidge )
+  {
+    if ( !roughRidge.success || ring.size() < 3 || pointCloudSamples.size() < 40 )
+      return false;
+
+    double dirX = roughRidge.dirX;
+    double dirY = roughRidge.dirY;
+    const double dirLength = std::hypot( dirX, dirY );
+    if ( dirLength <= 1e-10 )
+      return false;
+    dirX /= dirLength;
+    dirY /= dirLength;
+    const double normalX = -dirY;
+    const double normalY = dirX;
+    const double extent = ringExtentSize( ring );
+
+    QgsPointXY roughStart( roughRidge.firstPoint.x(), roughRidge.firstPoint.y() );
+    QgsPointXY roughEnd( roughRidge.secondPoint.x(), roughRidge.secondPoint.y() );
+    if ( lineParameter( roughStart, dirX, dirY, roughEnd ) < 0.0 )
+      std::swap( roughStart, roughEnd );
+
+    const double roughLength = lineParameter( roughStart, dirX, dirY, roughEnd );
+    if ( roughLength < std::max( 0.70, extent * 0.08 ) )
+      return false;
+
+    const QVector<LineInterval> roughIntervals = lineInsideRingIntervals( ring, roughStart, dirX, dirY );
+    if ( roughIntervals.isEmpty() )
+      return false;
+
+    const double roughMidT = roughLength * 0.5;
+    LineInterval ridgeInterval = roughIntervals.first();
+    bool foundInterval = false;
+    for ( const LineInterval &interval : roughIntervals )
+    {
+      if ( intervalContains( interval, roughMidT ) )
+      {
+        ridgeInterval = interval;
+        foundInterval = true;
+        break;
+      }
+      if ( !foundInterval && interval.end - interval.start > ridgeInterval.end - ridgeInterval.start )
+        ridgeInterval = interval;
+    }
+
+    const double intervalLength = ridgeInterval.end - ridgeInterval.start;
+    if ( intervalLength < std::max( 1.0, extent * 0.12 ) )
+      return false;
+
+    const double trim = std::min( intervalLength * 0.24, std::max( 0.35, extent * 0.08 ) );
+    const double minT = ridgeInterval.start + trim;
+    const double maxT = ridgeInterval.end - trim;
+    if ( maxT <= minT + 1e-6 )
+      return false;
+
+    const double roughRidgeHeight = ( roughRidge.firstPoint.z() + roughRidge.secondPoint.z() ) * 0.5;
+    const double roofFloor = std::max( sortedPercentile( heightBand.filteredHeights, 0.35 ),
+                                      heightBand.baseHeight + std::max( 0.20, ( roughRidgeHeight - heightBand.baseHeight ) * 0.16 ) );
+    double footprintHalfWidth = 0.0;
+    for ( const QgsPointXY &ringPoint : ring )
+      footprintHalfWidth = std::max( footprintHalfWidth, std::fabs( signedDistanceToLine( ringPoint, QgsPoint( roughStart.x(), roughStart.y(), roughRidgeHeight ), normalX, normalY ) ) );
+    if ( footprintHalfWidth <= 1e-8 )
+      return false;
+
+    const double ridgeWeightRadius = std::max( 0.28, std::min( 0.90, extent * 0.045 ) );
+    QVector<double> rawInsideHeights;
+    QVector<double> rawRidgeHeights;
+    rawInsideHeights.reserve( pointCloudSamples.size() );
+    rawRidgeHeights.reserve( pointCloudSamples.size() / 8 );
+    for ( const BuildingRoof::RoofSample &sample : pointCloudSamples )
+    {
+      const QgsPoint &point = sample.point;
+      if ( !std::isfinite( point.z() ) )
+        continue;
+      const QgsPointXY pointXY( point.x(), point.y() );
+      if ( !pointInRing( ring, pointXY ) )
+        continue;
+      rawInsideHeights.append( point.z() );
+      if ( pointSegmentDistance2( pointXY, roughStart, roughEnd ) <= std::pow( ridgeWeightRadius * 1.35, 2.0 ) )
+        rawRidgeHeights.append( point.z() );
+    }
+    std::sort( rawInsideHeights.begin(), rawInsideHeights.end() );
+    std::sort( rawRidgeHeights.begin(), rawRidgeHeights.end() );
+
+    const double endpointInwardBand = std::max( 0.24, std::min( roughLength * 0.10, extent * 0.05 ) );
+    const double endpointOuterTolerance = std::max( 0.15, extent * 0.015 );
+    const double startSpan = std::max( 0.30, -ridgeInterval.start );
+    const double finishSpan = std::max( 0.30, ridgeInterval.end - roughLength );
+    const double endFaceWidthTolerance = std::max( 0.20, footprintHalfWidth * 0.08 );
+    const double sideStart = std::min( roughLength * 0.35, std::max( endpointInwardBand * 1.60, extent * 0.06 ) );
+    const double sideEnd = roughLength - sideStart;
+
+    QVector<QgsPoint> positiveSidePoints;
+    QVector<QgsPoint> negativeSidePoints;
+    QVector<QgsPoint> startEndPoints;
+    QVector<QgsPoint> finishEndPoints;
+    QVector<QgsPoint> roofCandidatePoints;
+    roofCandidatePoints.reserve( pointCloudSamples.size() );
+
+    for ( const BuildingRoof::RoofSample &sample : pointCloudSamples )
+    {
+      const QgsPoint &point = sample.point;
+      if ( point.z() < roofFloor || point.z() < heightBand.lowHeight || point.z() > heightBand.highHeight )
+        continue;
+      const QgsPointXY pointXY( point.x(), point.y() );
+      if ( !pointInRing( ring, pointXY ) )
+        continue;
+
+      roofCandidatePoints.append( point );
+    }
+
+    if ( roofCandidatePoints.size() < 40 )
+      return false;
+
+    const QVector<HippedNormalRoofSample> normalSamples = estimateHippedRoofNormalSamples( roofCandidatePoints, extent );
+    if ( normalSamples.size() < 24 )
+      return false;
+
+    positiveSidePoints.reserve( normalSamples.size() );
+    negativeSidePoints.reserve( normalSamples.size() );
+    startEndPoints.reserve( normalSamples.size() );
+    finishEndPoints.reserve( normalSamples.size() );
+
+    for ( const HippedNormalRoofSample &sample : normalSamples )
+    {
+      const QgsPoint &point = sample.point;
+      const QgsPointXY pointXY( point.x(), point.y() );
+      const double along = lineParameter( roughStart, dirX, dirY, pointXY );
+      const double sideDistance = signedDistanceToLine( pointXY, QgsPoint( roughStart.x(), roughStart.y(), roughRidgeHeight ), normalX, normalY );
+      const double absSideDistance = std::fabs( sideDistance );
+      const double startFaceWidth = footprintHalfWidth * std::max( 0.0, std::min( 1.0, ( endpointInwardBand - along ) / ( startSpan + endpointInwardBand ) ) ) + endFaceWidthTolerance;
+      const double finishFaceWidth = footprintHalfWidth * std::max( 0.0, std::min( 1.0, ( along - ( roughLength - endpointInwardBand ) ) / ( finishSpan + endpointInwardBand ) ) ) + endFaceWidthTolerance;
+      const int normalGroup = hippedNormalGroup( sample, dirX, dirY, normalX, normalY );
+      if ( normalGroup == 2 && along >= ridgeInterval.start - endpointOuterTolerance && along <= endpointInwardBand && absSideDistance <= startFaceWidth )
+        startEndPoints.append( point );
+      if ( normalGroup == 3 && along >= roughLength - endpointInwardBand && along <= ridgeInterval.end + endpointOuterTolerance && absSideDistance <= finishFaceWidth )
+        finishEndPoints.append( point );
+      if ( along >= sideStart && along <= sideEnd )
+      {
+        if ( normalGroup == 0 && sideDistance >= 0.0 )
+          positiveSidePoints.append( point );
+        else if ( normalGroup == 1 && sideDistance < 0.0 )
+          negativeSidePoints.append( point );
+      }
+    }
+
+    const int minSideCount = std::max( 12, static_cast<int>( std::ceil( ( positiveSidePoints.size() + negativeSidePoints.size() ) * 0.10 ) ) );
+    if ( positiveSidePoints.size() < minSideCount || negativeSidePoints.size() < minSideCount || startEndPoints.size() < 10 || finishEndPoints.size() < 10 )
+      return false;
+
+    LeastSquaresRoofPlane positivePlane = fitRobustRoofPlane( positiveSidePoints );
+    LeastSquaresRoofPlane negativePlane = fitRobustRoofPlane( negativeSidePoints );
+    LeastSquaresRoofPlane startPlane = fitRobustRoofPlane( startEndPoints );
+    LeastSquaresRoofPlane finishPlane = fitRobustRoofPlane( finishEndPoints );
+    if ( !positivePlane.success || !negativePlane.success || !startPlane.success || !finishPlane.success )
+      return false;
+    double startSlopeAlong = startPlane.a * dirX + startPlane.b * dirY;
+    double finishSlopeAlong = finishPlane.a * dirX + finishPlane.b * dirY;
+    if ( startSlopeAlong <= 1e-5 || finishSlopeAlong >= -1e-5 )
+      return false;
+    double positiveSideSlope = positivePlane.a * normalX + positivePlane.b * normalY;
+    double negativeSideSlope = negativePlane.a * normalX + negativePlane.b * normalY;
+    if ( positiveSideSlope >= -1e-5 || negativeSideSlope <= 1e-5 )
+      return false;
+
+    const double sideLineA = positivePlane.a - negativePlane.a;
+    const double sideLineB = positivePlane.b - negativePlane.b;
+    const double sideLineLength = std::hypot( sideLineA, sideLineB );
+    if ( sideLineLength <= 1e-10 )
+      return false;
+
+    double fittedDirX = -sideLineB / sideLineLength;
+    double fittedDirY = sideLineA / sideLineLength;
+    const double alignment = std::fabs( fittedDirX * dirX + fittedDirY * dirY );
+    if ( alignment < 0.45 )
+      return false;
+
+    const QgsPointXY roughLineOrigin = roughStart;
+    const double ridgeDirX = dirX;
+    const double ridgeDirY = dirY;
+    const double roughStartT = 0.0;
+    const double roughEndT = roughLength;
+
+    const LeastSquaresRoofPlane ridgePlane = averagedRoofPlane( positivePlane, negativePlane );
+    double startT = std::max( minT, std::min( maxT, roughStartT ) );
+    double endT = std::max( minT, std::min( maxT, roughEndT ) );
+    double planeStartT = startT;
+    double planeEndT = endT;
+    const double maxEndpointMove = std::max( 0.45, std::min( roughLength * 0.22, extent * 0.12 ) );
+    const double maxLineMove = std::max( 0.25, std::min( footprintHalfWidth * 0.28, extent * 0.10 ) );
+    double seedLineOffset = 0.0;
+    double preferredLineOffset = 0.0;
+    const double sideOffsetDenominator = sideLineA * normalX + sideLineB * normalY;
+    if ( std::fabs( sideOffsetDenominator ) > 1e-10 )
+    {
+      const QgsPointXY roughMidPoint = pointOnLine( roughLineOrigin, ridgeDirX, ridgeDirY, roughMidT );
+      const double sideOffsetNumerator = sideLineA * roughMidPoint.x() + sideLineB * roughMidPoint.y() + positivePlane.c - negativePlane.c;
+      const double fittedLineOffset = -sideOffsetNumerator / sideOffsetDenominator;
+      if ( std::isfinite( fittedLineOffset ) && std::fabs( fittedLineOffset ) <= maxLineMove )
+      {
+        preferredLineOffset = fittedLineOffset;
+        seedLineOffset = preferredLineOffset;
+      }
+    }
+
+    QVector<double> seedLineOffsets;
+    seedLineOffsets.reserve( 5 );
+    auto appendSeedLineOffset = [&]( double offset ) {
+      if ( !std::isfinite( offset ) )
+        return;
+      offset = std::max( -maxLineMove, std::min( maxLineMove, offset ) );
+      for ( double existingOffset : seedLineOffsets )
+      {
+        if ( std::fabs( existingOffset - offset ) <= std::max( 0.03, maxLineMove * 0.08 ) )
+          return;
+      }
+      seedLineOffsets.append( offset );
+    };
+    appendSeedLineOffset( seedLineOffset );
+    appendSeedLineOffset( 0.0 );
+
+    QVector<double> highPointLineOffsets;
+    highPointLineOffsets.reserve( roofCandidatePoints.size() );
+    const double highLineThreshold = std::max( sortedPercentile( heightBand.filteredHeights, 0.82 ),
+                                              heightBand.ridgeHeight - std::max( heightBand.binWidth * 1.5, 0.25 ) );
+    const double highLineStart = std::max( ridgeInterval.start, -maxEndpointMove );
+    const double highLineEnd = std::min( ridgeInterval.end, roughLength + maxEndpointMove );
+    for ( const QgsPoint &point : roofCandidatePoints )
+    {
+      if ( point.z() < highLineThreshold )
+        continue;
+      const QgsPointXY pointXY( point.x(), point.y() );
+      const double along = lineParameter( roughLineOrigin, ridgeDirX, ridgeDirY, pointXY );
+      if ( along < highLineStart || along > highLineEnd )
+        continue;
+      const double lineOffset = signedDistanceToLine( pointXY, QgsPoint( roughLineOrigin.x(), roughLineOrigin.y(), roughRidgeHeight ), normalX, normalY );
+      if ( std::fabs( lineOffset ) <= maxLineMove )
+        highPointLineOffsets.append( lineOffset );
+    }
+    if ( highPointLineOffsets.size() >= 6 )
+    {
+      std::sort( highPointLineOffsets.begin(), highPointLineOffsets.end() );
+      appendSeedLineOffset( sortedPercentile( highPointLineOffsets, 0.50 ) );
+      appendSeedLineOffset( sortedPercentile( highPointLineOffsets, 0.40 ) );
+      appendSeedLineOffset( sortedPercentile( highPointLineOffsets, 0.60 ) );
+    }
+
+    QgsPointXY lineOrigin( roughLineOrigin.x() + seedLineOffset * normalX,
+                           roughLineOrigin.y() + seedLineOffset * normalY );
+    const double expandedMinT = minT - maxEndpointMove;
+    const double expandedMaxT = maxT + maxEndpointMove;
+    double preferredStartT = startT;
+    double preferredEndT = endT;
+    if ( planeIntersectionParameterOnLine( ridgePlane, startPlane, lineOrigin, ridgeDirX, ridgeDirY, planeStartT )
+         && planeStartT >= expandedMinT && planeStartT <= expandedMaxT
+         && std::fabs( planeStartT - roughStartT ) <= maxEndpointMove )
+    {
+      preferredStartT = std::max( minT, std::min( maxT, planeStartT ) );
+      startT = std::max( minT, std::min( maxT, planeStartT * 0.75 + roughStartT * 0.25 ) );
+    }
+    if ( planeIntersectionParameterOnLine( ridgePlane, finishPlane, lineOrigin, ridgeDirX, ridgeDirY, planeEndT )
+         && planeEndT >= expandedMinT && planeEndT <= expandedMaxT
+         && std::fabs( planeEndT - roughEndT ) <= maxEndpointMove )
+    {
+      preferredEndT = std::max( minT, std::min( maxT, planeEndT ) );
+      endT = std::max( minT, std::min( maxT, planeEndT * 0.75 + roughEndT * 0.25 ) );
+    }
+
+    double maxHeight = std::min( heightBand.highHeight, heightBand.ridgeHeight + std::max( 0.35, heightBand.binWidth * 2.0 ) );
+    if ( rawRidgeHeights.size() >= 8 && rawInsideHeights.size() >= 20 )
+    {
+      const double rawRidgeUpper = sortedPercentile( rawRidgeHeights, 0.90 );
+      const double rawGlobalCeiling = sortedPercentile( rawInsideHeights, 0.995 );
+      maxHeight = std::max( maxHeight, std::min( rawRidgeUpper, rawGlobalCeiling ) );
+    }
+    const double minHeight = heightBand.baseHeight + std::max( 0.25, ( heightBand.ridgeHeight - heightBand.baseHeight ) * 0.40 );
+    const double robustDelta = std::max( 0.16, std::min( 0.55, ( maxHeight - minHeight ) * 0.12 ) );
+    auto huberLoss = [robustDelta]( double residual ) {
+      const double absResidual = std::fabs( residual );
+      if ( absResidual <= robustDelta )
+        return 0.5 * absResidual * absResidual;
+      return robustDelta * ( absResidual - 0.5 * robustDelta );
+    };
+
+    auto constrainedRidgeHeight = [&]( const QgsPointXY &candidateLineOrigin, double candidateStartT, double candidateEndT ) {
+      const QgsPointXY candidateFirstXY = pointOnLine( candidateLineOrigin, ridgeDirX, ridgeDirY, candidateStartT );
+      const QgsPointXY candidateSecondXY = pointOnLine( candidateLineOrigin, ridgeDirX, ridgeDirY, candidateEndT );
+      QVector<double> heights;
+      heights.reserve( positiveSidePoints.size() + negativeSidePoints.size() + startEndPoints.size() + finishEndPoints.size() );
+      auto appendHeights = [&]( const QVector<QgsPoint> &points, int group ) {
+        for ( const QgsPoint &point : points )
+        {
+          const QgsPointXY pointXY( point.x(), point.y() );
+          double delta = 0.0;
+          if ( group == 0 )
+          {
+            const double sideDistance = signedDistanceToLine( pointXY, QgsPoint( candidateLineOrigin.x(), candidateLineOrigin.y(), roughRidgeHeight ), normalX, normalY );
+            const QgsPointXY ridgeProjection( pointXY.x() - sideDistance * normalX, pointXY.y() - sideDistance * normalY );
+            delta = roofPlaneZ( positivePlane, pointXY ) - roofPlaneZ( positivePlane, ridgeProjection );
+          }
+          else if ( group == 1 )
+          {
+            const double sideDistance = signedDistanceToLine( pointXY, QgsPoint( candidateLineOrigin.x(), candidateLineOrigin.y(), roughRidgeHeight ), normalX, normalY );
+            const QgsPointXY ridgeProjection( pointXY.x() - sideDistance * normalX, pointXY.y() - sideDistance * normalY );
+            delta = roofPlaneZ( negativePlane, pointXY ) - roofPlaneZ( negativePlane, ridgeProjection );
+          }
+          else if ( group == 2 )
+            delta = roofPlaneZ( startPlane, pointXY ) - roofPlaneZ( startPlane, candidateFirstXY );
+          else
+            delta = roofPlaneZ( finishPlane, pointXY ) - roofPlaneZ( finishPlane, candidateSecondXY );
+          const double height = point.z() - delta;
+          if ( std::isfinite( height ) )
+            heights.append( height );
+        }
+      };
+      appendHeights( positiveSidePoints, 0 );
+      appendHeights( negativeSidePoints, 1 );
+      appendHeights( startEndPoints, 2 );
+      appendHeights( finishEndPoints, 3 );
+      if ( heights.size() < 24 )
+        return roughRidgeHeight;
+
+      QVector<double> nearRidgeHeights;
+      nearRidgeHeights.reserve( roofCandidatePoints.size() );
+      const double nearRidgeHalfWidth = std::max( 0.20, std::min( footprintHalfWidth * 0.16, extent * 0.045 ) );
+      const double nearRidgeEndTolerance = std::max( 0.20, extent * 0.015 );
+      for ( const QgsPoint &point : roofCandidatePoints )
+      {
+        const QgsPointXY pointXY( point.x(), point.y() );
+        const double along = lineParameter( candidateLineOrigin, ridgeDirX, ridgeDirY, pointXY );
+        if ( along < candidateStartT - nearRidgeEndTolerance || along > candidateEndT + nearRidgeEndTolerance )
+          continue;
+        const double sideDistance = signedDistanceToLine( pointXY, QgsPoint( candidateLineOrigin.x(), candidateLineOrigin.y(), roughRidgeHeight ), normalX, normalY );
+        if ( std::fabs( sideDistance ) <= nearRidgeHalfWidth && point.z() >= minHeight )
+          nearRidgeHeights.append( point.z() );
+      }
+
+      std::sort( heights.begin(), heights.end() );
+      const double low = sortedPercentile( heights, 0.25 );
+      const double high = sortedPercentile( heights, 0.75 );
+      double sum = 0.0;
+      int count = 0;
+      for ( double height : heights )
+      {
+        if ( height >= low && height <= high )
+        {
+          sum += height;
+          ++count;
+        }
+      }
+      double fittedHeight = count > 0 ? sum / count : sortedPercentile( heights, 0.50 );
+      if ( nearRidgeHeights.size() >= 6 )
+      {
+        std::sort( nearRidgeHeights.begin(), nearRidgeHeights.end() );
+        const double ridgeSupportHeight = sortedPercentile( nearRidgeHeights, 0.74 );
+        if ( std::isfinite( ridgeSupportHeight ) && ridgeSupportHeight > fittedHeight )
+          fittedHeight = fittedHeight * 0.65 + ridgeSupportHeight * 0.35;
+      }
+      return std::max( minHeight, std::min( maxHeight, fittedHeight ) );
+    };
+
+    auto scoreConstrainedModel = [&]( double candidateLineOffset, double candidateStartT, double candidateEndT, HippedConstrainedRidgeFit &fit ) {
+      if ( std::fabs( candidateLineOffset ) > maxLineMove )
+        return false;
+      if ( candidateEndT <= candidateStartT )
+        return false;
+
+      const QgsPointXY candidateLineOrigin( roughLineOrigin.x() + candidateLineOffset * normalX,
+                                            roughLineOrigin.y() + candidateLineOffset * normalY );
+      const QgsPointXY candidateFirstXY = pointOnLine( candidateLineOrigin, ridgeDirX, ridgeDirY, candidateStartT );
+      const QgsPointXY candidateSecondXY = pointOnLine( candidateLineOrigin, ridgeDirX, ridgeDirY, candidateEndT );
+      if ( !pointInRing( ring, candidateFirstXY ) || !pointInRing( ring, candidateSecondXY ) )
+        return false;
+
+      const double candidateLength = candidateEndT - candidateStartT;
+      const double minLength = std::max( 0.70, intervalLength * 0.10 );
+      const double maxLength = ( maxT - minT ) * 0.98;
+      if ( candidateLength < minLength || candidateLength > maxLength )
+        return false;
+
+      const double candidateRidgeHeight = constrainedRidgeHeight( candidateLineOrigin, candidateStartT, candidateEndT );
+      if ( !std::isfinite( candidateRidgeHeight ) || candidateRidgeHeight <= heightBand.baseHeight + 0.20 )
+        return false;
+
+      double loss = 0.0;
+      int count = 0;
+      auto addResiduals = [&]( const QVector<QgsPoint> &points, int group ) {
+        for ( const QgsPoint &point : points )
+        {
+          const QgsPointXY pointXY( point.x(), point.y() );
+          double predictedZ = candidateRidgeHeight;
+          if ( group == 0 )
+          {
+            const double sideDistance = signedDistanceToLine( pointXY, QgsPoint( candidateLineOrigin.x(), candidateLineOrigin.y(), candidateRidgeHeight ), normalX, normalY );
+            const QgsPointXY ridgeProjection( pointXY.x() - sideDistance * normalX, pointXY.y() - sideDistance * normalY );
+            predictedZ += roofPlaneZ( positivePlane, pointXY ) - roofPlaneZ( positivePlane, ridgeProjection );
+          }
+          else if ( group == 1 )
+          {
+            const double sideDistance = signedDistanceToLine( pointXY, QgsPoint( candidateLineOrigin.x(), candidateLineOrigin.y(), candidateRidgeHeight ), normalX, normalY );
+            const QgsPointXY ridgeProjection( pointXY.x() - sideDistance * normalX, pointXY.y() - sideDistance * normalY );
+            predictedZ += roofPlaneZ( negativePlane, pointXY ) - roofPlaneZ( negativePlane, ridgeProjection );
+          }
+          else if ( group == 2 )
+            predictedZ += roofPlaneZ( startPlane, pointXY ) - roofPlaneZ( startPlane, candidateFirstXY );
+          else
+            predictedZ += roofPlaneZ( finishPlane, pointXY ) - roofPlaneZ( finishPlane, candidateSecondXY );
+
+          if ( !std::isfinite( predictedZ ) )
+            continue;
+          loss += huberLoss( point.z() - predictedZ );
+          ++count;
+        }
+      };
+      addResiduals( positiveSidePoints, 0 );
+      addResiduals( negativeSidePoints, 1 );
+      addResiduals( startEndPoints, 2 );
+      addResiduals( finishEndPoints, 3 );
+      if ( count < 24 )
+        return false;
+
+      const double startMove = ( candidateStartT - preferredStartT ) / std::max( maxEndpointMove, 1e-6 );
+      const double endMove = ( candidateEndT - preferredEndT ) / std::max( maxEndpointMove, 1e-6 );
+      const double lineMove = ( candidateLineOffset - preferredLineOffset ) / std::max( maxLineMove, 1e-6 );
+      const double heightMove = ( candidateRidgeHeight - roughRidgeHeight ) / std::max( maxHeight - minHeight, 1e-6 );
+      double score = loss / count;
+      score += 0.020 * ( startMove * startMove + endMove * endMove );
+      score += 0.030 * lineMove * lineMove;
+      score += 0.015 * heightMove * heightMove;
+
+      fit.success = true;
+      fit.lineOffset = candidateLineOffset;
+      fit.startT = candidateStartT;
+      fit.endT = candidateEndT;
+      fit.ridgeHeight = candidateRidgeHeight;
+      fit.score = score;
+      return true;
+    };
+
+    HippedConstrainedRidgeFit bestFit;
+    auto tryCandidate = [&]( double candidateLineOffset, double candidateStartT, double candidateEndT ) {
+      candidateLineOffset = std::max( -maxLineMove, std::min( maxLineMove, candidateLineOffset ) );
+      candidateStartT = std::max( minT, std::min( maxT, candidateStartT ) );
+      candidateEndT = std::max( minT, std::min( maxT, candidateEndT ) );
+      HippedConstrainedRidgeFit fit;
+      if ( scoreConstrainedModel( candidateLineOffset, candidateStartT, candidateEndT, fit ) && fit.score < bestFit.score )
+        bestFit = fit;
+    };
+
+    auto refitSlopePlanesFromCurrentRidge = [&]() {
+      if ( endT <= startT )
+        return false;
+
+      QVector<QgsPoint> refitPositiveSidePoints;
+      QVector<QgsPoint> refitNegativeSidePoints;
+      QVector<QgsPoint> refitStartEndPoints;
+      QVector<QgsPoint> refitFinishEndPoints;
+      refitPositiveSidePoints.reserve( normalSamples.size() );
+      refitNegativeSidePoints.reserve( normalSamples.size() );
+      refitStartEndPoints.reserve( normalSamples.size() );
+      refitFinishEndPoints.reserve( normalSamples.size() );
+
+      const double currentLength = endT - startT;
+      const double refitEndBand = std::max( 0.25, std::min( currentLength * 0.18, extent * 0.09 ) );
+      const double refitSideInset = std::max( 0.18, refitEndBand * 0.45 );
+      const double refitStartSpan = std::max( 0.30, startT - ridgeInterval.start );
+      const double refitFinishSpan = std::max( 0.30, ridgeInterval.end - endT );
+
+      for ( const HippedNormalRoofSample &sample : normalSamples )
+      {
+        const QgsPoint &point = sample.point;
+        const QgsPointXY pointXY( point.x(), point.y() );
+        const double along = lineParameter( lineOrigin, ridgeDirX, ridgeDirY, pointXY );
+        const double sideDistance = signedDistanceToLine( pointXY, QgsPoint( lineOrigin.x(), lineOrigin.y(), roughRidgeHeight ), normalX, normalY );
+        const double absSideDistance = std::fabs( sideDistance );
+        const int normalGroup = hippedNormalGroup( sample, ridgeDirX, ridgeDirY, normalX, normalY );
+
+        const double startFaceWidth = footprintHalfWidth * std::max( 0.0, std::min( 1.0, ( startT + refitEndBand - along ) / ( refitStartSpan + refitEndBand ) ) ) + endFaceWidthTolerance;
+        const double finishFaceWidth = footprintHalfWidth * std::max( 0.0, std::min( 1.0, ( along - ( endT - refitEndBand ) ) / ( refitFinishSpan + refitEndBand ) ) ) + endFaceWidthTolerance;
+        if ( normalGroup == 2 && along >= ridgeInterval.start - endpointOuterTolerance && along <= startT + refitEndBand && absSideDistance <= startFaceWidth )
+          refitStartEndPoints.append( point );
+        if ( normalGroup == 3 && along >= endT - refitEndBand && along <= ridgeInterval.end + endpointOuterTolerance && absSideDistance <= finishFaceWidth )
+          refitFinishEndPoints.append( point );
+        if ( along >= startT + refitSideInset && along <= endT - refitSideInset )
+        {
+          if ( normalGroup == 0 && sideDistance >= 0.0 )
+            refitPositiveSidePoints.append( point );
+          else if ( normalGroup == 1 && sideDistance < 0.0 )
+            refitNegativeSidePoints.append( point );
+        }
+      }
+
+      const int refitMinSideCount = std::max( 10, static_cast<int>( std::ceil( ( refitPositiveSidePoints.size() + refitNegativeSidePoints.size() ) * 0.10 ) ) );
+      if ( refitPositiveSidePoints.size() < refitMinSideCount || refitNegativeSidePoints.size() < refitMinSideCount || refitStartEndPoints.size() < 8 || refitFinishEndPoints.size() < 8 )
+        return false;
+
+      const LeastSquaresRoofPlane refitPositivePlane = fitRobustRoofPlane( refitPositiveSidePoints );
+      const LeastSquaresRoofPlane refitNegativePlane = fitRobustRoofPlane( refitNegativeSidePoints );
+      const LeastSquaresRoofPlane refitStartPlane = fitRobustRoofPlane( refitStartEndPoints );
+      const LeastSquaresRoofPlane refitFinishPlane = fitRobustRoofPlane( refitFinishEndPoints );
+      if ( !refitPositivePlane.success || !refitNegativePlane.success || !refitStartPlane.success || !refitFinishPlane.success )
+        return false;
+
+      const double refitStartSlopeAlong = refitStartPlane.a * ridgeDirX + refitStartPlane.b * ridgeDirY;
+      const double refitFinishSlopeAlong = refitFinishPlane.a * ridgeDirX + refitFinishPlane.b * ridgeDirY;
+      const double refitPositiveSideSlope = refitPositivePlane.a * normalX + refitPositivePlane.b * normalY;
+      const double refitNegativeSideSlope = refitNegativePlane.a * normalX + refitNegativePlane.b * normalY;
+      if ( refitStartSlopeAlong <= 1e-5 || refitFinishSlopeAlong >= -1e-5 || refitPositiveSideSlope >= -1e-5 || refitNegativeSideSlope <= 1e-5 )
+        return false;
+
+      const double refitSideLineA = refitPositivePlane.a - refitNegativePlane.a;
+      const double refitSideLineB = refitPositivePlane.b - refitNegativePlane.b;
+      const double refitSideLineLength = std::hypot( refitSideLineA, refitSideLineB );
+      if ( refitSideLineLength <= 1e-10 )
+        return false;
+      const double refitFittedDirX = -refitSideLineB / refitSideLineLength;
+      const double refitFittedDirY = refitSideLineA / refitSideLineLength;
+      if ( std::fabs( refitFittedDirX * ridgeDirX + refitFittedDirY * ridgeDirY ) < 0.40 )
+        return false;
+
+      positiveSidePoints = refitPositiveSidePoints;
+      negativeSidePoints = refitNegativeSidePoints;
+      startEndPoints = refitStartEndPoints;
+      finishEndPoints = refitFinishEndPoints;
+      positivePlane = refitPositivePlane;
+      negativePlane = refitNegativePlane;
+      startPlane = refitStartPlane;
+      finishPlane = refitFinishPlane;
+      startSlopeAlong = refitStartSlopeAlong;
+      finishSlopeAlong = refitFinishSlopeAlong;
+      positiveSideSlope = refitPositiveSideSlope;
+      negativeSideSlope = refitNegativeSideSlope;
+
+      const double refitSideOffsetDenominator = refitSideLineA * normalX + refitSideLineB * normalY;
+      if ( std::fabs( refitSideOffsetDenominator ) > 1e-10 )
+      {
+        const double refitMidT = ( startT + endT ) * 0.5;
+        const QgsPointXY refitBaseMidPoint = pointOnLine( roughLineOrigin, ridgeDirX, ridgeDirY, refitMidT );
+        const double refitSideOffsetNumerator = refitSideLineA * refitBaseMidPoint.x() + refitSideLineB * refitBaseMidPoint.y() + refitPositivePlane.c - refitNegativePlane.c;
+        const double refitLineOffset = -refitSideOffsetNumerator / refitSideOffsetDenominator;
+        if ( std::isfinite( refitLineOffset ) && std::fabs( refitLineOffset ) <= maxLineMove )
+        {
+          preferredLineOffset = refitLineOffset;
+          appendSeedLineOffset( preferredLineOffset );
+          lineOrigin = QgsPointXY( roughLineOrigin.x() + preferredLineOffset * normalX,
+                                   roughLineOrigin.y() + preferredLineOffset * normalY );
+        }
+      }
+
+      const LeastSquaresRoofPlane refitRidgePlane = averagedRoofPlane( positivePlane, negativePlane );
+      double refitPlaneStartT = preferredStartT;
+      double refitPlaneEndT = preferredEndT;
+      if ( planeIntersectionParameterOnLine( refitRidgePlane, startPlane, lineOrigin, ridgeDirX, ridgeDirY, refitPlaneStartT )
+           && refitPlaneStartT >= expandedMinT && refitPlaneStartT <= expandedMaxT
+           && std::fabs( refitPlaneStartT - roughStartT ) <= maxEndpointMove )
+      {
+        preferredStartT = std::max( minT, std::min( maxT, refitPlaneStartT ) );
+        startT = preferredStartT;
+      }
+      if ( planeIntersectionParameterOnLine( refitRidgePlane, finishPlane, lineOrigin, ridgeDirX, ridgeDirY, refitPlaneEndT )
+           && refitPlaneEndT >= expandedMinT && refitPlaneEndT <= expandedMaxT
+           && std::fabs( refitPlaneEndT - roughEndT ) <= maxEndpointMove )
+      {
+        preferredEndT = std::max( minT, std::min( maxT, refitPlaneEndT ) );
+        endT = preferredEndT;
+      }
+      return true;
+    };
+
+    const double coarseStep = std::max( 0.12, maxEndpointMove / 5.0 );
+    const double coarseLineStep = std::max( 0.05, maxLineMove / 5.0 );
+    const int coarseLineRadius = 5;
+    for ( double baseLineOffset : seedLineOffsets )
+    {
+      for ( int oi = -coarseLineRadius; oi <= coarseLineRadius; ++oi )
+      {
+        const double candidateLineOffset = baseLineOffset + oi * coarseLineStep;
+        for ( int si = -5; si <= 5; ++si )
+        {
+          for ( int ei = -5; ei <= 5; ++ei )
+            tryCandidate( candidateLineOffset, startT + si * coarseStep, endT + ei * coarseStep );
+        }
+      }
+    }
+    tryCandidate( 0.0, startT, endT );
+
+    if ( !bestFit.success )
+    {
+      const double fallbackStep = std::max( 0.12, ( maxT - minT ) / 8.0 );
+      for ( double candidateLineOffset : seedLineOffsets )
+      {
+        for ( int si = 0; si <= 8; ++si )
+        {
+          const double candidateStartT = minT + si * fallbackStep;
+          for ( int ei = si + 1; ei <= 8; ++ei )
+            tryCandidate( candidateLineOffset, candidateStartT, minT + ei * fallbackStep );
+        }
+      }
+    }
+
+    if ( bestFit.success )
+    {
+      for ( double refineStep : { coarseStep * 0.45, coarseStep * 0.20 } )
+      {
+        const double centerLineOffset = bestFit.lineOffset;
+        const double centerStartT = bestFit.startT;
+        const double centerEndT = bestFit.endT;
+        const double lineStep = std::max( 0.03, refineStep * 0.45 );
+        const int lineRadius = 2;
+        for ( int si = -2; si <= 2; ++si )
+        {
+          for ( int ei = -2; ei <= 2; ++ei )
+          {
+            for ( int oi = -lineRadius; oi <= lineRadius; ++oi )
+              tryCandidate( centerLineOffset + oi * lineStep, centerStartT + si * refineStep, centerEndT + ei * refineStep );
+          }
+        }
+      }
+      lineOrigin = QgsPointXY( roughLineOrigin.x() + bestFit.lineOffset * normalX,
+                               roughLineOrigin.y() + bestFit.lineOffset * normalY );
+      startT = bestFit.startT;
+      endT = bestFit.endT;
+    }
+
+    if ( bestFit.success )
+    {
+      const HippedConstrainedRidgeFit firstPassFit = bestFit;
+      const QgsPointXY firstPassLineOrigin = lineOrigin;
+      const double firstPassStartT = startT;
+      const double firstPassEndT = endT;
+
+      if ( refitSlopePlanesFromCurrentRidge() )
+      {
+        HippedConstrainedRidgeFit secondPassFit;
+        bestFit = secondPassFit;
+        const double secondEndpointStep = std::max( 0.08, coarseStep * 0.35 );
+        const double secondLineStep = std::max( 0.025, coarseLineStep * 0.35 );
+        const int secondLineRadius = 3;
+        for ( int oi = -secondLineRadius; oi <= secondLineRadius; ++oi )
+        {
+          for ( int si = -3; si <= 3; ++si )
+          {
+            for ( int ei = -3; ei <= 3; ++ei )
+              tryCandidate( firstPassFit.lineOffset + oi * secondLineStep, firstPassStartT + si * secondEndpointStep, firstPassEndT + ei * secondEndpointStep );
+          }
+        }
+
+        if ( bestFit.success )
+        {
+          for ( double refineStep : { secondEndpointStep * 0.45, secondEndpointStep * 0.20 } )
+          {
+            const double centerLineOffset = bestFit.lineOffset;
+            const double centerStartT = bestFit.startT;
+            const double centerEndT = bestFit.endT;
+            const double lineStep = std::max( 0.02, refineStep * 0.40 );
+            const int lineRadius = 2;
+            for ( int si = -2; si <= 2; ++si )
+            {
+              for ( int ei = -2; ei <= 2; ++ei )
+              {
+                for ( int oi = -lineRadius; oi <= lineRadius; ++oi )
+                  tryCandidate( centerLineOffset + oi * lineStep, centerStartT + si * refineStep, centerEndT + ei * refineStep );
+              }
+            }
+          }
+          lineOrigin = QgsPointXY( roughLineOrigin.x() + bestFit.lineOffset * normalX,
+                                   roughLineOrigin.y() + bestFit.lineOffset * normalY );
+          startT = bestFit.startT;
+          endT = bestFit.endT;
+        }
+        else
+        {
+          bestFit = firstPassFit;
+          lineOrigin = firstPassLineOrigin;
+          startT = firstPassStartT;
+          endT = firstPassEndT;
+        }
+      }
+    }
+
+    const double generatedInset = std::max( 0.05, extent * 0.002 );
+    const double generatedMinT = ridgeInterval.start + generatedInset;
+    const double generatedMaxT = ridgeInterval.end - generatedInset;
+    const double generatedIntervalLength = generatedMaxT - generatedMinT;
+    if ( generatedIntervalLength <= std::max( 0.75, extent * 0.08 ) )
+      return false;
+    const double minRidgeLength = std::max( 0.70, generatedIntervalLength * 0.08 );
+    const double maxRidgeLength = generatedIntervalLength * 0.98;
+    const double structureIntervalTolerance = std::max( 0.35, std::min( 1.20, extent * 0.060 ) );
+    QVector<HippedWeightedRoofSample> generatedRoofPoints;
+    generatedRoofPoints.reserve( normalSamples.size() );
+    for ( const HippedNormalRoofSample &sample : normalSamples )
+      generatedRoofPoints.append( HippedWeightedRoofSample{ sample.point, 1.0 } );
+
+    const double rawStructureThreshold = std::max( sortedPercentile( heightBand.filteredHeights, 0.78 ),
+                                                   roughRidgeHeight - std::max( 0.45, heightBand.binWidth * 2.5 ) );
+    const double rawStructureCeiling = rawInsideHeights.size() >= 20
+                                         ? sortedPercentile( rawInsideHeights, 0.995 )
+                                         : heightBand.highHeight;
+    QVector<double> rawStructureParameters;
+    rawStructureParameters.reserve( rawRidgeHeights.size() );
+    for ( const BuildingRoof::RoofSample &sample : pointCloudSamples )
+    {
+      const QgsPoint &point = sample.point;
+      if ( point.z() < rawStructureThreshold || point.z() > rawStructureCeiling )
+        continue;
+      const QgsPointXY pointXY( point.x(), point.y() );
+      if ( !pointInRing( ring, pointXY ) )
+        continue;
+      const double parameter = lineParameter( roughStart, ridgeDirX, ridgeDirY, pointXY );
+      if ( parameter < ridgeInterval.start - structureIntervalTolerance || parameter > ridgeInterval.end + structureIntervalTolerance )
+        continue;
+      const double lineDistance = std::fabs( signedDistanceToLine( pointXY, QgsPoint( roughStart.x(), roughStart.y(), roughRidgeHeight ), normalX, normalY ) );
+      if ( lineDistance > ridgeWeightRadius * 1.35 )
+        continue;
+      rawStructureParameters.append( parameter );
+    }
+    std::sort( rawStructureParameters.begin(), rawStructureParameters.end() );
+
+    double outlineDirX = ridgeDirX;
+    double outlineDirY = ridgeDirY;
+    double maxOutlineEdgeLength = 0.0;
+    for ( int i = 0; i < ring.size(); ++i )
+      maxOutlineEdgeLength = std::max( maxOutlineEdgeLength, std::hypot( ring[( i + 1 ) % ring.size()].x() - ring[i].x(), ring[( i + 1 ) % ring.size()].y() - ring[i].y() ) );
+
+    double bestOutlineScore = -1.0;
+    for ( int i = 0; i < ring.size(); ++i )
+    {
+      double edgeX = ring[( i + 1 ) % ring.size()].x() - ring[i].x();
+      double edgeY = ring[( i + 1 ) % ring.size()].y() - ring[i].y();
+      const double edgeLength = std::hypot( edgeX, edgeY );
+      if ( edgeLength <= 1e-8 || maxOutlineEdgeLength <= 1e-8 )
+        continue;
+      edgeX /= edgeLength;
+      edgeY /= edgeLength;
+      double alignment = edgeX * ridgeDirX + edgeY * ridgeDirY;
+      if ( std::fabs( alignment ) < 0.8660254037844386 )
+        continue;
+      if ( alignment < 0.0 )
+      {
+        edgeX = -edgeX;
+        edgeY = -edgeY;
+        alignment = -alignment;
+      }
+      const double lengthWeight = std::sqrt( edgeLength / maxOutlineEdgeLength );
+      const double outlineScore = alignment * ( 0.35 + 0.65 * lengthWeight );
+      if ( outlineScore > bestOutlineScore )
+      {
+        bestOutlineScore = outlineScore;
+        outlineDirX = edgeX;
+        outlineDirY = edgeY;
+      }
+    }
+
+    constexpr double maxAngleOffset = 0.2094395102393196; // 12 degrees
+    const double outlineAngleOffset = std::max( -maxAngleOffset, std::min( maxAngleOffset,
+      std::atan2( ridgeDirX * outlineDirY - ridgeDirY * outlineDirX,
+                  ridgeDirX * outlineDirX + ridgeDirY * outlineDirY ) ) );
+    const double outlinePenaltyWeight = std::max( 0.0025, robustDelta * robustDelta * 0.10 );
+    const QgsPointXY roughPivot = pointOnLine( roughLineOrigin, ridgeDirX, ridgeDirY, roughMidT );
+    double finalRidgeDirX = ridgeDirX;
+    double finalRidgeDirY = ridgeDirY;
+
+    HippedConstrainedRidgeFit generatedBest;
+    auto tryGeneratedRoof = [&]( double candidateLineOffset, double candidateStartT, double candidateEndT, double candidateHeight, double candidateAngleOffset ) {
+      candidateLineOffset = std::max( -maxLineMove, std::min( maxLineMove, candidateLineOffset ) );
+      candidateStartT = std::max( generatedMinT, std::min( generatedMaxT, candidateStartT ) );
+      candidateEndT = std::max( generatedMinT, std::min( generatedMaxT, candidateEndT ) );
+      candidateHeight = std::max( minHeight, std::min( maxHeight, candidateHeight ) );
+      candidateAngleOffset = std::max( -maxAngleOffset, std::min( maxAngleOffset, candidateAngleOffset ) );
+      if ( candidateEndT - candidateStartT < minRidgeLength || candidateEndT - candidateStartT > maxRidgeLength )
+        return;
+
+      const double angleCos = std::cos( candidateAngleOffset );
+      const double angleSin = std::sin( candidateAngleOffset );
+      const double candidateDirX = ridgeDirX * angleCos - ridgeDirY * angleSin;
+      const double candidateDirY = ridgeDirX * angleSin + ridgeDirY * angleCos;
+      const double candidateNormalX = -candidateDirY;
+      const double candidateNormalY = candidateDirX;
+      const QgsPointXY candidatePivot( roughPivot.x() + candidateLineOffset * candidateNormalX,
+                                       roughPivot.y() + candidateLineOffset * candidateNormalY );
+      const QgsPointXY candidateFirst = pointOnLine( candidatePivot, candidateDirX, candidateDirY, candidateStartT - roughMidT );
+      const QgsPointXY candidateSecond = pointOnLine( candidatePivot, candidateDirX, candidateDirY, candidateEndT - roughMidT );
+      if ( !pointInRing( ring, candidateFirst ) || !pointInRing( ring, candidateSecond ) )
+        return;
+
+      double candidateScore = hippedCandidateRoofLoss( ring, generatedRoofPoints, candidateFirst, candidateSecond,
+                                                       heightBand.baseHeight, candidateHeight, robustDelta );
+      const double outlineDot = std::max( -1.0, std::min( 1.0, std::fabs( candidateDirX * outlineDirX + candidateDirY * outlineDirY ) ) );
+      const double outlineAngle = std::acos( outlineDot );
+      candidateScore += outlinePenaltyWeight * std::pow( outlineAngle / maxAngleOffset, 2.0 );
+      if ( !std::isfinite( candidateScore ) || candidateScore >= generatedBest.score )
+        return;
+
+      generatedBest.success = true;
+      generatedBest.lineOffset = candidateLineOffset;
+      generatedBest.startT = candidateStartT;
+      generatedBest.endT = candidateEndT;
+      generatedBest.ridgeHeight = candidateHeight;
+      generatedBest.angleOffset = candidateAngleOffset;
+      generatedBest.score = candidateScore;
+    };
+
+    const double currentLineOffset = ( lineOrigin.x() - roughLineOrigin.x() ) * normalX
+                                     + ( lineOrigin.y() - roughLineOrigin.y() ) * normalY;
+    const double currentHeight = bestFit.success ? bestFit.ridgeHeight : roughRidgeHeight;
+    tryGeneratedRoof( currentLineOffset, startT, endT, currentHeight, 0.0 );
+    tryGeneratedRoof( currentLineOffset, startT, endT, currentHeight, outlineAngleOffset );
+    tryGeneratedRoof( 0.0, roughStartT, roughEndT, roughRidgeHeight, 0.0 );
+
+    if ( rawStructureParameters.size() >= 8 )
+    {
+      for ( const QPair<double, double> &percentilePair : {
+              qMakePair( 0.05, 0.95 ),
+              qMakePair( 0.10, 0.90 ),
+              qMakePair( 0.15, 0.85 ) } )
+      {
+        const double seedStartT = sortedPercentile( rawStructureParameters, percentilePair.first );
+        const double seedEndT = sortedPercentile( rawStructureParameters, percentilePair.second );
+        tryGeneratedRoof( currentLineOffset, seedStartT, seedEndT, currentHeight, 0.0 );
+        tryGeneratedRoof( currentLineOffset, seedStartT, seedEndT, currentHeight, outlineAngleOffset );
+      }
+
+      const double parameterBinWidth = std::max( 0.15, std::min( 0.55, extent * 0.018 ) );
+      const int parameterBinCount = std::max( 3, static_cast<int>( std::ceil( generatedIntervalLength / parameterBinWidth ) ) );
+      QVector<int> parameterCounts( parameterBinCount, 0 );
+      for ( double parameter : rawStructureParameters )
+      {
+        if ( parameter < generatedMinT || parameter > generatedMaxT )
+          continue;
+        const int index = std::max( 0, std::min( parameterBinCount - 1,
+          static_cast<int>( std::floor( ( parameter - generatedMinT ) / generatedIntervalLength * parameterBinCount ) ) ) );
+        ++parameterCounts[index];
+      }
+
+      QVector<int> smoothedParameterCounts( parameterBinCount, 0 );
+      int peakIndex = 0;
+      for ( int i = 0; i < parameterBinCount; ++i )
+      {
+        smoothedParameterCounts[i] = parameterCounts.at( i );
+        if ( i > 0 )
+          smoothedParameterCounts[i] += parameterCounts.at( i - 1 );
+        if ( i + 1 < parameterBinCount )
+          smoothedParameterCounts[i] += parameterCounts.at( i + 1 );
+        if ( smoothedParameterCounts.at( i ) > smoothedParameterCounts.at( peakIndex ) )
+          peakIndex = i;
+      }
+
+      const int runSupport = std::max( 2, smoothedParameterCounts.at( peakIndex ) / 5 );
+      int runStart = peakIndex;
+      int runEnd = peakIndex;
+      while ( runStart > 0 && smoothedParameterCounts.at( runStart - 1 ) >= runSupport )
+        --runStart;
+      while ( runEnd + 1 < parameterBinCount && smoothedParameterCounts.at( runEnd + 1 ) >= runSupport )
+        ++runEnd;
+      const double denseStartT = generatedMinT + generatedIntervalLength * runStart / parameterBinCount;
+      const double denseEndT = generatedMinT + generatedIntervalLength * ( runEnd + 1 ) / parameterBinCount;
+      tryGeneratedRoof( currentLineOffset, denseStartT, denseEndT, currentHeight, 0.0 );
+      tryGeneratedRoof( currentLineOffset, denseStartT, denseEndT, currentHeight, outlineAngleOffset );
+    }
+
+    if ( generatedBest.success )
+    {
+      const int endpointScanSteps = std::max( 16, std::min( 30,
+        static_cast<int>( std::ceil( generatedIntervalLength / std::max( 0.30, extent * 0.018 ) ) ) ) );
+      for ( int pass = 0; pass < 2; ++pass )
+      {
+        const HippedConstrainedRidgeFit startCenter = generatedBest;
+        for ( int i = 0; i <= endpointScanSteps; ++i )
+        {
+          const double candidateStartT = generatedMinT + generatedIntervalLength * i / endpointScanSteps;
+          if ( startCenter.endT - candidateStartT < minRidgeLength )
+            continue;
+          tryGeneratedRoof( startCenter.lineOffset, candidateStartT, startCenter.endT,
+                            startCenter.ridgeHeight, startCenter.angleOffset );
+        }
+
+        const HippedConstrainedRidgeFit endCenter = generatedBest;
+        for ( int i = 0; i <= endpointScanSteps; ++i )
+        {
+          const double candidateEndT = generatedMinT + generatedIntervalLength * i / endpointScanSteps;
+          if ( candidateEndT - endCenter.startT < minRidgeLength )
+            continue;
+          tryGeneratedRoof( endCenter.lineOffset, endCenter.startT, candidateEndT,
+                            endCenter.ridgeHeight, endCenter.angleOffset );
+        }
+      }
+    }
+
+    if ( generatedBest.success )
+    {
+      double lineStep = std::max( 0.035, maxLineMove * 0.42 );
+      double endpointStep = std::max( 0.07, generatedIntervalLength * 0.10 );
+      double heightStep = std::max( 0.035, ( maxHeight - minHeight ) * 0.18 );
+      double angleStep = maxAngleOffset * 0.32;
+      for ( int iteration = 0; iteration < 7; ++iteration )
+      {
+        for ( int direction : { -1, 1 } )
+        {
+          const HippedConstrainedRidgeFit center = generatedBest;
+          tryGeneratedRoof( center.lineOffset + direction * lineStep, center.startT, center.endT, center.ridgeHeight, center.angleOffset );
+        }
+        for ( int direction : { -1, 1 } )
+        {
+          const HippedConstrainedRidgeFit center = generatedBest;
+          tryGeneratedRoof( center.lineOffset, center.startT + direction * endpointStep, center.endT, center.ridgeHeight, center.angleOffset );
+        }
+        for ( int direction : { -1, 1 } )
+        {
+          const HippedConstrainedRidgeFit center = generatedBest;
+          tryGeneratedRoof( center.lineOffset, center.startT, center.endT + direction * endpointStep, center.ridgeHeight, center.angleOffset );
+        }
+        for ( int direction : { -1, 1 } )
+        {
+          const HippedConstrainedRidgeFit center = generatedBest;
+          tryGeneratedRoof( center.lineOffset, center.startT, center.endT, center.ridgeHeight + direction * heightStep, center.angleOffset );
+        }
+        for ( int direction : { -1, 1 } )
+        {
+          const HippedConstrainedRidgeFit center = generatedBest;
+          tryGeneratedRoof( center.lineOffset, center.startT, center.endT, center.ridgeHeight, center.angleOffset + direction * angleStep );
+        }
+        lineStep *= 0.45;
+        endpointStep *= 0.45;
+        heightStep *= 0.45;
+        angleStep *= 0.45;
+      }
+
+      bestFit = generatedBest;
+      const double angleCos = std::cos( bestFit.angleOffset );
+      const double angleSin = std::sin( bestFit.angleOffset );
+      finalRidgeDirX = ridgeDirX * angleCos - ridgeDirY * angleSin;
+      finalRidgeDirY = ridgeDirX * angleSin + ridgeDirY * angleCos;
+      const double finalNormalX = -finalRidgeDirY;
+      const double finalNormalY = finalRidgeDirX;
+      const QgsPointXY finalPivot( roughPivot.x() + bestFit.lineOffset * finalNormalX,
+                                   roughPivot.y() + bestFit.lineOffset * finalNormalY );
+      lineOrigin = pointOnLine( finalPivot, finalRidgeDirX, finalRidgeDirY, -roughMidT );
+      startT = bestFit.startT;
+      endT = bestFit.endT;
+    }
+
+    if ( endT <= startT )
+      return false;
+
+    if ( endT - startT < minRidgeLength )
+    {
+      const double centerT = std::max( minT, std::min( maxT, roughMidT ) );
+      startT = std::max( minT, centerT - minRidgeLength * 0.5 );
+      endT = std::min( maxT, centerT + minRidgeLength * 0.5 );
+      if ( endT - startT < minRidgeLength * 0.65 )
+        return false;
+    }
+
+    if ( endT - startT > maxRidgeLength )
+    {
+      const double centerT = ( startT + endT ) * 0.5;
+      startT = std::max( minT, centerT - maxRidgeLength * 0.5 );
+      endT = std::min( maxT, centerT + maxRidgeLength * 0.5 );
+    }
+
+    QgsPointXY firstXY = pointOnLine( lineOrigin, finalRidgeDirX, finalRidgeDirY, startT );
+    QgsPointXY secondXY = pointOnLine( lineOrigin, finalRidgeDirX, finalRidgeDirY, endT );
+    if ( !pointInRing( ring, firstXY ) )
+      firstXY = pullPointInsideRing( ring, firstXY, roughStart );
+    if ( !pointInRing( ring, secondXY ) )
+      secondXY = pullPointInsideRing( ring, secondXY, roughEnd );
+
+    double ridgeHeight = bestFit.success ? bestFit.ridgeHeight : averagedFiniteHeight( QVector<double>{
+      roofPlaneZ( ridgePlane, firstXY ),
+      roofPlaneZ( ridgePlane, secondXY ),
+      roughRidgeHeight
+    }, roughRidgeHeight );
+    ridgeHeight = std::max( minHeight, std::min( maxHeight, ridgeHeight ) );
+
+    if ( !std::isfinite( ridgeHeight ) || ridgeHeight <= heightBand.baseHeight + 0.20 )
+      return false;
+
+    refinedRidge = roughRidge;
+    refinedRidge.success = true;
+    refinedRidge.firstPoint = QgsPoint( firstXY.x(), firstXY.y(), ridgeHeight );
+    refinedRidge.secondPoint = QgsPoint( secondXY.x(), secondXY.y(), ridgeHeight );
+    refinedRidge.dirX = finalRidgeDirX;
+    refinedRidge.dirY = finalRidgeDirY;
+    return true;
+  }
+
   bool topHeightHippedRidgeFromPointCloud( const QVector<QgsPointXY> &ring, const QVector<BuildingRoof::RoofSample> &pointCloudSamples, const QgsPoint &boundaryPoint, AutoHippedRidge &ridge )
   {
     double dirX = 0.0;
@@ -3014,6 +5328,16 @@ namespace
 
     AutoHippedRidge best;
     double bestScore = -1.0;
+    QVector<QgsPoint> roofPoints;
+    roofPoints.reserve( filteredSamples.size() );
+    for ( const BuildingRoof::RoofSample &sample : filteredSamples )
+      roofPoints.append( sample.point );
+
+    QgsPoint gabledRidgePoint;
+    double gabledDirX = 0.0;
+    double gabledDirY = 0.0;
+    GabledBoundarySlopePlanes gabledSlopePlanes;
+    const bool hasGabledMainRidge = leastSquaresGabledRidgePointFromPointCloud( ring, filteredSamples, boundaryPoint, gabledRidgePoint, &gabledDirX, &gabledDirY, &gabledSlopePlanes );
     QVector<double> percentiles;
     percentiles << 0.72 << 0.78 << 0.84 << 0.90;
     for ( double percentile : percentiles )
@@ -3027,10 +5351,22 @@ namespace
           highPoints.append( sample.point );
       }
 
+      if ( hasGabledMainRidge )
+      {
+        AutoHippedRidge gabledCandidate;
+        double gabledCandidateScore = 0.0;
+        if ( fitHippedRidgeCandidateOnKnownLine( ring, roofPoints, highPoints, gabledRidgePoint, gabledDirX, gabledDirY, heightBand.ridgeHeight, gabledCandidate, gabledCandidateScore )
+             && ( !best.preferredGabledSeed || gabledCandidateScore > bestScore ) )
+        {
+          bestScore = gabledCandidateScore;
+          best = gabledCandidate;
+        }
+      }
+
       AutoHippedRidge candidate;
       double candidateScore = 0.0;
       if ( fitAutoHippedRidgeCandidate( ring, highPoints, dirX, dirY, heightBand.ridgeHeight, candidate, candidateScore )
-           && candidateScore > bestScore )
+           && !best.preferredGabledSeed && candidateScore > bestScore )
       {
         bestScore = candidateScore;
         best = candidate;
@@ -3047,8 +5383,20 @@ namespace
 
     AutoHippedRidge candidate;
     double candidateScore = 0.0;
+    if ( hasGabledMainRidge )
+    {
+      AutoHippedRidge gabledCandidate;
+      double gabledCandidateScore = 0.0;
+      if ( fitHippedRidgeCandidateOnKnownLine( ring, roofPoints, ridgeBandPoints, gabledRidgePoint, gabledDirX, gabledDirY, heightBand.ridgeHeight, gabledCandidate, gabledCandidateScore )
+             && ( !best.preferredGabledSeed || gabledCandidateScore > bestScore ) )
+      {
+        bestScore = gabledCandidateScore;
+        best = gabledCandidate;
+      }
+    }
+
     if ( fitAutoHippedRidgeCandidate( ring, ridgeBandPoints, dirX, dirY, heightBand.ridgeHeight, candidate, candidateScore )
-         && candidateScore > bestScore )
+         && !best.preferredGabledSeed && candidateScore > bestScore )
     {
       bestScore = candidateScore;
       best = candidate;
@@ -3057,7 +5405,11 @@ namespace
     if ( !best.success )
       return false;
 
-    ridge = best;
+    AutoHippedRidge refined;
+    if ( refineHippedRidgeWithLeastSquaresPlanes( ring, pointCloudSamples, heightBand, best, refined ) )
+      ridge = refined;
+    else
+      ridge = best;
     return true;
   }
 
@@ -3909,61 +6261,18 @@ namespace
     return hasSegment ? bestZ : baseHeight;
   }
 
-  void appendTriangulatedBentRoofSurface( BuildingRoof::Mesh &mesh, const QVector<QgsPointXY> &polygon, const QgsPoint &boundaryPoint, const QVector<BentGableSegment> &segments, double baseHeight )
+  BentGableLayout findBentGabledLayout( const QVector<QgsPointXY> &inputRing, const QgsPointXY &ridgeXY, double dirX, double dirY )
   {
-    if ( polygon.size() < 3 )
-      return;
-
-    QVector<QgsPointXY> localRing = polygon;
-    double area = 0.0;
-    for ( int i = 0; i < localRing.size(); ++i )
-    {
-      const QgsPointXY &a = localRing[i];
-      const QgsPointXY &b = localRing[( i + 1 ) % localRing.size()];
-      area += a.x() * b.y() - b.x() * a.y();
-    }
-    if ( area < 0.0 )
-      std::reverse( localRing.begin(), localRing.end() );
-
-    const int vertexOffset = mesh.vertices.size();
-    for ( const QgsPointXY &point : localRing )
-      mesh.vertices.append( QgsPoint( point.x(), point.y(), bentGabledTopZ( point, boundaryPoint, segments, baseHeight ) ) );
-
-    const QVector<int> triangles = triangulateRing( localRing );
-    for ( int i = 0; i + 2 < triangles.size(); i += 3 )
-      mesh.indices << vertexOffset + triangles[i] << vertexOffset + triangles[i + 1] << vertexOffset + triangles[i + 2];
-  }
-
-  void appendBentSegmentRoofSurfaces( BuildingRoof::Mesh &mesh, const QgsGeometry &footprintGeometry, const QVector<QgsPointXY> &referenceRing, const BentGableSegment &segment, const QgsPoint &boundaryPoint, const QVector<BentGableSegment> &segments, double baseHeight )
-  {
-    const QgsPointXY ridgeXY( segment.ridgePoint.x(), segment.ridgePoint.y() );
-    for ( bool keepPositive : { true, false } )
-    {
-      const QgsGeometry slopeGeometry = intersectWithHalfPlane( footprintGeometry, referenceRing, ridgeXY, segment.normalX, segment.normalY, keepPositive );
-      for ( const QVector<QgsPointXY> &slopeRing : exteriorRingsFromGeometry( slopeGeometry ) )
-        appendTriangulatedBentRoofSurface( mesh, slopeRing, boundaryPoint, segments, baseHeight );
-    }
-  }
-
-  BuildingRoof::MeshResult buildBentGabledRoofPrismMesh( const QVector<QgsPointXY> &inputRing, const QgsPoint &boundaryPoint, const QgsPoint &ridgePoint, double dirX, double dirY )
-  {
-    BuildingRoof::MeshResult result;
+    BentGableLayout layout;
     if ( inputRing.size() < 5 )
-      return result;
+      return layout;
 
-    const QgsPointXY ridgeXY( ridgePoint.x(), ridgePoint.y() );
     const QVector<LineInterval> primaryIntervals = lineInsideRingIntervals( inputRing, ridgeXY, dirX, dirY );
     if ( primaryIntervals.isEmpty() )
-      return result;
+      return layout;
 
     bool found = false;
     double bestScore = std::numeric_limits<double>::max();
-    QgsPointXY bestPrimaryEnd;
-    QgsPointXY bestBend;
-    QgsPointXY bestSecondaryEnd;
-    double bestSplitNormalX = 0.0;
-    double bestSplitNormalY = 0.0;
-
     for ( int pass = 0; pass < 2 && !found; ++pass )
     {
       bestScore = std::numeric_limits<double>::max();
@@ -4007,40 +6316,88 @@ namespace
         if ( score < bestScore )
         {
           bestScore = score;
-          bestPrimaryEnd = primaryEnd;
-          bestBend = bend;
-          bestSecondaryEnd = secondaryEnd;
-          bestSplitNormalX = splitNormalX;
-          bestSplitNormalY = splitNormalY;
+          layout.primaryEnd = primaryEnd;
+          layout.bend = bend;
+          layout.secondaryEnd = secondaryEnd;
+          layout.splitNormalX = splitNormalX;
+          layout.splitNormalY = splitNormalY;
+          layout.success = true;
           found = true;
         }
       }
     }
 
-    if ( !found )
+    return layout;
+  }
+
+  void appendTriangulatedBentRoofSurface( BuildingRoof::Mesh &mesh, const QVector<QgsPointXY> &polygon, const QgsPoint &boundaryPoint, const QVector<BentGableSegment> &segments, double baseHeight )
+  {
+    if ( polygon.size() < 3 )
+      return;
+
+    QVector<QgsPointXY> localRing = polygon;
+    double area = 0.0;
+    for ( int i = 0; i < localRing.size(); ++i )
+    {
+      const QgsPointXY &a = localRing[i];
+      const QgsPointXY &b = localRing[( i + 1 ) % localRing.size()];
+      area += a.x() * b.y() - b.x() * a.y();
+    }
+    if ( area < 0.0 )
+      std::reverse( localRing.begin(), localRing.end() );
+
+    const int vertexOffset = mesh.vertices.size();
+    for ( const QgsPointXY &point : localRing )
+      mesh.vertices.append( QgsPoint( point.x(), point.y(), bentGabledTopZ( point, boundaryPoint, segments, baseHeight ) ) );
+
+    const QVector<int> triangles = triangulateRing( localRing );
+    for ( int i = 0; i + 2 < triangles.size(); i += 3 )
+      mesh.indices << vertexOffset + triangles[i] << vertexOffset + triangles[i + 1] << vertexOffset + triangles[i + 2];
+  }
+
+  void appendBentSegmentRoofSurfaces( BuildingRoof::Mesh &mesh, const QgsGeometry &footprintGeometry, const QVector<QgsPointXY> &referenceRing, const BentGableSegment &segment, const QgsPoint &boundaryPoint, const QVector<BentGableSegment> &segments, double baseHeight )
+  {
+    const QgsPointXY ridgeXY( segment.ridgePoint.x(), segment.ridgePoint.y() );
+    for ( bool keepPositive : { true, false } )
+    {
+      const QgsGeometry slopeGeometry = intersectWithHalfPlane( footprintGeometry, referenceRing, ridgeXY, segment.normalX, segment.normalY, keepPositive );
+      for ( const QVector<QgsPointXY> &slopeRing : exteriorRingsFromGeometry( slopeGeometry ) )
+        appendTriangulatedBentRoofSurface( mesh, slopeRing, boundaryPoint, segments, baseHeight );
+    }
+  }
+
+  BuildingRoof::MeshResult buildBentGabledRoofPrismMesh( const QVector<QgsPointXY> &inputRing, const QgsPoint &boundaryPoint, const QgsPoint &ridgePoint, double dirX, double dirY )
+  {
+    BuildingRoof::MeshResult result;
+    if ( inputRing.size() < 5 )
+      return result;
+
+    const QgsPointXY ridgeXY( ridgePoint.x(), ridgePoint.y() );
+    const BentGableLayout layout = findBentGabledLayout( inputRing, ridgeXY, dirX, dirY );
+    if ( !layout.success )
       return result;
 
     const double baseHeight = boundaryPoint.z();
-    QVector<QgsPointXY> ring = ringWithInsertedBoundaryPoints( inputRing, QVector<QgsPointXY>{ bestPrimaryEnd, bestSecondaryEnd } );
+    QVector<QgsPointXY> ring = ringWithInsertedBoundaryPoints( inputRing, QVector<QgsPointXY>{ layout.primaryEnd, layout.secondaryEnd } );
 
     QVector<BentGableSegment> segments;
     BentGableSegment primarySegment;
     BentGableSegment secondarySegment;
-    if ( !makeBentSegment( bestPrimaryEnd, bestBend, ridgePoint.z(), ring, boundaryPoint, primarySegment ) )
+    if ( !makeBentSegment( layout.primaryEnd, layout.bend, ridgePoint.z(), ring, boundaryPoint, primarySegment ) )
       return result;
-    if ( !makeBentSegment( bestBend, bestSecondaryEnd, ridgePoint.z(), ring, boundaryPoint, secondarySegment ) )
+    if ( !makeBentSegment( layout.bend, layout.secondaryEnd, ridgePoint.z(), ring, boundaryPoint, secondarySegment ) )
       return result;
     segments << primarySegment << secondarySegment;
 
-    const QgsPoint splitPoint( bestBend.x(), bestBend.y(), ridgePoint.z() );
-    const double primarySide = signedDistanceToLine( bestPrimaryEnd, splitPoint, bestSplitNormalX, bestSplitNormalY );
+    const QgsPoint splitPoint( layout.bend.x(), layout.bend.y(), ridgePoint.z() );
+    const double primarySide = signedDistanceToLine( layout.primaryEnd, splitPoint, layout.splitNormalX, layout.splitNormalY );
     if ( std::fabs( primarySide ) <= 1e-8 )
       return result;
 
     const QgsGeometry footprintGeometry = polygonGeometryFromRing( ring );
     const QgsPointXY splitXY( splitPoint.x(), splitPoint.y() );
-    const QgsGeometry primaryFootprint = intersectWithHalfPlane( footprintGeometry, ring, splitXY, bestSplitNormalX, bestSplitNormalY, primarySide > 0.0 );
-    const QgsGeometry secondaryFootprint = intersectWithHalfPlane( footprintGeometry, ring, splitXY, bestSplitNormalX, bestSplitNormalY, primarySide < 0.0 );
+    const QgsGeometry primaryFootprint = intersectWithHalfPlane( footprintGeometry, ring, splitXY, layout.splitNormalX, layout.splitNormalY, primarySide > 0.0 );
+    const QgsGeometry secondaryFootprint = intersectWithHalfPlane( footprintGeometry, ring, splitXY, layout.splitNormalX, layout.splitNormalY, primarySide < 0.0 );
     if ( exteriorRingsFromGeometry( primaryFootprint ).isEmpty() || exteriorRingsFromGeometry( secondaryFootprint ).isEmpty() )
       return result;
 
@@ -4889,6 +7246,104 @@ static BuildingRoof::MeshResult buildGabledRoofPrismMeshFromKeypoints( const Qgs
   return result;
 }
 
+static BuildingRoof::MeshResult buildLeastSquaresClippedGabledRoofPrismMesh( const QgsGeometry &buildingGeometry, const QList<BuildingRoof::RoofPoint> &roofPoints, const GabledBoundarySlopePlanes &slopePlanes, double dirX, double dirY )
+{
+  using MeshResult = BuildingRoof::MeshResult;
+  using RoofPoint = BuildingRoof::RoofPoint;
+  MeshResult result;
+
+  if ( !slopePlanes.success || !slopePlanes.firstPlane.success || !slopePlanes.secondPlane.success || !slopePlanes.hasSideSigns )
+  {
+    result.error = QStringLiteral( "Least-squares gabled roof planes are not reliably separated by ridge side." );
+    return result;
+  }
+
+  const QList<RoofPoint> boundary = boundaryPoints( roofPoints );
+  const QList<RoofPoint> ridges = ridgePoints( roofPoints );
+  if ( boundary.size() != 1 || ridges.size() != 1 )
+  {
+    result.error = QStringLiteral( "Least-squares clipped gabled roof requires one boundary point and one ridge point." );
+    return result;
+  }
+
+  const QgsPoint boundaryPoint = boundary.first().point;
+  const QgsPoint ridgePoint = ridges.first().point;
+  const QgsPolygonXY polygon = firstPolygon( buildingGeometry );
+  QVector<QgsPointXY> ring = exteriorRing( polygon );
+  if ( ring.size() < 3 )
+  {
+    result.error = QStringLiteral( "The building footprint cannot be used for least-squares clipped gabled roof mesh generation." );
+    return result;
+  }
+
+  const double dirLength = std::hypot( dirX, dirY );
+  if ( dirLength <= 1e-10 )
+  {
+    if ( !nearestEdgeDirection( ring, boundaryPoint, dirX, dirY ) )
+    {
+      result.error = QStringLiteral( "Cannot infer ridge direction for least-squares clipped gabled roof mesh generation." );
+      return result;
+    }
+  }
+  else
+  {
+    dirX /= dirLength;
+    dirY /= dirLength;
+  }
+
+  const double normalX = -dirY;
+  const double normalY = dirX;
+  const double boundaryDistance = signedDistanceToLine( QgsPointXY( boundaryPoint.x(), boundaryPoint.y() ), ridgePoint, normalX, normalY );
+  if ( std::fabs( boundaryDistance ) <= 1e-6 )
+  {
+    result.error = QStringLiteral( "The boundary point must not lie on the ridge line." );
+    return result;
+  }
+  if ( !leastSquaresPlanesReliableForClippedMesh( slopePlanes, boundaryPoint, ridgePoint, normalX, normalY ) )
+  {
+    result.error = QStringLiteral( "Least-squares gabled roof planes are not reliable enough for direct clipped mesh generation." );
+    return result;
+  }
+
+  const LeastSquaresRoofPlane *positivePlane = planeForRidgeSide( slopePlanes, true );
+  const LeastSquaresRoofPlane *negativePlane = planeForRidgeSide( slopePlanes, false );
+  if ( !positivePlane || !negativePlane )
+  {
+    result.error = QStringLiteral( "Cannot match least-squares planes to the two clipped gabled roof sides." );
+    return result;
+  }
+
+  ring = ringWithRidgeIntersections( ring, ridgePoint, normalX, normalY );
+  const double fallbackZ = boundaryPoint.z();
+  for ( const QgsPointXY &point : ring )
+  {
+    result.mesh.vertices.append( QgsPoint( point.x(), point.y(), 0.0 ) );
+    result.mesh.vertices.append( QgsPoint( point.x(), point.y(), leastSquaresGabledTopZForSide( point, slopePlanes, ridgePoint, normalX, normalY, fallbackZ ) ) );
+  }
+
+  const int count = ring.size();
+  for ( int i = 0; i < count; ++i )
+  {
+    const int next = ( i + 1 ) % count;
+    result.mesh.indices << 2 * i << 2 * next << 2 * i + 1;
+    result.mesh.indices << 2 * i + 1 << 2 * next << 2 * next + 1;
+  }
+
+  const QVector<int> bottomTriangles = triangulateRing( ring );
+  for ( int i = 0; i + 2 < bottomTriangles.size(); i += 3 )
+    result.mesh.indices << 2 * bottomTriangles[i] << 2 * bottomTriangles[i + 2] << 2 * bottomTriangles[i + 1];
+
+  const QVector<QgsPointXY> positiveRoofRing = clipRingByRidgeSide( ring, ridgePoint, normalX, normalY, true );
+  const QVector<QgsPointXY> negativeRoofRing = clipRingByRidgeSide( ring, ridgePoint, normalX, normalY, false );
+  appendTriangulatedLeastSquaresRoofSurface( result.mesh, positiveRoofRing, *positivePlane, ridgePoint, normalX, normalY, fallbackZ );
+  appendTriangulatedLeastSquaresRoofSurface( result.mesh, negativeRoofRing, *negativePlane, ridgePoint, normalX, normalY, fallbackZ );
+
+  result.success = !result.mesh.isEmpty();
+  if ( !result.success )
+    result.error = QStringLiteral( "Least-squares clipped gabled roof mesh generation failed." );
+  return result;
+}
+
 BuildingRoof::MeshResult BuildingRoof::buildGabledRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints, const QVector<RoofSample> &pointCloudSamples )
 {
   const QList<RoofPoint> boundary = boundaryPoints( roofPoints );
@@ -4899,9 +7354,19 @@ BuildingRoof::MeshResult BuildingRoof::buildGabledRoofPrismMesh( const QgsGeomet
     const QVector<QgsPointXY> ring = exteriorRing( polygon );
     if ( ring.size() >= 3 )
     {
-      const QList<RoofPoint> automaticRoofPoints = topHeightGabledRoofPoints( ring, boundary, ridges, pointCloudSamples );
+      GabledBoundarySlopePlanes automaticSlopePlanes;
+      double automaticRidgeDirX = 0.0;
+      double automaticRidgeDirY = 0.0;
+      const QList<RoofPoint> automaticRoofPoints = topHeightGabledRoofPoints( ring, boundary, ridges, pointCloudSamples, &automaticSlopePlanes, &automaticRidgeDirX, &automaticRidgeDirY );
       if ( !automaticRoofPoints.isEmpty() )
       {
+        if ( ridges.size() == 1 && automaticSlopePlanes.success && automaticSlopePlanes.hasSideSigns )
+        {
+          const MeshResult leastSquaresClippedResult = buildLeastSquaresClippedGabledRoofPrismMesh( buildingGeometry, automaticRoofPoints, automaticSlopePlanes, automaticRidgeDirX, automaticRidgeDirY );
+          if ( leastSquaresClippedResult.success )
+            return leastSquaresClippedResult;
+        }
+
         const MeshResult automaticResult = buildGabledRoofPrismMeshFromKeypoints( buildingGeometry, buildingHeight, automaticRoofPoints );
         if ( automaticResult.success )
           return automaticResult;
