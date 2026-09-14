@@ -12,7 +12,7 @@
 static const QString sName = QObject::tr( "Building Edit Manager" );
 static const QString sDescription = QObject::tr( "Building editing tools" );
 static const QString sCategory = QObject::tr( "Edit Tools" );
-static const QString sPluginVersion = QObject::tr( "Version 1.0.7" );
+static const QString sPluginVersion = QObject::tr( "Version 1.0.8" );
 static const QgisPlugin::PluginType sPluginType = QgisPlugin::UI;
 static const QString sPluginIcon = QStringLiteral( "" );
 
