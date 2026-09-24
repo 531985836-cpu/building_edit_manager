@@ -91,6 +91,9 @@ class ThreeDViewTool : public QgsMapTool
     void clearWireframeLayer();
     void updateWireframeLayer( QgsVectorLayer *layer, QgsFeatureId fid );
     void updateWireframeLayerFromMesh( const MeshData &mesh, QgsFeatureId fid );
+    void ensureRoofSegmentationLayer();
+    void clearRoofSegmentationLayer();
+    void updateRoofSegmentationLayer( QgsVectorLayer *layer, QgsFeatureId fid );
     QgsFeatureList buildSimplifiedWireframeFromMesh( const MeshData &mesh, QgsFeatureId fid, bool flatTopWireframe, bool curvedWireframe, bool eaveWireframe ) const;
     void cleanup3DState();
     void refresh3DCanvases();
@@ -129,6 +132,8 @@ class ThreeDViewTool : public QgsMapTool
     QPointer<QgsVectorLayer> mActiveLayer = nullptr;
     QPointer<QgsVectorLayer> mTempLayer = nullptr;
     QPointer<QgsVectorLayer> mWireframeLayer = nullptr;
+    QPointer<QgsVectorLayer> mRoofSegmentationLayer = nullptr;
+    bool mShowRoofSegmentationDebug = false;
     QString mSelectedHeightField;
     bool mBuildingTriangleMeshMode = false;
     bool mTriangleMeshHiddenLayerWasVisible = false;

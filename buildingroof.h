@@ -46,6 +46,20 @@ class BuildingRoof
       Mesh mesh;
     };
 
+    struct RoofPlaneSegment
+    {
+      int id = 0;
+      bool accepted = false;
+      double projectedAreaRatio = 0.0;
+      QVector<QgsPoint> points;
+    };
+
+    struct RoofPlaneSegmentation
+    {
+      QVector<RoofPlaneSegment> segments;
+      QVector<QgsPoint> unclassifiedPoints;
+    };
+
     static Result buildSingleSlopeRoof( const QgsGeometry &buildingGeometry, const QList<RoofPoint> &roofPoints );
     static MeshResult buildSingleSlopePrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints );
     static MeshResult buildFlatReliefPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints, const QVector<RoofSample> &pointCloudSamples = QVector<RoofSample>() );
@@ -55,4 +69,5 @@ class BuildingRoof
     static MeshResult buildGabledRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints, const QVector<RoofSample> &pointCloudSamples = QVector<RoofSample>() );
     static MeshResult buildMultiRidgePrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints );
     static MeshResult buildHippedRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints, const QVector<RoofSample> &pointCloudSamples = QVector<RoofSample>() );
+    static RoofPlaneSegmentation segmentRoofPlanesForDebug( const QgsGeometry &buildingGeometry, const QVector<RoofSample> &pointCloudSamples, bool preserveSmallEndPlanes = false );
 };

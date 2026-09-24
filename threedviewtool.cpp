@@ -8,6 +8,7 @@
 #include <qgspointcloudindex.h>
 #include <qgspointcloudrequest.h>
 #include <qgspointcloudattributebyramprenderer.h>
+#include <qgspoint3dsymbol.h>
 #include <qgsrasterlayer.h>
 #include <qgsproject.h>
 #include <qgsmapmouseevent.h>
@@ -49,6 +50,9 @@
 #include <qgs3dmapscene.h>
 #include <qgsvector3d.h>
 #include <qgsnullsymbolrenderer.h>
+#include <qgsmarkersymbol.h>
+#include <qgscategorizedsymbolrenderer.h>
+#include <qgsrulebased3drenderer.h>
 #include <qgslinesymbol.h>
 #include <qgssinglesymbolrenderer.h>
 #include <qgslayertreelayer.h>
@@ -71,6 +75,47 @@
 // ==================== 构造与析构 ====================
 namespace
 {
+  QColor roofSegmentColor( int segmentId, bool accepted )
+  {
+    if ( !accepted )
+      return QColor( 255, 125, 25 );
+
+    const QList<QColor> colors = {
+      QColor( 230, 45, 45 ),
+      QColor( 20, 175, 80 ),
+      QColor( 35, 105, 235 ),
+      QColor( 210, 55, 205 ),
+      QColor( 255, 205, 20 ),
+      QColor( 0, 190, 205 ),
+      QColor( 150, 75, 225 ),
+      QColor( 235, 90, 150 )
+    };
+    return colors.at( std::max( 0, segmentId - 1 ) % colors.size() );
+  }
+
+  QgsMarkerSymbol *createRoofSegmentMarkerSymbol( const QColor &color, double size )
+  {
+    return QgsMarkerSymbol::createSimple(
+      { { QStringLiteral( "name" ), QStringLiteral( "square" ) },
+        { QStringLiteral( "color" ), QStringLiteral( "%1,%2,%3,235" ).arg( color.red() ).arg( color.green() ).arg( color.blue() ) },
+        { QStringLiteral( "outline_style" ), QStringLiteral( "no" ) },
+        { QStringLiteral( "size" ), QString::number( size, 'f', 1 ) } } ).release();
+  }
+
+  QgsPoint3DSymbol *createRoofSegmentPoint3DSymbol( const QColor &color )
+  {
+    QgsPoint3DSymbol *symbol = new QgsPoint3DSymbol();
+    symbol->setAltitudeClamping( Qgis::AltitudeClamping::Absolute );
+    symbol->setShape( Qgis::Point3DShape::Billboard );
+    symbol->setBillboardSymbol( createRoofSegmentMarkerSymbol( color, 3.8 ) );
+
+    QgsPhongMaterialSettings *material = new QgsPhongMaterialSettings();
+    material->setAmbient( color.darker( 120 ) );
+    material->setDiffuse( color );
+    symbol->setMaterialSettings( material );
+    return symbol;
+  }
+
   QList<QgsColorRampShader::ColorRampItem> pointCloudElevationRampItems( double zMin, double zMax )
   {
     const QList<QColor> colors = {
@@ -456,6 +501,7 @@ void ThreeDViewTool::cleanup3DState()
   restoreLayerVisibilityAfterTriangleMesh();
   clearPreviewEntity();
   clearWireframeLayer();
+  clearRoofSegmentationLayer();
 
   if ( mActiveLayer )
     disconnect( mActiveLayer, nullptr, this, nullptr );
@@ -650,6 +696,122 @@ void ThreeDViewTool::clearWireframeLayer()
   mWireframeLayer = nullptr;
   mWireframeFid = FID_NULL;
   QgsProject::instance()->removeMapLayer( layerId );
+}
+
+void ThreeDViewTool::ensureRoofSegmentationLayer()
+{
+  if ( mRoofSegmentationLayer )
+    return;
+
+  const QString crs = mActiveLayer && mActiveLayer->crs().isValid() ? mActiveLayer->crs().authid() : QStringLiteral( "EPSG:4326" );
+  mRoofSegmentationLayer = new QgsVectorLayer(
+    QStringLiteral( "PointZ?crs=%1&field=original_fid:long&field=class_id:int&field=segment_id:int&field=status:string&field=area_ratio:double" ).arg( crs ),
+    QStringLiteral( "Roof_RANSAC_Segmentation_Debug" ),
+    QStringLiteral( "memory" )
+  );
+  if ( !mRoofSegmentationLayer || !mRoofSegmentationLayer->isValid() )
+    return;
+
+  mRoofSegmentationLayer->setFlags( mRoofSegmentationLayer->flags() & ~QgsMapLayer::Identifiable );
+  mRoofSegmentationLayer->setFlags( mRoofSegmentationLayer->flags() & ~QgsMapLayer::Searchable );
+  QgsProject::instance()->addMapLayer( mRoofSegmentationLayer, false );
+  QgsLayerTreeLayer *treeLayer = QgsProject::instance()->layerTreeRoot()->addLayer( mRoofSegmentationLayer );
+  if ( treeLayer )
+    treeLayer->setItemVisibilityChecked( true );
+  ensureLayerIn3DView( mRoofSegmentationLayer );
+}
+
+void ThreeDViewTool::clearRoofSegmentationLayer()
+{
+  if ( !mRoofSegmentationLayer )
+    return;
+
+  for ( Qgs3DMapCanvas *canvas3D : mIface ? mIface->mapCanvases3D() : QList<Qgs3DMapCanvas *>() )
+  {
+    if ( !canvas3D || !canvas3D->mapSettings() )
+      continue;
+    QList<QgsMapLayer *> layers = canvas3D->mapSettings()->layers();
+    if ( layers.removeAll( mRoofSegmentationLayer ) > 0 )
+      canvas3D->mapSettings()->setLayers( layers );
+  }
+
+  const QString layerId = mRoofSegmentationLayer->id();
+  mRoofSegmentationLayer = nullptr;
+  QgsProject::instance()->removeMapLayer( layerId );
+}
+
+void ThreeDViewTool::updateRoofSegmentationLayer( QgsVectorLayer *layer, QgsFeatureId fid )
+{
+  if ( !mShowRoofSegmentationDebug || !mBuildingTriangleMeshMode || !layer || layer != mActiveLayer || fid == FID_NULL )
+  {
+    clearRoofSegmentationLayer();
+    return;
+  }
+
+  QgsFeature feature;
+  if ( !layer->getFeatures( QgsFeatureRequest( fid ) ).nextFeature( feature ) )
+  {
+    clearRoofSegmentationLayer();
+    return;
+  }
+
+  const QVector<BuildingRoof::RoofSample> samples = collectRoofSamplesFromFirstPointCloud( feature.geometry() );
+  const QList<BuildingRoof::RoofPoint> roofPoints = roofPointsForFeature( feature );
+  int ridgePointCount = 0;
+  for ( const BuildingRoof::RoofPoint &roofPoint : roofPoints )
+  {
+    if ( roofPoint.type.contains( QStringLiteral( "屋脊" ) )
+         || roofPoint.type.contains( QStringLiteral( "ridge" ), Qt::CaseInsensitive ) )
+      ++ridgePointCount;
+  }
+  const BuildingRoof::RoofPlaneSegmentation segmentation = BuildingRoof::segmentRoofPlanesForDebug( feature.geometry(), samples, ridgePointCount >= 2 );
+  ensureRoofSegmentationLayer();
+  if ( !mRoofSegmentationLayer )
+    return;
+
+  QgsFeatureList features;
+  QgsCategoryList categories;
+  QgsRuleBased3DRenderer::Rule *rootRule = new QgsRuleBased3DRenderer::Rule( nullptr );
+  auto addClass = [&]( int classId, int segmentId, bool accepted, double areaRatio, const QVector<QgsPoint> &points ) {
+    const QColor color = segmentId == 0 ? QColor( 125, 125, 125 ) : roofSegmentColor( segmentId, accepted );
+    const QString status = segmentId == 0 ? tr( "未归类" ) : ( accepted ? tr( "保留" ) : tr( "小面积或非主连通块，排除" ) );
+    const QString label = segmentId == 0
+                            ? tr( "未归类点" )
+                            : tr( "平面 %1 - %2（投影占比 %3%）" ).arg( segmentId ).arg( status ).arg( areaRatio * 100.0, 0, 'f', 1 );
+    categories << QgsRendererCategory( classId, createRoofSegmentMarkerSymbol( color, segmentId == 0 ? 2.2 : 3.2 ), label );
+    rootRule->appendChild( new QgsRuleBased3DRenderer::Rule(
+      createRoofSegmentPoint3DSymbol( color ),
+      QStringLiteral( "\"class_id\" = %1" ).arg( classId ),
+      label ) );
+
+    for ( const QgsPoint &point : points )
+    {
+      QgsFeature debugPoint( mRoofSegmentationLayer->fields() );
+      debugPoint.setGeometry( QgsGeometry::fromPoint( point ) );
+      debugPoint.setAttributes( QgsAttributes() << fid << classId << segmentId << status << areaRatio );
+      features.append( debugPoint );
+    }
+  };
+
+  for ( const BuildingRoof::RoofPlaneSegment &segment : segmentation.segments )
+  {
+    const int classId = segment.accepted ? segment.id : 100 + segment.id;
+    addClass( classId, segment.id, segment.accepted, segment.projectedAreaRatio, segment.points );
+  }
+  if ( !segmentation.unclassifiedPoints.isEmpty() )
+    addClass( 0, 0, false, 0.0, segmentation.unclassifiedPoints );
+
+  mRoofSegmentationLayer->startEditing();
+  mRoofSegmentationLayer->deleteFeatures( mRoofSegmentationLayer->allFeatureIds() );
+  mRoofSegmentationLayer->addFeatures( features );
+  mRoofSegmentationLayer->commitChanges();
+  mRoofSegmentationLayer->setRenderer( new QgsCategorizedSymbolRenderer( QStringLiteral( "class_id" ), categories ) );
+
+  QgsRuleBased3DRenderer *renderer3D = new QgsRuleBased3DRenderer( rootRule );
+  renderer3D->setLayer( mRoofSegmentationLayer );
+  mRoofSegmentationLayer->setRenderer3D( renderer3D );
+  mRoofSegmentationLayer->triggerRepaint();
+  ensureLayerIn3DView( mRoofSegmentationLayer );
 }
 
 QgsFeatureList ThreeDViewTool::buildSimplifiedWireframeFromMesh( const MeshData &mesh, QgsFeatureId fid, bool flatTopWireframe, bool curvedWireframe, bool eaveWireframe ) const
@@ -1722,6 +1884,7 @@ void ThreeDViewTool::onLayerChanged( int index )
     mBuildingTriangleMeshMode = false;
     mWireframeFid = FID_NULL;
     clearWireframeLayer();
+    clearRoofSegmentationLayer();
     applyBuildingTriangleMeshMode();
   }
 
@@ -2227,7 +2390,10 @@ void ThreeDViewTool::updateFeature3D( const QgsFeature &originFeat )
   mTempLayer->triggerRepaint();
 
   if ( mBuildingTriangleMeshMode && originFeat.id() == mWireframeFid )
+  {
     updateWireframeLayerFromMesh( mesh, originFeat.id() );
+    updateRoofSegmentationLayer( mActiveLayer, originFeat.id() );
+  }
 }
 
 // 响应要素几何/属性变更
@@ -2280,7 +2446,10 @@ void ThreeDViewTool::onFeaturesDeleted( const QgsFeatureIds &fids )
       toDelete << f.id();
     mTempLayer->deleteFeatures( toDelete );
     if ( fid == mWireframeFid )
+    {
       clearWireframeLayer();
+      clearRoofSegmentationLayer();
+    }
   }
   mTempLayer->commitChanges();
   mTempLayer->triggerRepaint();
@@ -2344,11 +2513,13 @@ void ThreeDViewTool::onBuildingTriangleMeshModeChanged( QgsVectorLayer *layer, Q
   {
     hideActiveLayerForTriangleMesh();
     updateWireframeLayer( layer, fid );
+    updateRoofSegmentationLayer( layer, fid );
   }
   else
   {
     restoreLayerVisibilityAfterTriangleMesh();
     clearWireframeLayer();
+    clearRoofSegmentationLayer();
   }
 }
 
