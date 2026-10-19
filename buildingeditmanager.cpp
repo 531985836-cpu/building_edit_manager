@@ -12,7 +12,7 @@
 static const QString sName = QObject::tr( "Building Edit Manager" );
 static const QString sDescription = QObject::tr( "Building editing tools" );
 static const QString sCategory = QObject::tr( "Edit Tools" );
-static const QString sPluginVersion = QObject::tr( "Version 1.0.9" );
+static const QString sPluginVersion = QObject::tr( "Version 1.1.0" );
 static const QgisPlugin::PluginType sPluginType = QgisPlugin::UI;
 static const QString sPluginIcon = QStringLiteral( "" );
 
@@ -22,8 +22,6 @@ BuildingEditManager::BuildingEditManager( QgisInterface *iface )
   : QgisPlugin( sName, sDescription, sCategory, sPluginVersion, sPluginType )
   , mIface( iface )
 {
-  QString projPath = "D:/conda/envs/qgis/Library/share/proj";
-  qputenv( "PROJ_LIB", projPath.toUtf8() );
 }
 
 BuildingEditManager::~BuildingEditManager()

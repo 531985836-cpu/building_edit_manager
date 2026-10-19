@@ -51,6 +51,7 @@ class CreateTool : public QgsMapTool
 
     // --- UI 管理与界面交互 ---
     void setupUi();
+    void createVectorLayer();
     void updateFields( int index );
     void refreshLayerCombos();
     void updateWidgetInteractivity( bool heightEnabled, bool mergeEnabled );
@@ -77,6 +78,7 @@ class CreateTool : public QgsMapTool
     Ui::Form mUI;
     QWidget *mSettingsWidget = nullptr;
     QString mTargetFieldName;
+    QString mSelectedVectorLayerId;
 
     // --- 调试相关对象 ---
     QgsVectorLayer *mDebugLayer = nullptr;

@@ -65,6 +65,8 @@
 #include <QtMath>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <tuple>
 #include <Qt3DCore/QEntity>
 #include <Qt3DRender/QAttribute>
 #include <Qt3DRender/QBuffer>
@@ -381,7 +383,7 @@ namespace
     }
   }
 
-  QVector<BuildingRoof::RoofSample> collectRoofSamplesFromFirstPointCloud( const QgsGeometry &geometry, int maxSamples = 20000 )
+  QVector<BuildingRoof::RoofSample> collectRoofSamplesFromFirstPointCloud( const QgsGeometry &geometry )
   {
     QVector<BuildingRoof::RoofSample> samples;
     if ( geometry.isNull() || geometry.isEmpty() )
@@ -417,7 +419,6 @@ namespace
     const double yOffset = index.offset().y();
     const double zOffset = index.offset().z();
 
-    QVector<BuildingRoof::RoofSample> allSamples;
     for ( const QgsPointCloudNodeId &nodeId : nodeIds )
     {
       std::unique_ptr<QgsPointCloudBlock> block( index.nodeData( nodeId, request ) );
@@ -445,20 +446,10 @@ namespace
         if ( !geometry.contains( QgsGeometry::fromPointXY( xy ) ) )
           continue;
 
-        allSamples.append( BuildingRoof::RoofSample{ QgsPoint( x, y, z ) } );
+        samples.append( BuildingRoof::RoofSample{ QgsPoint( x, y, z ) } );
       }
     }
 
-    if ( maxSamples <= 0 || allSamples.size() <= maxSamples )
-      return allSamples;
-
-    const int stride = std::max( 1, allSamples.size() / maxSamples );
-    for ( int i = 0; i < allSamples.size(); i += stride )
-    {
-      samples.append( allSamples.at( i ) );
-      if ( samples.size() >= maxSamples )
-        break;
-    }
     return samples;
   }
 }
@@ -630,7 +621,7 @@ void ThreeDViewTool::ensureWireframeLayer()
   if ( mWireframeLayer )
     return;
 
-  const QString crs = mActiveLayer && mActiveLayer->crs().isValid() ? mActiveLayer->crs().authid() : QStringLiteral( "EPSG:4326" );
+  const QString crs = mActiveLayer && mActiveLayer->crs().isValid() ? mActiveLayer->crs().authid() : QString();
   mWireframeLayer = new QgsVectorLayer(
     QStringLiteral( "LineStringZ?crs=%1&field=original_fid:long" ).arg( crs ),
     QStringLiteral( "Building_Wireframe_Current" ),
@@ -703,7 +694,7 @@ void ThreeDViewTool::ensureRoofSegmentationLayer()
   if ( mRoofSegmentationLayer )
     return;
 
-  const QString crs = mActiveLayer && mActiveLayer->crs().isValid() ? mActiveLayer->crs().authid() : QStringLiteral( "EPSG:4326" );
+  const QString crs = mActiveLayer && mActiveLayer->crs().isValid() ? mActiveLayer->crs().authid() : QString();
   mRoofSegmentationLayer = new QgsVectorLayer(
     QStringLiteral( "PointZ?crs=%1&field=original_fid:long&field=class_id:int&field=segment_id:int&field=status:string&field=area_ratio:double" ).arg( crs ),
     QStringLiteral( "Roof_RANSAC_Segmentation_Debug" ),
@@ -758,13 +749,29 @@ void ThreeDViewTool::updateRoofSegmentationLayer( QgsVectorLayer *layer, QgsFeat
   const QVector<BuildingRoof::RoofSample> samples = collectRoofSamplesFromFirstPointCloud( feature.geometry() );
   const QList<BuildingRoof::RoofPoint> roofPoints = roofPointsForFeature( feature );
   int ridgePointCount = 0;
+  int boundaryPointCount = 0;
   for ( const BuildingRoof::RoofPoint &roofPoint : roofPoints )
   {
     if ( roofPoint.type.contains( QStringLiteral( "屋脊" ) )
+         || roofPoint.type.contains( QStringLiteral( "灞嬭剨" ) )
          || roofPoint.type.contains( QStringLiteral( "ridge" ), Qt::CaseInsensitive ) )
+    {
       ++ridgePointCount;
+      continue;
+    }
+    if ( !roofPoint.type.contains( QStringLiteral( "地面" ) )
+         && !roofPoint.type.contains( QStringLiteral( "鍦伴潰" ) )
+         && !roofPoint.type.contains( QStringLiteral( "ground" ), Qt::CaseInsensitive )
+         && !roofPoint.type.contains( QStringLiteral( "曲面点" ) )
+         && !roofPoint.type.contains( QStringLiteral( "surface" ), Qt::CaseInsensitive )
+         && !roofPoint.type.contains( QStringLiteral( "顶点" ) )
+         && !roofPoint.type.contains( QStringLiteral( "vertex" ), Qt::CaseInsensitive ) )
+      ++boundaryPointCount;
   }
-  const BuildingRoof::RoofPlaneSegmentation segmentation = BuildingRoof::segmentRoofPlanesForDebug( feature.geometry(), samples, ridgePointCount >= 2 );
+  const bool flatTopRoof = boundaryPointCount == 2 && ridgePointCount == 1;
+  const BuildingRoof::RoofPlaneSegmentation segmentation = flatTopRoof
+                                                           ? BuildingRoof::segmentFlatTopRoofCloud( feature.geometry(), samples )
+                                                           : BuildingRoof::segmentRoofPlanesForDebug( feature.geometry(), samples, ridgePointCount >= 2 );
   ensureRoofSegmentationLayer();
   if ( !mRoofSegmentationLayer )
     return;
@@ -773,12 +780,16 @@ void ThreeDViewTool::updateRoofSegmentationLayer( QgsVectorLayer *layer, QgsFeat
   QgsCategoryList categories;
   QgsRuleBased3DRenderer::Rule *rootRule = new QgsRuleBased3DRenderer::Rule( nullptr );
   auto addClass = [&]( int classId, int segmentId, bool accepted, double areaRatio, const QVector<QgsPoint> &points ) {
-    const QColor color = segmentId == 0 ? QColor( 125, 125, 125 ) : roofSegmentColor( segmentId, accepted );
-    const QString status = segmentId == 0 ? tr( "未归类" ) : ( accepted ? tr( "保留" ) : tr( "小面积或非主连通块，排除" ) );
-    const QString label = segmentId == 0
-                            ? tr( "未归类点" )
-                            : tr( "平面 %1 - %2（投影占比 %3%）" ).arg( segmentId ).arg( status ).arg( areaRatio * 100.0, 0, 'f', 1 );
-    categories << QgsRendererCategory( classId, createRoofSegmentMarkerSymbol( color, segmentId == 0 ? 2.2 : 3.2 ), label );
+    const QColor color = classId == -1 ? QColor( 45, 45, 45 )
+                         : segmentId == 0 ? QColor( 125, 125, 125 ) : roofSegmentColor( segmentId, accepted );
+    const QString status = classId == -1 ? tr( "候选范围外" )
+                           : segmentId == 0 ? tr( "未归类候选点" ) : ( accepted ? tr( "主要候选面" ) : tr( "小面积或非主连通候选面" ) );
+    const QString label = classId == -1
+                            ? tr( "候选范围外（%1 点）" ).arg( points.size() )
+                            : segmentId == 0
+                              ? ( flatTopRoof ? tr( "未分入平面的点（%1 点）" ) : tr( "未归类候选点（含高度带外，%1 点）" ) ).arg( points.size() )
+                              : tr( "平面 %1 - %2（投影占比 %3%，%4 点）" ).arg( segmentId ).arg( status ).arg( areaRatio * 100.0, 0, 'f', 1 ).arg( points.size() );
+    categories << QgsRendererCategory( classId, createRoofSegmentMarkerSymbol( color, segmentId <= 0 ? 2.2 : 3.2 ), label );
     rootRule->appendChild( new QgsRuleBased3DRenderer::Rule(
       createRoofSegmentPoint3DSymbol( color ),
       QStringLiteral( "\"class_id\" = %1" ).arg( classId ),
@@ -793,13 +804,40 @@ void ThreeDViewTool::updateRoofSegmentationLayer( QgsVectorLayer *layer, QgsFeat
     }
   };
 
+  struct DebugClass
+  {
+    int segmentId = 0;
+    bool accepted = false;
+    double areaRatio = 0.0;
+    QVector<QgsPoint> points;
+  };
+  QMap<int, DebugClass> classes;
+  using PointKey = std::tuple<double, double, double>;
+  auto pointKey = []( const QgsPoint &point ) -> PointKey {
+    return std::make_tuple( point.x(), point.y(), point.z() );
+  };
+  std::map<PointKey, int> classByPoint;
   for ( const BuildingRoof::RoofPlaneSegment &segment : segmentation.segments )
   {
-    const int classId = segment.accepted ? segment.id : 100 + segment.id;
-    addClass( classId, segment.id, segment.accepted, segment.projectedAreaRatio, segment.points );
+    const int classId = segment.meetsAreaReference ? segment.id : 100 + segment.id;
+    DebugClass &debugClass = classes[classId];
+    debugClass.segmentId = segment.id;
+    debugClass.accepted = segment.meetsAreaReference;
+    debugClass.areaRatio = segment.projectedAreaRatio;
+    for ( const QgsPoint &point : segment.points )
+      classByPoint[pointKey( point )] = classId;
   }
-  if ( !segmentation.unclassifiedPoints.isEmpty() )
-    addClass( 0, 0, false, 0.0, segmentation.unclassifiedPoints );
+  for ( const QgsPoint &point : segmentation.unclassifiedPoints )
+    classByPoint.emplace( pointKey( point ), 0 );
+
+  for ( const BuildingRoof::RoofSample &sample : samples )
+  {
+    const auto found = classByPoint.find( pointKey( sample.point ) );
+    const int classId = found == classByPoint.end() ? -1 : found->second;
+    classes[classId].points.append( sample.point );
+  }
+  for ( auto it = classes.cbegin(); it != classes.cend(); ++it )
+    addClass( it.key(), it.value().segmentId, it.value().accepted, it.value().areaRatio, it.value().points );
 
   mRoofSegmentationLayer->startEditing();
   mRoofSegmentationLayer->deleteFeatures( mRoofSegmentationLayer->allFeatureIds() );
@@ -1023,7 +1061,7 @@ QgsFeatureList ThreeDViewTool::buildSimplifiedWireframeFromMesh( const MeshData 
     }
   }
 
-  if ( flatTopWireframe && hasFlatTopFace && topPoints.size() >= 3 )
+  if ( flatTopWireframe && hasFlatTopFace && topPoints.size() >= 3 && mesh.structureLines.isEmpty() )
   {
     const QVector<QgsPoint> topHull = convexHullByXY( topPoints );
     for ( int i = 0; i < topHull.size(); ++i )

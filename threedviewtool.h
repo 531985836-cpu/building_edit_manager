@@ -133,7 +133,8 @@ class ThreeDViewTool : public QgsMapTool
     QPointer<QgsVectorLayer> mTempLayer = nullptr;
     QPointer<QgsVectorLayer> mWireframeLayer = nullptr;
     QPointer<QgsVectorLayer> mRoofSegmentationLayer = nullptr;
-    bool mShowRoofSegmentationDebug = false;
+
+    bool mShowRoofSegmentationDebug = true;
     QString mSelectedHeightField;
     bool mBuildingTriangleMeshMode = false;
     bool mTriangleMeshHiddenLayerWasVisible = false;

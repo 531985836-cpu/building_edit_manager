@@ -1153,9 +1153,7 @@ void RoofEditTool::ensurePointLayer()
   if ( mPointLayer )
     return;
 
-  const QString crs = mActiveLayer && mActiveLayer->crs().isValid()
-                        ? mActiveLayer->crs().authid()
-                        : ( mCanvas ? mCanvas->mapSettings().destinationCrs().authid() : QStringLiteral( "EPSG:4326" ) );
+  const QString crs = mActiveLayer && mActiveLayer->crs().isValid() ? mActiveLayer->crs().authid() : QString();
   const QString uri = QStringLiteral( "PointZ?crs=%1&field=building_fid:long&field=type:string&field=z:double&field=source:string&field=base_height:double" ).arg( crs );
   mPointLayer = new QgsVectorLayer( uri, tr( "Roof_Edit_Points" ), QStringLiteral( "memory" ) );
 
@@ -1207,9 +1205,7 @@ void RoofEditTool::ensureSavedPointLayer()
     }
   }
 
-  const QString crs = mActiveLayer && mActiveLayer->crs().isValid()
-                        ? mActiveLayer->crs().authid()
-                        : ( mCanvas ? mCanvas->mapSettings().destinationCrs().authid() : QStringLiteral( "EPSG:4326" ) );
+  const QString crs = mActiveLayer && mActiveLayer->crs().isValid() ? mActiveLayer->crs().authid() : QString();
   const QString uri = QStringLiteral( "PointZ?crs=%1&field=building_fid:long&field=type:string&field=z:double&field=source:string&field=base_height:double&field=rel_x:double&field=rel_y:double&field=building_shape:string&field=building_center_x:double&field=building_center_y:double" ).arg( crs );
   mSavedPointLayer = new QgsVectorLayer( uri, tr( "Roof_Saved_Points" ), QStringLiteral( "memory" ) );
   QgsProject::instance()->addMapLayer( mSavedPointLayer, false );
@@ -1293,9 +1289,7 @@ void RoofEditTool::ensureRoofPreviewLayer()
   if ( mRoofPreviewLayer )
     return;
 
-  const QString crs = mActiveLayer && mActiveLayer->crs().isValid()
-                        ? mActiveLayer->crs().authid()
-                        : ( mCanvas ? mCanvas->mapSettings().destinationCrs().authid() : QStringLiteral( "EPSG:4326" ) );
+  const QString crs = mActiveLayer && mActiveLayer->crs().isValid() ? mActiveLayer->crs().authid() : QString();
   const QString uri = QStringLiteral( "PolygonZ?crs=%1&field=building_fid:long&field=roof_type:string&field=preview:int" ).arg( crs );
   mRoofPreviewLayer = new QgsVectorLayer( uri, tr( "Roof_Edit_Roof_Preview" ), QStringLiteral( "memory" ) );
 
@@ -1308,9 +1302,7 @@ void RoofEditTool::ensureRoofModelLayer()
   if ( mRoofModelLayer )
     return;
 
-  const QString crs = mActiveLayer && mActiveLayer->crs().isValid()
-                        ? mActiveLayer->crs().authid()
-                        : ( mCanvas ? mCanvas->mapSettings().destinationCrs().authid() : QStringLiteral( "EPSG:4326" ) );
+  const QString crs = mActiveLayer && mActiveLayer->crs().isValid() ? mActiveLayer->crs().authid() : QString();
   const QString uri = QStringLiteral( "PolygonZ?crs=%1&field=building_fid:long&field=roof_type:string&field=preview:int" ).arg( crs );
   mRoofModelLayer = new QgsVectorLayer( uri, tr( "Roof_Edit_Roofs" ), QStringLiteral( "memory" ) );
 
@@ -1722,19 +1714,7 @@ void RoofEditTool::previewRoofModel()
   const QString pointCloudLayerId = mUI.pointCloudComboBox ? mUI.pointCloudComboBox->currentData().toString() : QString();
   mPointCloudLayer = qobject_cast<QgsPointCloudLayer *>( QgsProject::instance()->mapLayer( pointCloudLayerId ) );
   const QVector<BuildingRoof::RoofSample> pointCloudSamples = collectPointCloudSamplesForGeometry( mCurrentBuilding.geometry() );
-  BuildingRoof::MeshResult roofMesh = BuildingRoof::buildFlatReliefPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
-  if ( !roofMesh.success )
-    roofMesh = BuildingRoof::buildClusteredFlatTopHippedRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
-  if ( !roofMesh.success )
-    roofMesh = BuildingRoof::buildCurvedRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
-  if ( !roofMesh.success )
-    roofMesh = BuildingRoof::buildApexRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
-  if ( !roofMesh.success )
-    roofMesh = BuildingRoof::buildGabledRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
-  if ( !roofMesh.success )
-    roofMesh = BuildingRoof::buildHippedRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
-  if ( !roofMesh.success )
-    roofMesh = BuildingRoof::buildMultiRidgePrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
+  const BuildingRoof::MeshResult roofMesh = BuildingRoof::buildRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
   if ( !roofMesh.success )
   {
     QMessageBox::warning( mWidget, tr( "Roof preview" ), roofMesh.error );
@@ -1837,19 +1817,7 @@ void RoofEditTool::saveRoofModel()
   const QString pointCloudLayerId = mUI.pointCloudComboBox ? mUI.pointCloudComboBox->currentData().toString() : QString();
   mPointCloudLayer = qobject_cast<QgsPointCloudLayer *>( QgsProject::instance()->mapLayer( pointCloudLayerId ) );
   const QVector<BuildingRoof::RoofSample> pointCloudSamples = collectPointCloudSamplesForGeometry( mCurrentBuilding.geometry() );
-  BuildingRoof::MeshResult roofMesh = BuildingRoof::buildFlatReliefPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
-  if ( !roofMesh.success )
-    roofMesh = BuildingRoof::buildClusteredFlatTopHippedRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
-  if ( !roofMesh.success )
-    roofMesh = BuildingRoof::buildCurvedRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
-  if ( !roofMesh.success )
-    roofMesh = BuildingRoof::buildApexRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
-  if ( !roofMesh.success )
-    roofMesh = BuildingRoof::buildGabledRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
-  if ( !roofMesh.success )
-    roofMesh = BuildingRoof::buildHippedRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
-  if ( !roofMesh.success )
-    roofMesh = BuildingRoof::buildMultiRidgePrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints );
+  const BuildingRoof::MeshResult roofMesh = BuildingRoof::buildRoofPrismMesh( mCurrentBuilding.geometry(), 1.0, roofPoints, pointCloudSamples );
   if ( !roofMesh.success )
   {
     QMessageBox::warning( mWidget, tr( "Save roof" ), roofMesh.error );
@@ -2101,7 +2069,7 @@ double RoofEditTool::estimateHeightFromPointCloud( const QgsPointXY &mapPoint, c
   return percentileValue( values, heightPercentileForPointType( pointType ) );
 }
 
-QVector<BuildingRoof::RoofSample> RoofEditTool::collectPointCloudSamplesForGeometry( const QgsGeometry &geometry, int maxSamples ) const
+QVector<BuildingRoof::RoofSample> RoofEditTool::collectPointCloudSamplesForGeometry( const QgsGeometry &geometry ) const
 {
   QVector<BuildingRoof::RoofSample> samples;
   if ( geometry.isNull() || geometry.isEmpty() )
@@ -2131,7 +2099,6 @@ QVector<BuildingRoof::RoofSample> RoofEditTool::collectPointCloudSamplesForGeome
   const double yOffset = index.offset().y();
   const double zOffset = index.offset().z();
 
-  QVector<BuildingRoof::RoofSample> allSamples;
   const QgsGeometry preparedGeometry = geometry;
   for ( const QgsPointCloudNodeId &nodeId : nodeIds )
   {
@@ -2160,19 +2127,8 @@ QVector<BuildingRoof::RoofSample> RoofEditTool::collectPointCloudSamplesForGeome
       if ( !preparedGeometry.contains( QgsGeometry::fromPointXY( xy ) ) )
         continue;
 
-      allSamples.append( BuildingRoof::RoofSample{ QgsPoint( x, y, z ) } );
+      samples.append( BuildingRoof::RoofSample{ QgsPoint( x, y, z ) } );
     }
-  }
-
-  if ( maxSamples <= 0 || allSamples.size() <= maxSamples )
-    return allSamples;
-
-  const int stride = std::max( 1, allSamples.size() / maxSamples );
-  for ( int i = 0; i < allSamples.size(); i += stride )
-  {
-    samples.append( allSamples.at( i ) );
-    if ( samples.size() >= maxSamples )
-      break;
   }
   return samples;
 }

@@ -118,7 +118,7 @@ class RoofEditTool : public QgsMapTool
     QString currentPointType() const;
     QColor colorForPointType( const QString &type ) const;
     double estimateHeightFromPointCloud( const QgsPointXY &mapPoint, const QString &pointType ) const;
-    QVector<BuildingRoof::RoofSample> collectPointCloudSamplesForGeometry( const QgsGeometry &geometry, int maxSamples = 20000 ) const;
+    QVector<BuildingRoof::RoofSample> collectPointCloudSamplesForGeometry( const QgsGeometry &geometry ) const;
     void collectNodes( const QgsPointCloudIndex &index, const QgsPointCloudNodeId &nodeId, const QgsRectangle &extent, QList<QgsPointCloudNodeId> &nodes ) const;
 
     QPointer<QgisInterface> mIface = nullptr;

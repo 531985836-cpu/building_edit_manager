@@ -25,6 +25,12 @@
 #include <QgsGeometryUtils.h>
 #include <qgis.h>
 #include <qgslayertree.h>
+#include <qgsnewvectorlayerdialog.h>
+#include <qgsogrproviderutils.h>
+#include <qgsproviderregistry.h>
+#include <qgssettings.h>
+#include <QFileInfo>
+#include <QTreeWidget>
 // ==================== 构造 / 析构 ====================
 
 CreateTool::CreateTool( QgsMapCanvas *canvas )
@@ -101,6 +107,10 @@ void CreateTool::setupUi()
   } );
 
   connect( mUI.vectorcombo, QOverload<int>::of( &QComboBox::currentIndexChanged ), this, &CreateTool::updateFields );
+  connect( mUI.vectorcombo, QOverload<int>::of( &QComboBox::activated ), this, [this]( int index ) {
+    if ( mUI.vectorcombo->itemData( index, Qt::UserRole + 1 ).toBool() )
+      createVectorLayer();
+  } );
 
   // 确认按钮：保存设置并验证
   connect( mUI.setting, &QPushButton::clicked, this, [this]() {
@@ -161,8 +171,11 @@ void CreateTool::setupUi()
       info += "<font color='gray'>○ 融合功能：未开启</font><br>";
     }
 
-    if ( !mVectorLayer->isEditable() )
-      mVectorLayer->startEditing();
+    if ( !mVectorLayer->isEditable() && !mVectorLayer->startEditing() )
+    {
+      QMessageBox::warning( mSettingsWidget, "错误", "无法开启图层编辑，请检查文件是否只读或被占用！" );
+      return;
+    }
 
     QMessageBox::information( mSettingsWidget, "配置确认", info );
     mSettingsWidget->hide();
@@ -207,6 +220,9 @@ void CreateTool::refreshLayerCombos()
       mUI.pointcloudcombo->addItem( layer->name(), layer->id() );
   }
 
+  mUI.vectorcombo->addItem( tr( "新建矢量图层..." ) );
+  mUI.vectorcombo->setItemData( mUI.vectorcombo->count() - 1, true, Qt::UserRole + 1 );
+
   mUI.vectorcombo->setCurrentIndex( 0 );
   mUI.pointcloudcombo->setCurrentIndex( 0 );
 
@@ -214,6 +230,97 @@ void CreateTool::refreshLayerCombos()
   mUI.pointcloudcombo->blockSignals( false );
 
   mUI.fieldcombo->clear();
+  mSelectedVectorLayerId.clear();
+}
+
+void CreateTool::createVectorLayer()
+{
+  const QString previousField = mUI.fieldcombo->currentText();
+  const int previousIndex = mUI.vectorcombo->findData( mSelectedVectorLayerId );
+  mUI.vectorcombo->setCurrentIndex( previousIndex >= 0 ? previousIndex : 0 );
+  const int previousFieldIndex = mUI.fieldcombo->findText( previousField );
+  if ( previousFieldIndex >= 0 )
+    mUI.fieldcombo->setCurrentIndex( previousFieldIndex );
+
+  QgsNewVectorLayerDialog dialog( mSettingsWidget );
+  dialog.setCrs( mCanvas->mapSettings().destinationCrs() );
+
+  // The native dialog has no public geometry/field setters. Configure its existing widgets.
+  QComboBox *geometryCombo = dialog.findChild<QComboBox *>( QStringLiteral( "mGeometryTypeBox" ) );
+  QTreeWidget *fieldList = dialog.findChild<QTreeWidget *>( QStringLiteral( "mAttributeView" ) );
+  QWidget *newFieldGroup = dialog.findChild<QWidget *>( QStringLiteral( "groupBox" ) );
+  QWidget *fieldListGroup = dialog.findChild<QWidget *>( QStringLiteral( "groupBox_2" ) );
+  const int polygonIndex = geometryCombo ? geometryCombo->findData( static_cast<quint32>( Qgis::WkbType::Polygon ) ) : -1;
+  if ( !fieldList || !newFieldGroup || !fieldListGroup || polygonIndex < 0 )
+  {
+    QMessageBox::warning( mSettingsWidget, tr( "新建矢量图层" ), tr( "无法配置 QGIS 原生新建图层对话框。" ) );
+    return;
+  }
+
+  geometryCombo->setCurrentIndex( polygonIndex );
+  geometryCombo->setEnabled( false );
+  fieldList->clear();
+  // Shapefile integers wider than 9 digits may reopen as Int64 instead of Int.
+  fieldList->addTopLevelItem( new QTreeWidgetItem( QStringList{ QStringLiteral( "id" ), QStringLiteral( "Integer" ), QStringLiteral( "9" ), QString() } ) );
+  fieldList->addTopLevelItem( new QTreeWidgetItem( QStringList{ QStringLiteral( "height" ), QStringLiteral( "Real" ), QStringLiteral( "20" ), QStringLiteral( "6" ) } ) );
+  newFieldGroup->setEnabled( false );
+  fieldListGroup->setEnabled( false );
+
+  if ( dialog.exec() != QDialog::Accepted )
+    return;
+
+  const QString fileName = dialog.filename();
+  const QString encoding = dialog.selectedFileEncoding();
+  const QFileInfo targetFile( fileName );
+  if ( targetFile.exists() )
+  {
+    for ( QgsMapLayer *layer : QgsProject::instance()->mapLayers() )
+    {
+      const QString sourcePath = QgsProviderRegistry::instance()->decodeUri( layer->providerType(), layer->source() ).value( QStringLiteral( "path" ) ).toString();
+      if ( !sourcePath.isEmpty() && QFileInfo( sourcePath ).canonicalFilePath() == targetFile.canonicalFilePath() )
+      {
+        QMessageBox::warning( mSettingsWidget, tr( "新建矢量图层" ), tr( "此文件已在当前项目中打开，请选择其他文件名，或先移除已打开的图层。" ) );
+        return;
+      }
+    }
+  }
+
+  QList<QPair<QString, QString>> attributes;
+  dialog.attributes( attributes );
+  QString errorMessage;
+  if ( !QgsOgrProviderUtils::createEmptyDataSource( fileName, dialog.selectedFileFormat(), encoding,
+                                                  dialog.selectedType(), attributes, dialog.crs(), errorMessage ) )
+  {
+    QMessageBox::warning( mSettingsWidget, tr( "新建矢量图层失败" ), errorMessage );
+    return;
+  }
+
+  QgsSettings settings;
+  settings.setValue( QStringLiteral( "UI/lastVectorFileFilterDir" ), targetFile.absolutePath() );
+  settings.setValue( QStringLiteral( "UI/encoding" ), encoding );
+
+  auto newLayer = std::make_unique<QgsVectorLayer>( fileName, targetFile.completeBaseName(), QStringLiteral( "ogr" ) );
+  if ( !newLayer->isValid() || !newLayer->dataProvider() )
+  {
+    QMessageBox::warning( mSettingsWidget, tr( "新建矢量图层失败" ), tr( "文件已创建，但无法加载图层：%1" ).arg( fileName ) );
+    return;
+  }
+  newLayer->dataProvider()->setEncoding( encoding );
+  const int idIndex = newLayer->fields().indexFromName( QStringLiteral( "id" ) );
+  const int heightIndex = newLayer->fields().indexFromName( QStringLiteral( "height" ) );
+  if ( idIndex < 0 || heightIndex < 0 || newLayer->fields().at( idIndex ).type() != QMetaType::Int
+       || newLayer->fields().at( heightIndex ).type() != QMetaType::Double )
+  {
+    QMessageBox::warning( mSettingsWidget, tr( "新建矢量图层失败" ), tr( "新图层字段不符合要求：id 必须为 int，height 必须为 double。" ) );
+    return;
+  }
+
+  const QString layerId = newLayer->id();
+  const QString layerName = newLayer->name();
+  QgsProject::instance()->addMapLayer( newLayer.release() );
+  mUI.vectorcombo->insertItem( mUI.vectorcombo->count() - 1, layerName, layerId );
+  mUI.vectorcombo->setCurrentIndex( mUI.vectorcombo->findData( layerId ) );
+  mUI.fieldcombo->setCurrentIndex( mUI.fieldcombo->findText( QStringLiteral( "height" ) ) );
 }
 
 void CreateTool::updateFields( int index )
@@ -221,6 +328,10 @@ void CreateTool::updateFields( int index )
   if ( !mUI.fieldcombo || !mUI.vectorcombo )
     return;
 
+  if ( mUI.vectorcombo->itemData( index, Qt::UserRole + 1 ).toBool() )
+    return;
+
+  mSelectedVectorLayerId = mUI.vectorcombo->currentData().toString();
   mUI.fieldcombo->clear();
 
   if ( index <= 0 )
