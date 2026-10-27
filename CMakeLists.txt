@@ -15,6 +15,7 @@ set(buildingeditmanager_SRCS
   createtool.cpp
   view.cpp
   roofedit.cpp
+  roofmodelpipeline.cpp
   buildingroof.cpp
 )
 

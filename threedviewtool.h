@@ -79,6 +79,7 @@ class ThreeDViewTool : public QgsMapTool
 
     // 3D 构建与同步
     void updateFeature3D( const QgsFeature &originFeat );
+    void clearDisplayedMeshCache();
     void refreshMemoryData();
     QgsFeatureList buildBuildingFromMesh( const MeshData &mesh, const QMatrix4x4 &mat );
     void ensureLayerIn3DView( QgsMapLayer *layer );
@@ -100,8 +101,6 @@ class ThreeDViewTool : public QgsMapTool
     void applyFeature3DUpdate( QgsFeatureId fid );
     void flushPendingFeatureUpdates();
     void removeTempFeatures( const QgsFeatureIds &fids );
-    QList<BuildingRoof::RoofPoint> roofPointsForFeature( const QgsFeature &feature, bool *fromSavedLayer = nullptr );
-    double savedRoofBaseHeight( QgsFeatureId fid, double currentHeight );
     MeshData buildMeshForFeature( const QgsFeature &feature, double height );
     void ensurePreviewEntity();
     void updatePreviewEntity( QgsVectorLayer *layer, const QgsFeatureIds &fids, const QString &heightFieldName, double height );
@@ -133,8 +132,12 @@ class ThreeDViewTool : public QgsMapTool
     QPointer<QgsVectorLayer> mTempLayer = nullptr;
     QPointer<QgsVectorLayer> mWireframeLayer = nullptr;
     QPointer<QgsVectorLayer> mRoofSegmentationLayer = nullptr;
+    QPointer<QgsVectorLayer> mDisplayedMeshLayer = nullptr;
+    QgsFeatureId mDisplayedMeshFid = FID_NULL;
+    MeshData mDisplayedMesh;
+    QList<QMetaObject::Connection> mDisplayedMeshConnections;
 
-    bool mShowRoofSegmentationDebug = true;
+    bool mShowRoofSegmentationDebug = false;
     QString mSelectedHeightField;
     bool mBuildingTriangleMeshMode = false;
     bool mTriangleMeshHiddenLayerWasVisible = false;
