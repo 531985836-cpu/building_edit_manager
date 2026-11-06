@@ -1,4 +1,5 @@
 #include "createtool.h"
+#include "buildingprediction.h"
 
 #include <qgsmapcanvas.h>
 #include <qgsproject.h>
@@ -50,6 +51,12 @@ CreateTool::CreateTool( QgsMapCanvas *canvas )
 
 CreateTool::~CreateTool()
 {
+  // Stop local monitoring before destroying prediction widgets. The lab job
+  // continues independently; no remote cancellation or deletion is requested.
+  delete mPrediction;
+  mPrediction = nullptr;
+  delete mSettingsWidget;
+  mSettingsWidget = nullptr;
 }
 
 // ==================== 激活 / 停用 ====================
@@ -87,6 +94,7 @@ void CreateTool::setupUi()
 {
   mSettingsWidget = new QWidget();
   mUI.setupUi( mSettingsWidget );
+  mPrediction = new BuildingPrediction( mUI, this );
   mSettingsWidget->setWindowTitle( "设置" );
 
   // 初始化控件状态（根据 CheckBox 初始状态）

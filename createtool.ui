@@ -6,8 +6,8 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>312</width>
-    <height>281</height>
+    <width>400</width>
+    <height>635</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -15,101 +15,266 @@
   </property>
   <layout class="QVBoxLayout" name="verticalLayout">
    <item>
-    <widget class="QGroupBox" name="initialset">
-     <property name="title">
-      <string>初始设置</string>
+    <widget class="QTabWidget" name="creationTabWidget">
+     <property name="currentIndex">
+      <number>0</number>
      </property>
-     <layout class="QFormLayout" name="formLayout_3">
-      <item row="0" column="0">
-       <widget class="QLabel" name="vector">
-        <property name="text">
-         <string>矢量图层</string>
-        </property>
-       </widget>
-      </item>
-      <item row="0" column="1">
-       <widget class="QComboBox" name="vectorcombo"/>
-      </item>
-     </layout>
-    </widget>
-   </item>
-   <item>
-    <widget class="QGroupBox" name="heightset">
-     <property name="title">
-      <string>高度初始化</string>
-     </property>
-     <layout class="QFormLayout" name="formLayout">
-      <item row="0" column="0" colspan="2">
-       <widget class="QCheckBox" name="heightcheckBox">
-        <property name="text">
-         <string>启用功能</string>
-        </property>
-       </widget>
-      </item>
-      <item row="1" column="0">
-       <widget class="QLabel" name="field">
-        <property name="maximumSize">
-         <size>
-          <width>1677721</width>
-          <height>1677721</height>
-         </size>
-        </property>
-        <property name="text">
-         <string>保存字段</string>
-        </property>
-       </widget>
-      </item>
-      <item row="1" column="1">
-       <widget class="QComboBox" name="fieldcombo"/>
-      </item>
-      <item row="2" column="0">
-       <widget class="QLabel" name="pointcloud">
-        <property name="text">
-         <string>点云图层</string>
-        </property>
-       </widget>
-      </item>
-      <item row="2" column="1">
-       <widget class="QComboBox" name="pointcloudcombo"/>
-      </item>
-     </layout>
-    </widget>
-   </item>
-   <item>
-    <widget class="QGroupBox" name="mergeset">
-     <property name="title">
-      <string>融合设置</string>
-     </property>
-     <layout class="QFormLayout" name="formLayout_2">
-      <item row="0" column="0" colspan="2">
-       <widget class="QCheckBox" name="mergecheckBox">
-        <property name="text">
-         <string>启用功能</string>
-        </property>
-       </widget>
-      </item>
-      <item row="1" column="0">
-       <widget class="QLabel" name="merge">
-        <property name="text">
-         <string>融合距离</string>
-        </property>
-       </widget>
-      </item>
-      <item row="1" column="1">
-       <widget class="QLineEdit" name="mergelineEdit"/>
-      </item>
-     </layout>
-    </widget>
-   </item>
-   <item>
-    <widget class="QPushButton" name="setting">
-     <property name="text">
-      <string>确认设置</string>
-     </property>
+     <widget class="QWidget" name="manualCreationTab">
+      <attribute name="title">
+       <string>手动新建</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="manualCreationLayout">
+       <item>
+        <widget class="QGroupBox" name="initialset">
+         <property name="title">
+          <string>初始设置</string>
+         </property>
+         <layout class="QFormLayout" name="formLayout_3">
+          <item row="0" column="0">
+           <widget class="QLabel" name="vector">
+            <property name="text">
+             <string>矢量图层</string>
+            </property>
+           </widget>
+          </item>
+          <item row="0" column="1">
+           <widget class="QComboBox" name="vectorcombo"/>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="heightset">
+         <property name="title">
+          <string>高度初始化</string>
+         </property>
+         <layout class="QFormLayout" name="formLayout">
+          <item row="0" column="0" colspan="2">
+           <widget class="QCheckBox" name="heightcheckBox">
+            <property name="text">
+             <string>启用功能</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="0">
+           <widget class="QLabel" name="field">
+            <property name="maximumSize">
+             <size>
+              <width>1677721</width>
+              <height>1677721</height>
+             </size>
+            </property>
+            <property name="text">
+             <string>保存字段</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="1">
+           <widget class="QComboBox" name="fieldcombo"/>
+          </item>
+          <item row="2" column="0">
+           <widget class="QLabel" name="pointcloud">
+            <property name="text">
+             <string>点云图层</string>
+            </property>
+           </widget>
+          </item>
+          <item row="2" column="1">
+           <widget class="QComboBox" name="pointcloudcombo"/>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="mergeset">
+         <property name="title">
+          <string>融合设置</string>
+         </property>
+         <layout class="QFormLayout" name="formLayout_2">
+          <item row="0" column="0" colspan="2">
+           <widget class="QCheckBox" name="mergecheckBox">
+            <property name="text">
+             <string>启用功能</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="0">
+           <widget class="QLabel" name="merge">
+            <property name="text">
+             <string>融合距离</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="1">
+           <widget class="QLineEdit" name="mergelineEdit"/>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="setting">
+         <property name="text">
+          <string>确认设置</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <spacer name="manualCreationSpacer">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size><width>20</width><height>0</height></size>
+         </property>
+        </spacer>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="predictionTab">
+      <attribute name="title">
+       <string>点云预测</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="predictionLayout">
+       <item>
+        <widget class="QGroupBox" name="predictionServiceGroup">
+         <property name="title"><string>实验室预测服务</string></property>
+         <layout class="QFormLayout" name="predictionServiceLayout">
+          <property name="fieldGrowthPolicy"><enum>QFormLayout::AllNonFixedFieldsGrow</enum></property>
+          <item row="0" column="0"><widget class="QLabel" name="predictionServiceUrlLabel"><property name="text"><string>服务地址</string></property><property name="buddy"><cstring>predictionServiceUrlLineEdit</cstring></property></widget></item>
+          <item row="0" column="1"><widget class="QLineEdit" name="predictionServiceUrlLineEdit"><property name="text"><string>http://127.0.0.1:8000</string></property><property name="toolTip"><string>填写实验室服务地址；使用 SSH 隧道时填写本机转发地址。</string></property></widget></item>
+          <item row="1" column="0"><widget class="QLabel" name="predictionTokenLabel"><property name="text"><string>访问密钥</string></property><property name="buddy"><cstring>predictionTokenLineEdit</cstring></property></widget></item>
+          <item row="1" column="1"><widget class="QLineEdit" name="predictionTokenLineEdit"><property name="echoMode"><enum>QLineEdit::Password</enum></property><property name="toolTip"><string>填写实验室服务的 SPT_API_TOKEN；密钥仅在本次会话中使用。</string></property></widget></item>
+          <item row="2" column="0" colspan="2"><widget class="QPushButton" name="predictionConnectButton"><property name="text"><string>测试连接</string></property></widget></item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="predictionInputGroup">
+         <property name="title"><string>图层设置</string></property>
+         <layout class="QFormLayout" name="predictionInputLayout">
+          <property name="fieldGrowthPolicy"><enum>QFormLayout::AllNonFixedFieldsGrow</enum></property>
+          <item row="0" column="0">
+           <widget class="QLabel" name="predictionPointCloudLabel">
+            <property name="text"><string>点云图层</string></property>
+            <property name="buddy"><cstring>predictionPointCloudComboBox</cstring></property>
+           </widget>
+          </item>
+          <item row="0" column="1">
+           <widget class="QgsMapLayerComboBox" name="predictionPointCloudComboBox">
+            <property name="toolTip"><string>选择需要提取建筑轮廓的点云图层。</string></property>
+            <property name="sizeAdjustPolicy"><enum>QComboBox::AdjustToMinimumContentsLengthWithIcon</enum></property>
+            <property name="minimumContentsLength"><number>14</number></property>
+           </widget>
+          </item>
+          <item row="1" column="0">
+           <widget class="QLabel" name="predictionTargetLabel">
+            <property name="text"><string>写入图层</string></property>
+            <property name="buddy"><cstring>predictionTargetLayerComboBox</cstring></property>
+           </widget>
+          </item>
+          <item row="1" column="1">
+           <widget class="QgsMapLayerComboBox" name="predictionTargetLayerComboBox">
+            <property name="toolTip"><string>选择接收建筑轮廓和屋顶高程的可写面图层。</string></property>
+            <property name="sizeAdjustPolicy"><enum>QComboBox::AdjustToMinimumContentsLengthWithIcon</enum></property>
+            <property name="minimumContentsLength"><number>14</number></property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="predictionHeightGroup">
+         <property name="title"><string>高度初始化</string></property>
+         <layout class="QFormLayout" name="predictionHeightLayout">
+          <property name="fieldGrowthPolicy"><enum>QFormLayout::AllNonFixedFieldsGrow</enum></property>
+          <item row="0" column="0" colspan="2">
+           <widget class="QCheckBox" name="predictionHeightCheckBox">
+            <property name="text"><string>启用功能</string></property>
+            <property name="checked"><bool>false</bool></property>
+            <property name="toolTip"><string>启用后，按最终建筑轮廓计算屋顶高程并写入所选字段。</string></property>
+           </widget>
+          </item>
+          <item row="1" column="0">
+           <widget class="QLabel" name="predictionHeightFieldLabel">
+            <property name="enabled"><bool>false</bool></property>
+            <property name="text"><string>保存字段</string></property>
+            <property name="buddy"><cstring>predictionHeightFieldComboBox</cstring></property>
+           </widget>
+          </item>
+          <item row="1" column="1">
+           <widget class="QgsFieldComboBox" name="predictionHeightFieldComboBox">
+            <property name="enabled"><bool>false</bool></property>
+            <property name="toolTip"><string>选择写入图层中用于保存屋顶高程的数值字段。</string></property>
+            <property name="sizeAdjustPolicy"><enum>QComboBox::AdjustToMinimumContentsLengthWithIcon</enum></property>
+            <property name="minimumContentsLength"><number>14</number></property>
+           </widget>
+          </item>
+          <item row="2" column="0" colspan="2">
+           <widget class="QLabel" name="predictionHeightDescriptionLabel">
+            <property name="text"><string>轮廓拟合完成后，自动为每个建筑计算屋顶高程。</string></property>
+            <property name="wordWrap"><bool>true</bool></property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="startPredictionButton">
+         <property name="enabled"><bool>false</bool></property>
+         <property name="text"><string>开始预测并写入</string></property>
+         <property name="toolTip"><string>连接实验室预测服务并选择图层后可开始任务。</string></property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPushButton" name="resumePredictionButton">
+         <property name="enabled"><bool>false</bool></property>
+         <property name="text"><string>恢复上次任务</string></property>
+         <property name="toolTip"><string>网络断开或重启 QGIS 后，查询上次任务并重新下载结果，不重复提交预测。</string></property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="predictionProgressGroup">
+         <property name="title"><string>任务进度</string></property>
+         <layout class="QVBoxLayout" name="predictionProgressLayout">
+          <item>
+           <widget class="QProgressBar" name="predictionProgressBar">
+            <property name="value"><number>0</number></property>
+            <property name="textVisible"><bool>true</bool></property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QLabel" name="predictionStatusLabel">
+            <property name="text"><string>未连接预测服务</string></property>
+            <property name="wordWrap"><bool>true</bool></property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <spacer name="predictionSpacer">
+         <property name="orientation"><enum>Qt::Vertical</enum></property>
+         <property name="sizeHint" stdset="0"><size><width>20</width><height>0</height></size></property>
+        </spacer>
+       </item>
+      </layout>
+     </widget>
     </widget>
    </item>
   </layout>
  </widget>
+ <customwidgets>
+  <customwidget>
+   <class>QgsMapLayerComboBox</class>
+   <extends>QComboBox</extends>
+   <header>qgsmaplayercombobox.h</header>
+  </customwidget>
+  <customwidget>
+   <class>QgsFieldComboBox</class>
+   <extends>QComboBox</extends>
+   <header>qgsfieldcombobox.h</header>
+  </customwidget>
+ </customwidgets>
  <resources/>
  <connections/>
 </ui>

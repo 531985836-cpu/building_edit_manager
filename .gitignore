@@ -13,3 +13,16 @@ __pycache__/
 
 # 排除 QGIS 临时文件
 .qgis2/
+
+# Model weights, point clouds and private runtime data are distributed separately.
+*.pth
+*.ckpt
+*.pt
+*.las
+*.laz
+*.gpkg
+*.zip
+*.log
+prediction_jobs/
+.venv*/
+.env

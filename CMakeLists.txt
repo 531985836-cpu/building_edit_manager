@@ -13,6 +13,10 @@ set(buildingeditmanager_SRCS
   threedviewtool.cpp
   pointedit.cpp
   createtool.cpp
+  buildingprediction.cpp
+  buildingprediction.h
+  buildingpredictionclient.cpp
+  buildingpredictionclient.h
   view.cpp
   roofedit.cpp
   roofmodelpipeline.cpp
@@ -43,6 +47,7 @@ find_package(Qt5 REQUIRED COMPONENTS
     Core
     Gui
     Widgets
+    Network
     3DCore
     3DRender
     3DInput
@@ -83,6 +88,7 @@ target_link_libraries(buildingeditmanager
     Qt5::Core
     Qt5::Gui
     Qt5::Widgets
+    Qt5::Network
     D:/conda/envs/qgis/Library/lib/Qt53DCore_conda.lib
     D:/conda/envs/qgis/Library/lib/Qt53DRender_conda.lib
     D:/conda/envs/qgis/Library/lib/Qt53DInput_conda.lib

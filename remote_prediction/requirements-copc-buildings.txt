@@ -1,0 +1,9 @@
+# Extra I/O/vector packages, installed INSIDE an already working SPT environment.
+# This file does not install or replace the author's CUDA/FRNN/SPT dependencies.
+numpy>=1.24,<2
+laspy[lazrs]>=2.5,<3
+pyproj>=3.4,<4
+rasterio>=1.3,<2
+fiona>=1.9,<2
+shapely>=2.0,<3
+scipy>=1.10,<2

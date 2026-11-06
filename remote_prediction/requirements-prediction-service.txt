@@ -1,0 +1,5 @@
+# Install in a NEW service-only venv; see REMOTE_PREDICTION_SETUP.md.
+# Invoke the existing SPT environment with --python, without reinstalling it.
+fastapi>=0.110,<1
+pydantic>=2,<3
+uvicorn>=0.27,<1

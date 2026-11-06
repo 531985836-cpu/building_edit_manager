@@ -17,6 +17,7 @@
 
 class QgsMapCanvas;
 class QgsMapMouseEvent;
+class BuildingPrediction;
 
 class CreateTool : public QgsMapTool
 {
@@ -76,6 +77,7 @@ class CreateTool : public QgsMapTool
 
     // --- UI 插件窗体与属性字段 ---
     Ui::Form mUI;
+    BuildingPrediction *mPrediction = nullptr;
     QWidget *mSettingsWidget = nullptr;
     QString mTargetFieldName;
     QString mSelectedVectorLayerId;
