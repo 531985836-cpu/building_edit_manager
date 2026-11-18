@@ -13,6 +13,7 @@ class QgsMapCanvas;
 class QgsPointCloudLayer;
 class QgsVectorLayer;
 class QTimer;
+namespace RoofAccuracy { class Controller; }
 
 class RoofEditTool : public QgsMapTool
 {
@@ -45,6 +46,7 @@ class RoofEditTool : public QgsMapTool
     void notifyRoofModelChanged();
     void setTriangleMeshModeEnabled( bool enabled );
     void updateTriangleMeshModeForCurrentBuilding();
+    void syncAccuracyContext();
 
     QPointer<QgisInterface> mIface;
     QPointer<QgsMapCanvas> mCanvas;
@@ -53,4 +55,5 @@ class RoofEditTool : public QgsMapTool
     QPointer<QgsVectorLayer> mActiveLayer;
     QgsFeature mCurrentBuilding;
     QTimer *mRoofPreviewTimer = nullptr;
+    RoofAccuracy::Controller *mAccuracy = nullptr;
 };

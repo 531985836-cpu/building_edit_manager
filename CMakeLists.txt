@@ -19,6 +19,8 @@ set(buildingeditmanager_SRCS
   buildingpredictionclient.h
   view.cpp
   roofedit.cpp
+  roofaccuracy.cpp
+  roofaccuracy.h
   roofmodelpipeline.cpp
   buildingroof.cpp
 )

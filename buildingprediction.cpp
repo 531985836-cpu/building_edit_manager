@@ -15,15 +15,116 @@
 #include <qgssettings.h>
 #include <qgscoordinatetransform.h>
 #include <qgseditformconfig.h>
+#include <qgsapplication.h>
+#include <qgstaskmanager.h>
 #include <QCryptographicHash>
 #include <QDir>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QMessageBox>
+#include <QProcess>
 #include <QSaveFile>
 #include <QStandardPaths>
 #include <QUuid>
+#include <functional>
+
+namespace
+{
+  // Convert a local LAS/LAZ to a task-local COPC without touching the source.
+  // Untwine is shipped with QGIS and is also used by QGIS' Create COPC algorithm.
+  class LocalCopcConversionTask final : public QgsTask
+  {
+    public:
+      LocalCopcConversionTask( const QString &input, const QString &output,
+                               std::function<void( bool, const QString & )> callback )
+        : QgsTask( QObject::tr( "为远程预测准备 COPC 点云" ), QgsTask::CanCancel )
+        , mInput( input )
+        , mOutput( output )
+        , mCallback( std::move( callback ) )
+      {}
+
+    protected:
+      bool run() override
+      {
+        const QString executable = QDir( QgsApplication::libexecPath() ).filePath(
+#ifdef Q_OS_WIN
+                                     QStringLiteral( "untwine.exe" )
+#else
+                                     QStringLiteral( "untwine" )
+#endif
+                                   );
+        if ( !QFileInfo( executable ).isExecutable() )
+        {
+          mError = QObject::tr( "没有找到 QGIS 自带的 untwine 转换程序：%1" ).arg( executable );
+          return false;
+        }
+
+        QProcess process;
+        process.setProgram( executable );
+        process.setArguments( {mOutput, mInput, QStringLiteral( "--stats" ), QStringLiteral( "--progress_debug" )} );
+        process.setProcessChannelMode( QProcess::MergedChannels );
+        process.start();
+        if ( !process.waitForStarted( 10000 ) )
+        {
+          mError = QObject::tr( "无法启动 QGIS 的 COPC 转换程序：%1" ).arg( process.errorString() );
+          return false;
+        }
+
+        QByteArray log;
+        while ( process.state() != QProcess::NotRunning )
+        {
+          if ( isCanceled() )
+          {
+            process.terminate();
+            if ( !process.waitForFinished( 3000 ) )
+              process.kill();
+            process.waitForFinished();
+            mError = QObject::tr( "本地点云转换已取消。原始点云未修改。" );
+            return false;
+          }
+          process.waitForReadyRead( 200 );
+          log += process.readAll();
+          // Untwine's debug progress output contains percentage values. Keep the
+          // UI responsive and expose approximate progress while it builds COPC.
+          const int percentIndex = log.lastIndexOf( '%' );
+        if ( percentIndex > 0 )
+          {
+            int begin = percentIndex - 1;
+            while ( begin >= 0 && log.at( begin ) >= '0' && log.at( begin ) <= '9' )
+              --begin;
+            bool ok = false;
+            const int percent = log.mid( begin + 1, percentIndex - begin - 1 ).toInt( &ok );
+            if ( ok )
+              setProgress( qBound( 0, percent, 99 ) );
+          }
+        if ( log.size() > 4096 )
+          log = log.right( 4096 );
+        }
+        log += process.readAll();
+        if ( process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0 ||
+             !QFileInfo::exists( mOutput ) || QFileInfo( mOutput ).size() <= 0 )
+        {
+          mError = QObject::tr( "LAS/LAZ 转换为 COPC 失败。%1" ).arg( QString::fromLocal8Bit( log ).trimmed() );
+          return false;
+        }
+        setProgress( 100 );
+        return true;
+      }
+
+      void finished( bool result ) override
+      {
+        if ( mCallback )
+          mCallback( result, mError );
+      }
+
+    private:
+      QString mInput;
+      QString mOutput;
+      QString mError;
+      std::function<void( bool, const QString & )> mCallback;
+  };
+}
 
 BuildingPrediction::BuildingPrediction( Ui::Form &ui, QObject *parent )
   : QObject( parent )
@@ -145,7 +246,7 @@ void BuildingPrediction::updateHeightControls()
 
 void BuildingPrediction::updateActions()
 {
-  const bool busy = mClient->isActive();
+  const bool busy = mPreparingInput || mClient->isActive();
   mUi.predictionServiceGroup->setEnabled( !busy );
   mUi.predictionInputGroup->setEnabled( !busy );
   mUi.predictionHeightGroup->setEnabled( !busy );
@@ -201,9 +302,17 @@ void BuildingPrediction::startPrediction()
   const QUrl cloudUrl( cloudPath );
   if ( cloudUrl.isLocalFile() )
     cloudPath = cloudUrl.toLocalFile();
-  if ( !cloudPath.endsWith( QLatin1String( ".copc.laz" ), Qt::CaseInsensitive ) || !QFileInfo( cloudPath ).isFile() )
+  if ( !QFileInfo( cloudPath ).isFile() )
   {
-    showError( tr( "当前远程入口需要本机的 .copc.laz 文件。普通 LAS/LAZ、EPT 和网络点云需先转换为 COPC。" ) );
+    showError( tr( "点云源不是本机可读取的单个文件。请使用本机 LAS、LAZ 或 COPC 文件；网络服务和虚拟点云目录暂不支持直接传输。" ) );
+    return;
+  }
+  const bool isCopc = cloudPath.endsWith( QLatin1String( ".copc.laz" ), Qt::CaseInsensitive );
+  const bool isLas = cloudPath.endsWith( QLatin1String( ".las" ), Qt::CaseInsensitive );
+  const bool isLaz = cloudPath.endsWith( QLatin1String( ".laz" ), Qt::CaseInsensitive );
+  if ( !isCopc && !isLas && !isLaz )
+  {
+    showError( tr( "本机输入目前支持 LAS、LAZ 和 COPC。普通 LAS/LAZ 会在本机自动转换为 COPC 后上传，原始文件不会修改。" ) );
     return;
   }
   const QString height = heightField();
@@ -258,11 +367,51 @@ void BuildingPrediction::startPrediction()
                      {QStringLiteral( "height_field" ), height},
                      {QStringLiteral( "server_url" ), mUi.predictionServiceUrlLineEdit->text().trimmed()},
                      {QStringLiteral( "imported" ), false}};
-  if ( !saveTask() )
+  if ( isCopc )
+  {
+    if ( !saveTask() )
+      return;
+    uploadPreparedInput( cloudPath, snapshot, height, fields );
     return;
-  mClient->startJob( cloudPath, snapshot,
+  }
+
+  const QString copcPath = QDir( mDirectory ).filePath( QStringLiteral( "input.copc.laz" ) );
+  mPreparingInput = true;
+  mUi.predictionStatusLabel->setText( tr( "正在本机将 LAS/LAZ 转换为 COPC；原始点云不会修改。" ) );
+  mUi.predictionProgressBar->setRange( 0, 100 );
+  mUi.predictionProgressBar->setValue( 0 );
+  updateActions();
+  auto *task = new LocalCopcConversionTask( cloudPath, copcPath,
+    [this, copcPath, snapshot, height, fields]( bool ok, const QString &message ) {
+      mPreparingInput = false;
+      if ( !ok )
+      {
+        showError( message );
+        return;
+      }
+      if ( !saveTask() )
+        return;
+      mUi.predictionStatusLabel->setText( tr( "本机 COPC 准备完成，开始上传点云。" ) );
+      uploadPreparedInput( copcPath, snapshot, height, fields );
+    } );
+  connect( task, &QgsTask::progressChanged, this, [this]( double progress ) {
+    mUi.predictionProgressBar->setValue( qBound( 0, static_cast<int>( progress ), 100 ) );
+  } );
+  if ( !QgsApplication::taskManager()->addTask( task ) )
+  {
+    delete task;
+    mPreparingInput = false;
+    showError( tr( "无法启动本地点云 COPC 转换任务。" ) );
+  }
+}
+
+void BuildingPrediction::uploadPreparedInput( const QString &cloudPath, const QString &targetSnapshot,
+                                               const QString &height, const QJsonArray &fields )
+{
+  mClient->startJob( cloudPath, targetSnapshot,
                     QJsonObject{{QStringLiteral( "pointcloud_name" ), QFileInfo( cloudPath ).fileName()},
-                                {QStringLiteral( "height_field" ), height}, {QStringLiteral( "target_fields" ), fields}}, mDirectory );
+                                {QStringLiteral( "height_field" ), height},
+                                {QStringLiteral( "target_fields" ), fields}}, mDirectory );
 }
 
 void BuildingPrediction::resumePrediction()

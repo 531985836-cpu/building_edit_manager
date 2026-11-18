@@ -3,50 +3,239 @@
  <class>roofedit</class>
  <widget class="QWidget" name="roofedit">
   <property name="geometry">
-   <rect><x>0</x><y>0</y><width>329</width><height>220</height></rect>
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>378</width>
+    <height>375</height>
+   </rect>
   </property>
-  <property name="windowTitle"><string>屋顶编辑</string></property>
+  <property name="windowTitle">
+   <string>屋顶编辑</string>
+  </property>
   <layout class="QVBoxLayout" name="verticalLayout">
    <item>
     <widget class="QGroupBox" name="roofTypeGroup">
-     <property name="title"><string>屋顶类型</string></property>
+     <property name="title">
+      <string>屋顶类型</string>
+     </property>
      <layout class="QFormLayout" name="formLayout">
       <item row="0" column="0">
        <widget class="QLabel" name="roofTypeLabel">
-        <property name="text"><string>屋顶类型</string></property>
-        <property name="buddy"><cstring>roofTypeComboBox</cstring></property>
+        <property name="text">
+         <string>屋顶类型</string>
+        </property>
+        <property name="buddy">
+         <cstring>roofTypeComboBox</cstring>
+        </property>
        </widget>
       </item>
-      <item row="0" column="1"><widget class="QComboBox" name="roofTypeComboBox"/></item>
+      <item row="0" column="1">
+       <widget class="QComboBox" name="roofTypeComboBox"/>
+      </item>
       <item row="1" column="0">
        <widget class="QLabel" name="pointCloudLabel">
-        <property name="text"><string>点云图层</string></property>
-        <property name="buddy"><cstring>pointCloudComboBox</cstring></property>
+        <property name="text">
+         <string>点云图层</string>
+        </property>
+        <property name="buddy">
+         <cstring>pointCloudComboBox</cstring>
+        </property>
        </widget>
       </item>
-      <item row="1" column="1"><widget class="QComboBox" name="pointCloudComboBox"/></item>
+      <item row="1" column="1">
+       <widget class="QComboBox" name="pointCloudComboBox"/>
+      </item>
      </layout>
     </widget>
    </item>
    <item>
     <widget class="QCheckBox" name="triangleMeshCheckBox">
-     <property name="text"><string>建筑物三角网</string></property>
+     <property name="text">
+      <string>建筑物三角网</string>
+     </property>
     </widget>
    </item>
    <item>
     <widget class="QGroupBox" name="roofGroup">
-     <property name="title"><string>屋顶模型</string></property>
+     <property name="title">
+      <string>屋顶模型</string>
+     </property>
      <layout class="QHBoxLayout" name="roofButtonLayout">
-      <item><widget class="QPushButton" name="deleteRoofButton"><property name="text"><string>删除屋顶模型</string></property></widget></item>
-      <item><widget class="QPushButton" name="saveRoofButton"><property name="text"><string>保存屋顶模型</string></property></widget></item>
+      <item>
+       <widget class="QPushButton" name="deleteRoofButton">
+        <property name="text">
+         <string>删除屋顶模型</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="saveRoofButton">
+        <property name="text">
+         <string>保存屋顶模型</string>
+        </property>
+       </widget>
+      </item>
      </layout>
     </widget>
    </item>
    <item>
-    <spacer name="verticalSpacer">
-     <property name="orientation"><enum>Qt::Vertical</enum></property>
-     <property name="sizeHint" stdset="0"><size><width>20</width><height>0</height></size></property>
-    </spacer>
+    <widget class="QGroupBox" name="accuracyGroupBox">
+     <property name="toolTip">
+      <string>评价当前建筑物屋顶模型与上方所选点云的拟合程度。</string>
+     </property>
+     <property name="title">
+      <string>精度计算</string>
+     </property>
+     <layout class="QVBoxLayout" name="accuracyLayout">
+      <item>
+       <layout class="QFormLayout" name="accuracySettingsLayout">
+        <item row="0" column="0">
+         <widget class="QLabel" name="accuracyToleranceLabel">
+          <property name="text">
+           <string>允许误差</string>
+          </property>
+          <property name="buddy">
+           <cstring>accuracyToleranceSpinBox</cstring>
+          </property>
+         </widget>
+        </item>
+        <item row="0" column="1">
+         <widget class="QDoubleSpinBox" name="accuracyToleranceSpinBox">
+          <property name="toolTip">
+           <string>用于统计误差不超过此值的评价点比例，请根据点云精度设置。</string>
+          </property>
+          <property name="suffix">
+           <string> m</string>
+          </property>
+          <property name="decimals">
+           <number>2</number>
+          </property>
+          <property name="minimum">
+           <double>0.010000000000000</double>
+          </property>
+          <property name="maximum">
+           <double>100.000000000000000</double>
+          </property>
+          <property name="singleStep">
+           <double>0.050000000000000</double>
+          </property>
+          <property name="value">
+           <double>0.200000000000000</double>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+      <item>
+       <widget class="QPushButton" name="calculateAccuracyButton">
+        <property name="enabled">
+         <bool>false</bool>
+        </property>
+        <property name="toolTip">
+         <string>计算当前屋顶模型与所选点云之间的误差。</string>
+        </property>
+        <property name="text">
+         <string>计算精度</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <layout class="QFormLayout" name="accuracyResultsLayout">
+        <item row="0" column="0">
+         <widget class="QLabel" name="accuracyPointCountLabel">
+          <property name="text">
+           <string>评价点数</string>
+          </property>
+         </widget>
+        </item>
+        <item row="0" column="1">
+         <widget class="QLabel" name="accuracyPointCountValueLabel">
+          <property name="text">
+           <string>—</string>
+          </property>
+          <property name="textInteractionFlags">
+           <set>Qt::TextSelectableByMouse</set>
+          </property>
+         </widget>
+        </item>
+        <item row="1" column="0">
+         <widget class="QLabel" name="accuracyMaeLabel">
+          <property name="toolTip">
+           <string>评价点绝对误差的平均值，越小越好。</string>
+          </property>
+          <property name="text">
+           <string>平均绝对误差 MAE（m）</string>
+          </property>
+         </widget>
+        </item>
+        <item row="1" column="1">
+         <widget class="QLabel" name="accuracyMaeValueLabel">
+          <property name="text">
+           <string>—</string>
+          </property>
+          <property name="textInteractionFlags">
+           <set>Qt::TextSelectableByMouse</set>
+          </property>
+         </widget>
+        </item>
+        <item row="2" column="0">
+         <widget class="QLabel" name="accuracyRmseLabel">
+          <property name="toolTip">
+           <string>反映整体拟合误差，对较大的误差更敏感，越小越好。</string>
+          </property>
+          <property name="text">
+           <string>均方根误差 RMSE（m）</string>
+          </property>
+         </widget>
+        </item>
+        <item row="2" column="1">
+         <widget class="QLabel" name="accuracyRmseValueLabel">
+          <property name="text">
+           <string>—</string>
+          </property>
+          <property name="textInteractionFlags">
+           <set>Qt::TextSelectableByMouse</set>
+          </property>
+         </widget>
+        </item>
+        <item row="3" column="0">
+         <widget class="QLabel" name="accuracyInlierRateLabel">
+          <property name="toolTip">
+           <string>绝对误差不超过允许误差的评价点比例，越大越好。</string>
+          </property>
+          <property name="text">
+           <string>阈值内点比例（%）</string>
+          </property>
+         </widget>
+        </item>
+        <item row="3" column="1">
+         <widget class="QLabel" name="accuracyInlierRateValueLabel">
+          <property name="text">
+           <string>—</string>
+          </property>
+          <property name="textInteractionFlags">
+           <set>Qt::TextSelectableByMouse</set>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+      <item>
+       <widget class="QCheckBox" name="showAccuracyIn3DCheckBox">
+        <property name="enabled">
+         <bool>false</bool>
+        </property>
+        <property name="toolTip">
+         <string>按误差大小为评价点着色，查看屋顶各处的拟合情况。</string>
+        </property>
+        <property name="text">
+         <string>在三维视图中显示误差</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
    </item>
   </layout>
  </widget>

@@ -2,6 +2,7 @@
 
 #include "buildingeditpreviewbus.h"
 #include "roofmodelpipeline.h"
+#include "roofaccuracy.h"
 
 #include <qgisinterface.h>
 #include <qgs3dmapcanvas.h>
@@ -39,6 +40,8 @@ RoofEditTool::RoofEditTool( QgsMapCanvas *canvas, QgisInterface *iface )
 
 RoofEditTool::~RoofEditTool()
 {
+  delete mAccuracy;
+  mAccuracy = nullptr;
   setTriangleMeshModeEnabled( false );
   clearRoofPreview();
   if ( mWidget )
@@ -57,6 +60,7 @@ void RoofEditTool::activate()
 
 void RoofEditTool::deactivate()
 {
+  if ( mAccuracy ) mAccuracy->clear();
   setTriangleMeshModeEnabled( false );
   clearRoofPreview();
   if ( mWidget )
@@ -68,6 +72,7 @@ bool RoofEditTool::eventFilter( QObject *object, QEvent *event )
 {
   if ( object == mWidget && event && ( event->type() == QEvent::Hide || event->type() == QEvent::Close ) )
   {
+    if ( mAccuracy ) mAccuracy->clear();
     setTriangleMeshModeEnabled( false );
     clearRoofPreview();
   }
@@ -110,6 +115,8 @@ void RoofEditTool::setupUi()
       emit BuildingEditPreviewBus::instance()->buildingTriangleMeshModeChanged( mActiveLayer, FID_NULL, false );
   } );
 
+  connect( mUI.calculateAccuracyButton, &QPushButton::clicked, this, &RoofEditTool::previewRoofSelection );
+  mAccuracy = new RoofAccuracy::Controller( mWidget, mUI, mIface, this );
   refreshPointCloudCombo();
 }
 
@@ -144,6 +151,7 @@ void RoofEditTool::refreshLayerRefs()
 
   if ( mActiveLayer != nextLayer )
   {
+    if ( mAccuracy ) mAccuracy->clear();
     setTriangleMeshModeEnabled( false );
     clearRoofPreview();
     mCurrentBuilding = QgsFeature();
@@ -183,6 +191,7 @@ void RoofEditTool::refreshPointCloudCombo()
   if ( index <= 0 && mUI.pointCloudComboBox->count() == 2 )
     index = 1;
   mUI.pointCloudComboBox->setCurrentIndex( index < 0 ? 0 : index );
+  syncAccuracyContext();
 }
 
 void RoofEditTool::hideLegacyPointLayers()
@@ -273,6 +282,7 @@ void RoofEditTool::loadRoofSelection()
     const int cloudIndex = mUI.pointCloudComboBox->findData( saved.pointCloudLayerId );
     mUI.pointCloudComboBox->setCurrentIndex( cloudIndex < 0 ? 0 : cloudIndex );
   }
+  syncAccuracyContext();
 }
 
 RoofModelSettings::Selection RoofEditTool::currentSelection() const
@@ -285,6 +295,7 @@ RoofModelSettings::Selection RoofEditTool::currentSelection() const
 
 void RoofEditTool::scheduleRoofPreview()
 {
+  syncAccuracyContext();
   if ( mWidget && mWidget->isVisible() && mActiveLayer && mCurrentBuilding.isValid() )
     mRoofPreviewTimer->start();
 }
@@ -398,5 +409,11 @@ void RoofEditTool::saveRoofModel()
   mActiveLayer->removeSelection();
   mWidget->hide();
   mCurrentBuilding = QgsFeature();
+}
+
+void RoofEditTool::syncAccuracyContext()
+{
+  if ( mAccuracy )
+    mAccuracy->setContext( mActiveLayer, mCurrentBuilding.isValid() ? mCurrentBuilding.id() : FID_NULL, currentSelection() );
 }
 

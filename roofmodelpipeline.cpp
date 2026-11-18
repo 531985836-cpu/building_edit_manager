@@ -207,10 +207,12 @@ namespace
   }
 }
 
-QVector<BuildingRoof::RoofSample> RoofModelPipeline::collectSamples( const QgsGeometry &geometry, const QString &pointCloudLayerId )
+QVector<BuildingRoof::RoofSample> RoofModelPipeline::collectSamples( const QgsGeometry &geometry, const QString &pointCloudLayerId, bool *complete )
 {
   RoofCache &entry = cache();
-  return entry.prepare( geometry, pointCloudLayerId ) ? entry.samples : QVector<BuildingRoof::RoofSample>();
+  const bool ready = entry.prepare( geometry, pointCloudLayerId );
+  if ( complete ) *complete = ready && entry.loaded;
+  return ready ? entry.samples : QVector<BuildingRoof::RoofSample>();
 }
 
 BuildingRoof::MeshResult RoofModelPipeline::build( const QgsGeometry &geometry, const RoofModelSettings::Selection &selection )

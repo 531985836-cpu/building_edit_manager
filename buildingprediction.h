@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QObject>
+#include <QJsonArray>
 #include <QString>
 #include <QJsonObject>
 
@@ -40,10 +41,13 @@ class BuildingPrediction : public QObject
     bool saveTask();
     bool loadTask();
     void showError( const QString &message );
+    void uploadPreparedInput( const QString &cloudPath, const QString &targetSnapshot,
+                              const QString &height, const QJsonArray &fields );
 
     Ui::Form &mUi;
     QMetaObject::Connection mFieldsChangedConnection;
     BuildingPredictionClient *mClient = nullptr;
     QJsonObject mTask;
     QString mDirectory;
+    bool mPreparingInput = false;
 };
