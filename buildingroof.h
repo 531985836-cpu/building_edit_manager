@@ -7,6 +7,7 @@
 #include <QPair>
 #include <QString>
 #include <QVector>
+#include <array>
 
 class BuildingRoof
 {
@@ -37,6 +38,25 @@ class BuildingRoof
       bool success = false;
       QString error;
       Mesh mesh;
+    };
+
+    using GableSideWidths = std::array<double, 2>;
+
+    struct RidgePrediction
+    {
+      QgsPolylineXY ridge;
+      double eaveHeight = 0.0;
+      double ridgeHeight = 0.0;
+      QVector<RoofSample> samples;
+      GableSideWidths gableWidths{}; // Run to the common eave datum, in negative/positive ridge-side order.
+    };
+
+    struct RoofPlanePatch
+    {
+      QgsGeometry geometry;
+      double gradientX = 0.0;
+      double gradientY = 0.0;
+      double fractionAtBend = 1.0;
     };
 
     struct RoofPlaneSegment
@@ -74,9 +94,10 @@ class BuildingRoof
     static MeshResult buildClusteredFlatTopHippedRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints, const QVector<RoofSample> &pointCloudSamples = QVector<RoofSample>() );
     static MeshResult buildCurvedRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints, const QVector<RoofSample> &pointCloudSamples = QVector<RoofSample>() );
     static MeshResult buildApexRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints, const QVector<RoofSample> &pointCloudSamples = QVector<RoofSample>() );
-    static MeshResult buildGabledRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints, const QVector<RoofSample> &pointCloudSamples = QVector<RoofSample>() );
-    static MeshResult buildHippedRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints, const QVector<RoofSample> &pointCloudSamples = QVector<RoofSample>() );
+    static MeshResult buildGabledRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints, const QVector<RoofSample> &pointCloudSamples = QVector<RoofSample>(), RidgePrediction *prediction = nullptr );
+    static MeshResult buildHippedRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints, const QVector<RoofSample> &pointCloudSamples = QVector<RoofSample>(), RidgePrediction *prediction = nullptr );
     static MeshResult buildRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints, const QVector<RoofSample> &pointCloudSamples );
+    static QVector<RoofPlanePatch> bentGabledSurface( const QgsGeometry &footprint, const QgsPolylineXY &ridge );
     static RoofPlaneSegmentation segmentRoofCloud( const QgsGeometry &buildingGeometry, const QVector<RoofSample> &pointCloudSamples,
                                                    const RoofSegmentationOptions &options = RoofSegmentationOptions() );
     static RoofPlaneSegmentation segmentFlatTopRoofCloud( const QgsGeometry &buildingGeometry, const QVector<RoofSample> &pointCloudSamples,

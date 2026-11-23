@@ -44,7 +44,8 @@ class Controller final : public QObject
 public:
   Controller ( QWidget *panel, Ui::roofedit &ui, QgisInterface *iface, QObject *parent );
   ~Controller () override;
-  void setContext ( QgsVectorLayer *layer, QgsFeatureId fid, const RoofModelSettings::Selection &selection );
+  void setContext ( QgsVectorLayer *layer, QgsFeatureId fid, const RoofModelSettings::Selection &selection,
+                    const BuildingRoof::Mesh *previewMesh = nullptr );
   void clear ();
 
 private:

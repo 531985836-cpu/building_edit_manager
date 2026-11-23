@@ -10423,18 +10423,11 @@ namespace
     return layout;
   }
 
-  BuildingRoof::MeshResult buildBentGabledRoofPrismMesh( const QVector<QgsPointXY> &inputRing, const QgsPoint &boundaryPoint,
-                                                          const BentGableLayout &layout, double ridgeHeight )
+  QVector<BuildingRoof::RoofPlanePatch> bentGabledSurfacePatches( const QgsGeometry &footprint, const QVector<QgsPointXY> &inputRing,
+                                                                 const QgsPoint &boundaryPoint, const BentGableLayout &layout, double ridgeHeight )
   {
-    BuildingRoof::MeshResult result;
-    if ( inputRing.size() < 5 || !layout.success || !pointInRing( inputRing, layout.bend )
-         || ridgeHeight <= boundaryPoint.z() + 1e-8 )
-      return result;
-    const QgsGeometry footprint = polygonGeometryFromRing( inputRing );
-    const double footprintArea = footprint.area();
-    if ( footprintArea <= 1e-8 )
-      return result;
-
+    if ( inputRing.size() < 5 || !layout.success || !pointInRing( inputRing, layout.bend ) )
+      return {};
     const QgsGeometry primaryFootprint = intersectWithHalfPlane( footprint, inputRing, layout.bend, layout.splitNormalX, layout.splitNormalY, true );
     const QgsGeometry secondaryFootprint = intersectWithHalfPlane( footprint, inputRing, layout.bend, layout.splitNormalX, layout.splitNormalY, false );
     auto armRing = []( const QgsGeometry &geometry ) {
@@ -10446,25 +10439,17 @@ namespace
     BentGableSegment primary, secondary;
     if ( !makeBentSegment( layout.primaryEnd, layout.bend, ridgeHeight, armRing( primaryFootprint ), boundaryPoint, primary )
          || !makeBentSegment( layout.bend, layout.secondaryEnd, ridgeHeight, armRing( secondaryFootprint ), boundaryPoint, secondary ) )
-      return result;
+      return {};
 
     const double ux = -primary.dirX, uy = -primary.dirY;
     const double vx = secondary.dirX, vy = secondary.dirY;
     const double determinant = cross2d( ux, uy, vx, vy );
     if ( std::fabs( determinant ) <= 1e-6 )
-      return result;
+      return {};
 
     struct RoofPlane
     {
       double a = 0.0, b = 0.0, c = 1.0;
-    };
-    struct RoofPatch
-    {
-      QgsGeometry geometry;
-      RoofPlane plane;
-    };
-    auto fractionAt = [&]( const RoofPlane &plane, const QgsPointXY &point ) {
-      return plane.c + plane.a * ( point.x() - layout.bend.x() ) + plane.b * ( point.y() - layout.bend.y() );
     };
     auto sidePlane = [&]( const BentGableSegment &segment, bool positive ) {
       const double boundaryDistance = signedDistanceToLine( QgsPointXY( boundaryPoint.x(), boundaryPoint.y() ),
@@ -10497,24 +10482,11 @@ namespace
                    layout.bend, betaX, betaY, betaPositive );
     };
 
-    QVector<RoofPatch> patches;
+    QVector<BuildingRoof::RoofPlanePatch> patches;
     auto appendPatch = [&]( const QgsGeometry &geometry, const RoofPlane &plane ) {
-      if ( geometry.isNull() || geometry.isEmpty() )
-        return;
-      const double length2 = plane.a * plane.a + plane.b * plane.b;
-      if ( length2 <= 1e-16 )
-      {
-        patches.append( RoofPatch{ geometry, plane } );
-        return;
-      }
-      const QgsPointXY eaveOrigin( layout.bend.x() - plane.a * plane.c / length2,
-                                   layout.bend.y() - plane.b * plane.c / length2 );
-      const QgsGeometry aboveEave = clip( geometry, eaveOrigin, plane.a, plane.b, true );
-      const QgsGeometry belowEave = clip( geometry, eaveOrigin, plane.a, plane.b, false );
-      if ( !aboveEave.isEmpty() && aboveEave.area() > 1e-10 )
-        patches.append( RoofPatch{ aboveEave, plane } );
-      if ( !belowEave.isEmpty() && belowEave.area() > 1e-10 )
-        patches.append( RoofPatch{ belowEave, RoofPlane{ 0.0, 0.0, 0.0 } } );
+      // Eave height defines the plane. The footprint determines where it ends.
+      if ( !geometry.isEmpty() && geometry.area() > 1e-10 )
+        patches.append( { geometry, plane.a, plane.b, plane.c } );
     };
     auto appendJoinedPlanes = [&]( const QgsGeometry &geometry, const RoofPlane &first, const RoofPlane &second, bool higher ) {
       const double nx = first.a - second.a, ny = first.b - second.b;
@@ -10532,10 +10504,29 @@ namespace
     appendPatch( quadrant( false, true ), secondaryOuter );
     appendJoinedPlanes( quadrant( true, true ), primaryInner, secondaryInner, true );
     appendJoinedPlanes( quadrant( false, false ), primaryOuter, secondaryOuter, false );
+    return patches;
+  }
+
+  BuildingRoof::MeshResult buildBentGabledRoofPrismMesh( const QVector<QgsPointXY> &inputRing, const QgsPoint &boundaryPoint,
+                                                          const BentGableLayout &layout, double ridgeHeight )
+  {
+    BuildingRoof::MeshResult result;
+    if ( inputRing.size() < 5 || !layout.success || !pointInRing( inputRing, layout.bend )
+         || ridgeHeight <= boundaryPoint.z() + 1e-8 )
+      return result;
+    const QgsGeometry footprint = polygonGeometryFromRing( inputRing );
+    const double footprintArea = footprint.area();
+    if ( footprintArea <= 1e-8 )
+      return result;
+
+    const auto patches = bentGabledSurfacePatches( footprint, inputRing, boundaryPoint, layout, ridgeHeight );
+    const auto fractionAt = [&layout]( const BuildingRoof::RoofPlanePatch &patch, const QgsPointXY &point ) {
+      return patch.fractionAtBend + patch.gradientX * ( point.x() - layout.bend.x() ) + patch.gradientY * ( point.y() - layout.bend.y() );
+    };
 
     QVector<QgsPointXY> junctions{ layout.primaryEnd, layout.bend, layout.secondaryEnd };
     double coveredArea = 0.0;
-    for ( const RoofPatch &patch : patches )
+    for ( const BuildingRoof::RoofPlanePatch &patch : patches )
     {
       coveredArea += patch.geometry.area();
       for ( const QVector<QgsPointXY> &ring : exteriorRingsFromGeometry( patch.geometry ) )
@@ -10551,14 +10542,19 @@ namespace
 
     const double baseHeight = boundaryPoint.z(), rise = ridgeHeight - baseHeight;
     double triangulatedArea = 0.0;
-    for ( const RoofPatch &patch : patches )
+    double floor = 0.0;
+    for ( const BuildingRoof::RoofPlanePatch &patch : patches )
     {
       for ( const QVector<QgsPointXY> &part : exteriorRingsFromGeometry( patch.geometry ) )
       {
         const QVector<QgsPointXY> ring = ringWithInsertedBoundaryPoints( part, junctions );
         const int offset = result.mesh.vertices.size();
         for ( const QgsPointXY &point : ring )
-          result.mesh.vertices.append( QgsPoint( point.x(), point.y(), baseHeight + rise * std::max( 0.0, std::min( 1.0, fractionAt( patch.plane, point ) ) ) ) );
+        {
+          const double height = baseHeight + rise * fractionAt( patch, point );
+          floor = std::min( floor, height );
+          result.mesh.vertices.append( QgsPoint( point.x(), point.y(), height ) );
+        }
         const QVector<int> triangles = triangulateRing( ring );
         for ( int i = 0; i + 2 < triangles.size(); i += 3 )
         {
@@ -10577,22 +10573,24 @@ namespace
     const QVector<QgsPointXY> wallRing = ringWithInsertedBoundaryPoints( inputRing, junctions );
     const int wallOffset = result.mesh.vertices.size();
     const double boundaryTolerance = std::max( 1e-7, ringExtentSize( inputRing ) * 1e-8 );
+    if ( floor < 0.0 )
+      floor -= 0.1;
     for ( const QgsPointXY &point : wallRing )
     {
       const QgsGeometry query = QgsGeometry::fromPointXY( point );
-      double top = -std::numeric_limits<double>::max();
-      for ( const RoofPatch &patch : patches )
+      double top = -std::numeric_limits<double>::infinity();
+      for ( const BuildingRoof::RoofPlanePatch &patch : patches )
       {
         const double distance = patch.geometry.distance( query );
         if ( distance >= 0.0 && distance <= boundaryTolerance )
-          top = std::max( top, baseHeight + rise * std::max( 0.0, std::min( 1.0, fractionAt( patch.plane, point ) ) ) );
+          top = std::max( top, baseHeight + rise * fractionAt( patch, point ) );
       }
-      if ( top < baseHeight - 1e-8 || !std::isfinite( top ) )
+      if ( !std::isfinite( top ) )
       {
         result.error = QStringLiteral( "The bent roof cannot connect to the outer walls." );
         return result;
       }
-      result.mesh.vertices.append( QgsPoint( point.x(), point.y(), 0.0 ) );
+      result.mesh.vertices.append( QgsPoint( point.x(), point.y(), floor ) );
       result.mesh.vertices.append( QgsPoint( point.x(), point.y(), top ) );
     }
     for ( int i = 0; i < wallRing.size(); ++i )
@@ -11949,6 +11947,20 @@ BuildingRoof::MeshResult BuildingRoof::buildApexRoofPrismMesh( const QgsGeometry
   return result;
 }
 
+QVector<BuildingRoof::RoofPlanePatch> BuildingRoof::bentGabledSurface( const QgsGeometry &footprint, const QgsPolylineXY &ridge )
+{
+  if ( ridge.size() != 3 )
+    return {};
+  const auto ring = exteriorRing( firstPolygon( footprint ) );
+  if ( ring.size() < 5 )
+    return {};
+  QList<RoofPoint> points;
+  for ( const QgsPointXY &point : ridge )
+    points.append( { QgsPoint( point.x(), point.y(), 1.0 ), {} } );
+  const QgsPointXY &eave = ring.first();
+  return bentGabledSurfacePatches( footprint, ring, QgsPoint( eave.x(), eave.y(), 0.0 ), bentLayoutFromRidgePoints( points ), 1.0 );
+}
+
 static BuildingRoof::MeshResult buildGabledRoofPrismMeshFromKeypoints( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<BuildingRoof::RoofPoint> &roofPoints )
 {
   using MeshResult = BuildingRoof::MeshResult;
@@ -12161,9 +12173,29 @@ static BuildingRoof::MeshResult buildLeastSquaresClippedGabledRoofPrismMesh( con
   return result;
 }
 
-BuildingRoof::MeshResult BuildingRoof::buildGabledRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints, const QVector<RoofSample> &pointCloudSamples )
+static void collectRidgePredictionSamples( BuildingRoof::RidgePrediction &prediction, const QVector<BuildingRoof::RoofSample> &samples,
+                                           const AutoHeightBand &band, const GabledBoundarySlopePlanes &planes = {},
+                                           const QgsPoint &ridge = QgsPoint(), double dirX = 0.0, double dirY = 0.0 )
+{
+  prediction.samples.clear();
+  const double tolerance = std::max( 0.30, band.binWidth * 2.0 );
+  for ( const BuildingRoof::RoofSample &sample : samples )
+  {
+    const QgsPoint &point = sample.point;
+    if ( !std::isfinite( point.z() ) || point.z() < band.baseHeight - tolerance || point.z() > band.highHeight + tolerance )
+      continue;
+    const double side = signedDistanceToLine( QgsPointXY( point ), ridge, -dirY, dirX );
+    const LeastSquaresRoofPlane *plane = planeForRidgeSide( planes, side > 0.0 );
+    if ( !plane || std::fabs( point.z() - roofPlaneZ( *plane, QgsPointXY( point ) ) ) <= std::max( tolerance, 3.0 * plane->rmse ) )
+      prediction.samples.append( sample );
+  }
+}
+
+BuildingRoof::MeshResult BuildingRoof::buildGabledRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints, const QVector<RoofSample> &pointCloudSamples, RidgePrediction *prediction )
 {
   MeshResult result;
+  if ( prediction )
+    *prediction = {};
   const QList<RoofPoint> boundary = boundaryPoints( roofPoints );
   const QList<RoofPoint> ridges = ridgePoints( roofPoints );
   if ( boundary.size() != 1 || ( ridges.size() != 1 && ridges.size() != 3 ) )
@@ -12213,6 +12245,7 @@ BuildingRoof::MeshResult BuildingRoof::buildGabledRoofPrismMesh( const QgsGeomet
     MeshResult candidate;
     if ( ridges.size() == 1 && automaticSlopePlanes.success && automaticSlopePlanes.hasSideSigns )
       candidate = buildLeastSquaresClippedGabledRoofPrismMesh( buildingGeometry, automaticPoints, automaticSlopePlanes, automaticRidgeDirX, automaticRidgeDirY );
+    const bool usedSlopePlanes = candidate.success;
     if ( !candidate.success )
       candidate = buildGabledRoofPrismMeshFromKeypoints( buildingGeometry, buildingHeight, automaticPoints );
     if ( !candidate.success )
@@ -12227,6 +12260,47 @@ BuildingRoof::MeshResult BuildingRoof::buildGabledRoofPrismMesh( const QgsGeomet
     {
       bestScore = score;
       result = candidate;
+      if ( prediction && ridges.size() == 3 )
+      {
+        const QList<RoofPoint> points = ridgePoints( automaticPoints );
+        prediction->ridge = { QgsPointXY( points[0].point ), QgsPointXY( points[1].point ), QgsPointXY( points[2].point ) };
+        prediction->eaveHeight = boundaryPoints( automaticPoints ).first().point.z();
+        prediction->ridgeHeight = points[1].point.z();
+        collectRidgePredictionSamples( *prediction, pointCloudSamples, band );
+      }
+      else if ( prediction )
+      {
+        const QgsPoint ridge = ridgePoints( automaticPoints ).first().point;
+        const QgsPoint eave = boundaryPoints( automaticPoints ).first().point;
+        if ( std::hypot( automaticRidgeDirX, automaticRidgeDirY ) <= 1e-10 )
+          nearestEdgeDirection( ring, eave, automaticRidgeDirX, automaticRidgeDirY );
+        prediction->ridge.clear();
+        prediction->samples.clear();
+        prediction->gableWidths = {};
+        const double length = std::hypot( automaticRidgeDirX, automaticRidgeDirY );
+        if ( length <= 1e-10 )
+          continue;
+        automaticRidgeDirX /= length;
+        automaticRidgeDirY /= length;
+        const QgsPointXY origin( ridge );
+        const QVector<LineInterval> intervals = lineInsideRingIntervals( ring, origin, automaticRidgeDirX, automaticRidgeDirY );
+        if ( intervals.isEmpty() )
+          continue;
+        prediction->ridge = { pointOnLine( origin, automaticRidgeDirX, automaticRidgeDirY, intervals.first().start ),
+                              pointOnLine( origin, automaticRidgeDirX, automaticRidgeDirY, intervals.last().end ) };
+        prediction->eaveHeight = eave.z();
+        prediction->ridgeHeight = ridge.z();
+        if ( usedSlopePlanes )
+        {
+          const auto *negative = planeForRidgeSide( automaticSlopePlanes, false );
+          const auto *positive = planeForRidgeSide( automaticSlopePlanes, true );
+          const double rise = ridge.z() - eave.z();
+          const double nx = -automaticRidgeDirY, ny = automaticRidgeDirX;
+          prediction->gableWidths = { rise / ( negative->a * nx + negative->b * ny ),
+                                      -rise / ( positive->a * nx + positive->b * ny ) };
+        }
+        collectRidgePredictionSamples( *prediction, pointCloudSamples, band, automaticSlopePlanes, ridge, automaticRidgeDirX, automaticRidgeDirY );
+      }
     }
   }
   if ( !result.success )
@@ -12335,9 +12409,11 @@ static BuildingRoof::MeshResult buildHippedRoofPrismMeshFromKeypoints( const Qgs
   return result;
 }
 
-BuildingRoof::MeshResult BuildingRoof::buildHippedRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints, const QVector<RoofSample> &pointCloudSamples )
+BuildingRoof::MeshResult BuildingRoof::buildHippedRoofPrismMesh( const QgsGeometry &buildingGeometry, double buildingHeight, const QList<RoofPoint> &roofPoints, const QVector<RoofSample> &pointCloudSamples, RidgePrediction *prediction )
 {
   MeshResult result;
+  if ( prediction )
+    *prediction = {};
   const QList<RoofPoint> boundaries = boundaryPoints( roofPoints );
   const QList<RoofPoint> ridges = ridgePoints( roofPoints );
   if ( boundaries.size() != 1 || ridges.size() != 2 )
@@ -12365,6 +12441,14 @@ BuildingRoof::MeshResult BuildingRoof::buildHippedRoofPrismMesh( const QgsGeomet
     {
       bestScore = score;
       result = candidate;
+      if ( prediction )
+      {
+        const QList<RoofPoint> points = ridgePoints( automaticPoints );
+        prediction->ridge = { QgsPointXY( points[0].point ), QgsPointXY( points[1].point ) };
+        prediction->eaveHeight = boundaryPoints( automaticPoints ).first().point.z();
+        prediction->ridgeHeight = 0.5 * ( points[0].point.z() + points[1].point.z() );
+        collectRidgePredictionSamples( *prediction, pointCloudSamples, band );
+      }
     }
   }
   if ( !result.success )

@@ -16,6 +16,16 @@ namespace RoofModelSettings
   {
     Type type = Type::None;
     QString pointCloudLayerId;
+    QVariantList regions;
+    double regionBaseHeight = 3.0;
+
+    bool hasRoof() const { return type != Type::None || !regions.isEmpty(); }
+
+    bool operator==( const Selection &other ) const
+    {
+      return type == other.type && pointCloudLayerId == other.pointCloudLayerId
+             && regions == other.regions && ( regions.isEmpty() || regionBaseHeight == other.regionBaseHeight );
+    }
   };
 
   inline QString typeId( Type type )
@@ -48,14 +58,22 @@ namespace RoofModelSettings
 
   inline QVariantMap toMap( const Selection &selection )
   {
-    return { { QStringLiteral( "type" ), typeId( selection.type ) },
-             { QStringLiteral( "point_cloud" ), selection.pointCloudLayerId } };
+    QVariantMap values{ { QStringLiteral( "type" ), typeId( selection.type ) },
+                        { QStringLiteral( "point_cloud" ), selection.pointCloudLayerId } };
+    if ( !selection.regions.isEmpty() )
+    {
+      values.insert( QStringLiteral( "regions" ), selection.regions );
+      values.insert( QStringLiteral( "region_base_height" ), selection.regionBaseHeight );
+    }
+    return values;
   }
 
   inline Selection fromMap( const QVariantMap &values )
   {
     return { typeFromId( values.value( QStringLiteral( "type" ) ).toString() ),
-             values.value( QStringLiteral( "point_cloud" ) ).toString() };
+             values.value( QStringLiteral( "point_cloud" ) ).toString(),
+             values.value( QStringLiteral( "regions" ) ).toList(),
+             values.value( QStringLiteral( "region_base_height" ), 3.0 ).toDouble() };
   }
 
   inline QString propertyKey( QgsFeatureId fid )

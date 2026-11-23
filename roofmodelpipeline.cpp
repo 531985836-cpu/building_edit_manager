@@ -1,4 +1,5 @@
 #include "roofmodelpipeline.h"
+#include "roofinteraction.h"
 
 #include <qgsgeos.h>
 #include <qgspointcloudattribute.h>
@@ -217,6 +218,8 @@ QVector<BuildingRoof::RoofSample> RoofModelPipeline::collectSamples( const QgsGe
 
 BuildingRoof::MeshResult RoofModelPipeline::build( const QgsGeometry &geometry, const RoofModelSettings::Selection &selection )
 {
+  if ( !selection.regions.isEmpty() )
+    return RoofInteraction::build( geometry, selection );
   RoofCache &entry = cache();
   const bool sourceReady = entry.prepare( geometry, selection.pointCloudLayerId, false );
   const QByteArray key = entry.modelKey( selection.type );

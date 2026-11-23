@@ -1,5 +1,4 @@
 #include "roofaccuracy.h"
-#include "buildingeditpreviewbus.h"
 #include "roofmodelpipeline.h"
 #include "ui_roofedit.h"
 
@@ -16,6 +15,7 @@
 #include <qgsphongmaterialsettings.h>
 #include <qgspoint3dsymbol.h>
 #include <qgspointcloudlayer.h>
+#include <qgspointclouddataprovider.h>
 #include <qgsproject.h>
 #include <qgsrulebased3drenderer.h>
 #include <qgsrulebasedrenderer.h>
@@ -24,18 +24,19 @@
 #include <qgsvectordataprovider.h>
 #include <qgsvectorlayer.h>
 
-#include <QApplication>
-#include <QCoreApplication>
+#include <QHash>
 #include <QMessageBox>
 #include <QPointer>
-#include <QSet>
+#include <QScopeGuard>
 #include <QSignalBlocker>
+#include <QTimer>
 #include <QWidget>
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <tuple>
@@ -215,24 +216,102 @@ public:
   }
 };
 
+struct EvaluationPoints
+{
+  QVector<QPair<QgsPoint, QgsPoint>> points;
+  QVector<qsizetype> displayIndices;
+  QString error;
+};
+
+QVector<qsizetype>
+sampleDisplayPoints ( const QVector<QPair<QgsPoint, QgsPoint>> &points )
+{
+  constexpr int minimumDisplayBudget = 100;
+  constexpr int maximumDisplayBudget = 2200;
+  QVector<qsizetype> indices;
+  if ( points.size () <= minimumDisplayBudget )
+  {
+    indices.resize ( points.size () );
+    std::iota ( indices.begin (), indices.end (), qsizetype ( 0 ) );
+    return indices;
+  }
+
+  const int budget = std::clamp<qsizetype> ( points.size () / 3, minimumDisplayBudget, maximumDisplayBudget );
+  double minX = points.first ().first.x (), maxX = minX;
+  double minY = points.first ().first.y (), maxY = minY;
+  for ( const auto &entry : points )
+  {
+    minX = std::min ( minX, entry.first.x () );
+    maxX = std::max ( maxX, entry.first.x () );
+    minY = std::min ( minY, entry.first.y () );
+    maxY = std::max ( maxY, entry.first.y () );
+  }
+  const double width = maxX - minX, height = maxY - minY;
+  const double aspect = height > 0.0 ? std::clamp ( width / height, 1.0 / budget, double ( budget ) ) : budget;
+  const int columns = std::clamp ( int ( std::lround ( std::sqrt ( budget * aspect ) ) ), 1, budget );
+  const int rows = budget / columns;
+  const double xScale = width > 0.0 ? columns / width : 0.0;
+  const double yScale = height > 0.0 ? rows / height : 0.0;
+
+  struct Cell
+  {
+    qsizetype index = -1;
+    double centerDistanceSquared = std::numeric_limits<double>::infinity ();
+  };
+  QVector<Cell> cells ( columns * rows );
+  // Keep one point per occupied cell, independent of its error and of the edited mesh.
+  for ( qsizetype i = 0; i < points.size (); ++i )
+  {
+    const QgsPoint &point = points[i].first;
+    const double x = ( point.x () - minX ) * xScale, y = ( point.y () - minY ) * yScale;
+    const int column = std::min ( int ( x ), columns - 1 ), row = std::min ( int ( y ), rows - 1 );
+    const double dx = x - column - 0.5, dy = y - row - 0.5;
+    const double distanceSquared = dx * dx + dy * dy;
+    Cell &cell = cells[row * columns + column];
+    if ( distanceSquared < cell.centerDistanceSquared )
+      cell = { i, distanceSquared };
+  }
+  indices.reserve ( cells.size () );
+  for ( const Cell &cell : std::as_const ( cells ) )
+    if ( cell.index >= 0 )
+      indices.append ( cell.index );
+  return indices;
+}
+
+EvaluationPoints preparePoints ( const QgsGeometry &footprint, const QVector<BuildingRoof::RoofSample> &samples,
+                                  const QVector<QgsPoint> &display, const std::function<bool ()> &canceled );
+RoofAccuracy::Result measure ( const BuildingRoof::Mesh &mesh, const EvaluationPoints &points,
+                               const std::function<bool ()> &canceled, const std::function<void ( double )> &progress );
+
 class AccuracyTask final : public QgsTask
 {
 public:
+  using QgsTask::isCanceled;
+
   AccuracyTask ( QgsGeometry footprint, BuildingRoof::Mesh mesh, QVector<BuildingRoof::RoofSample> samples,
-                 QVector<QgsPoint> display )
-      : QgsTask ( QObject::tr ( "屋顶精度评价" ), QgsTask::CanCancel ), footprint ( std::move ( footprint ) ),
+                 QVector<QgsPoint> display, std::shared_ptr<const EvaluationPoints> prepared )
+      : QgsTask ( QObject::tr ( "屋顶精度评价" ), QgsTask::CanCancel | QgsTask::Hidden ),
+        prepared ( std::move ( prepared ) ), footprint ( std::move ( footprint ) ),
         mesh ( std::move ( mesh ) ),
         samples ( std::move ( samples ) ), display ( std::move ( display ) )
   {
   }
+  std::shared_ptr<const EvaluationPoints> prepared;
   RoofAccuracy::Result result;
 
 protected:
   bool
   run () override
   {
-    result = RoofAccuracy::evaluate (
-        footprint, mesh, samples, display, [this] () { return isCanceled (); }, [this] ( double p ) { setProgress ( p ); } );
+    const auto canceled = [this] () { return isCanceled (); };
+    if ( !prepared )
+    {
+      EvaluationPoints points = preparePoints ( footprint, samples, display, canceled );
+      if ( !canceled () )
+        points.displayIndices = sampleDisplayPoints ( points.points );
+      prepared = std::make_shared<const EvaluationPoints> ( std::move ( points ) );
+    }
+    result = measure ( mesh, *prepared, canceled, [this] ( double p ) { setProgress ( p ); } );
     return !result.canceled && result.error.isEmpty () && !result.points.isEmpty ();
   }
 
@@ -266,17 +345,21 @@ symbol3D ( const QColor &color )
   return symbol;
 }
 void
-styleLayer ( QgsVectorLayer *layer, const RoofAccuracy::Result &result, double tolerance )
+styleLayer ( QgsVectorLayer *layer, const RoofAccuracy::Result &result, const QVector<qsizetype> &displayIndices,
+             double tolerance )
 {
   const std::array<QColor, 4> colors
       = { QColor ( 35, 180, 80 ), QColor ( 175, 205, 35 ), QColor ( 255, 155, 20 ), QColor ( 225, 45, 45 ) };
   const std::array<double, 3> limits = { tolerance * .5, tolerance, tolerance * 2 };
   std::array<int, 4> counts = { 0, 0, 0, 0 };
-  for ( const auto &point : result.points )
-    ++counts[point.distance <= boundary ( limits[0] )   ? 0
-             : point.distance <= boundary ( limits[1] ) ? 1
-             : point.distance <= boundary ( limits[2] ) ? 2
-                                                        : 3];
+  for ( const qsizetype index : displayIndices )
+  {
+    const double distance = result.points[index].distance;
+    ++counts[distance <= boundary ( limits[0] )   ? 0
+             : distance <= boundary ( limits[1] ) ? 1
+             : distance <= boundary ( limits[2] ) ? 2
+                                                  : 3];
+  }
   auto *root2D = new QgsRuleBasedRenderer::Rule ( nullptr );
   auto *root3D = new QgsRuleBased3DRenderer::Rule ( nullptr );
   for ( int i = 0; i < 4; ++i )
@@ -315,38 +398,22 @@ RoofAccuracy::Result::inlierRate ( double tolerance ) const
   return 100.0 * count / points.size ();
 }
 
-RoofAccuracy::Result
-RoofAccuracy::evaluate ( const QgsGeometry &footprint, const BuildingRoof::Mesh &mesh,
-                         const QVector<BuildingRoof::RoofSample> &samples,
-                         const QVector<QgsPoint> &displayPoints, const std::function<bool ()> &canceled,
-                         const std::function<void ( double )> &progress )
+namespace
 {
-  Result result;
-  auto stop = [&] ()
-  {
-    if ( canceled && canceled () )
-    {
-      result.canceled = true;
-      return true;
-    }
-    return false;
-  };
+EvaluationPoints
+preparePoints ( const QgsGeometry &footprint, const QVector<BuildingRoof::RoofSample> &samples,
+                const QVector<QgsPoint> &display, const std::function<bool ()> &canceled )
+{
+  EvaluationPoints result;
   try
   {
-    if ( footprint.isEmpty () || mesh.isEmpty () || samples.isEmpty ()
-         || ( !displayPoints.isEmpty () && displayPoints.size () != samples.size () ) )
-    {
-      result.error = QObject::tr ( "缺少有效的屋顶模型或评价点云。" );
+    if ( canceled && canceled () )
       return result;
-    }
-    if ( stop () )
-      return result;
-
     BuildingRoof::RoofSegmentationOptions segmentationOptions;
     segmentationOptions.allowVerticalPlanes = true;
     segmentationOptions.useRoofHeightBand = false;
     const auto segmentation = BuildingRoof::segmentRoofCloud ( footprint, samples, segmentationOptions );
-    if ( stop () )
+    if ( canceled && canceled () )
       return result;
 
     struct Candidate
@@ -377,7 +444,7 @@ RoofAccuracy::evaluate ( const QgsGeometry &footprint, const BuildingRoof::Mesh 
     std::set<std::tuple<double, double, double> > roofPoints;
     for ( const Candidate &candidate : std::as_const ( candidates ) )
     {
-      if ( stop () )
+      if ( canceled && canceled () )
         return result;
       // Reject underlying surfaces only when clearly higher candidates cover most of their projection.
       // This also preserves a lower roof adjoining a higher roof.
@@ -398,6 +465,49 @@ RoofAccuracy::evaluate ( const QgsGeometry &footprint, const BuildingRoof::Mesh 
       return result;
     }
 
+    result.points.reserve ( static_cast<qsizetype> ( roofPoints.size () ) );
+    for ( qsizetype i = 0; i < samples.size (); ++i )
+    {
+      if ( ( i & 127 ) == 0 && canceled && canceled () )
+        return {};
+      const QgsPoint &point = samples.at ( i ).point;
+      if ( finitePoint ( point ) && roofPoints.find ( key ( point ) ) != roofPoints.end () )
+        result.points.append ( { point, display.isEmpty () ? point : display.at ( i ) } );
+    }
+    if ( result.points.isEmpty () )
+      result.error = QObject::tr ( "点云分割未识别到可评价的屋面点。" );
+  }
+  catch ( const std::exception &e )
+  {
+    result.error = QObject::tr ( "精度计算失败：%1" ).arg ( QString::fromUtf8 ( e.what () ) );
+  }
+  return result;
+}
+
+RoofAccuracy::Result
+measure ( const BuildingRoof::Mesh &mesh, const EvaluationPoints &points, const std::function<bool ()> &canceled,
+          const std::function<void ( double )> &progress )
+{
+  RoofAccuracy::Result result;
+  auto stop = [&] ()
+  {
+    result.canceled = canceled && canceled ();
+    return result.canceled;
+  };
+  if ( stop () )
+    return result;
+  if ( !points.error.isEmpty () )
+  {
+    result.error = points.error;
+    return result;
+  }
+  if ( mesh.isEmpty () || points.points.isEmpty () )
+  {
+    result.error = QObject::tr ( "缺少有效的屋顶模型或评价点云。" );
+    return result;
+  }
+  try
+  {
     const QgsPoint origin = mesh.vertices.first ();
     auto local = [&] ( const QgsPoint &p ) -> Vec
     { return { p.x () - origin.x (), p.y () - origin.y (), p.z () - origin.z () }; };
@@ -425,36 +535,29 @@ RoofAccuracy::evaluate ( const QgsGeometry &footprint, const BuildingRoof::Mesh 
       return result;
     }
     surface.build ();
-    result.points.reserve ( static_cast<qsizetype> ( roofPoints.size () ) );
+    const qsizetype count = points.points.size ();
+    result.points.reserve ( count );
     long double sum = 0, squared = 0;
-    for ( qsizetype i = 0; i < samples.size (); ++i )
+    for ( qsizetype i = 0; i < count; ++i )
     {
       if ( ( i & 127 ) == 0 )
       {
         if ( stop () )
           return result;
         if ( progress )
-          progress ( 100.0 * i / samples.size () );
+          progress ( 100.0 * i / count );
       }
-      const QgsPoint &point = samples.at ( i ).point;
-      if ( !finitePoint ( point ) || roofPoints.find ( key ( point ) ) == roofPoints.end () )
-        continue;
-      const double d2 = surface.distanceSquared ( local ( point ) );
+      const auto &point = points.points.at ( i );
+      const double d2 = surface.distanceSquared ( local ( point.first ) );
       if ( !std::isfinite ( d2 ) )
       {
         result.error = QObject::tr ( "点到屋面距离计算失败。" );
         return result;
       }
       const double d = std::sqrt ( std::max ( 0.0, d2 ) );
-      result.points.append ( { displayPoints.isEmpty () ? point : displayPoints.at ( i ), d } );
+      result.points.append ( { point.second, d } );
       sum += d;
       squared += d2;
-    }
-    const qsizetype count = result.points.size ();
-    if ( count == 0 )
-    {
-      result.error = QObject::tr ( "点云分割未识别到可评价的屋面点。" );
-      return result;
     }
     result.mae = static_cast<double> ( sum / count );
     result.rmse = std::sqrt ( static_cast<double> ( squared / count ) );
@@ -468,9 +571,35 @@ RoofAccuracy::evaluate ( const QgsGeometry &footprint, const BuildingRoof::Mesh 
   }
   return result;
 }
+}
+
+RoofAccuracy::Result
+RoofAccuracy::evaluate ( const QgsGeometry &footprint, const BuildingRoof::Mesh &mesh,
+                         const QVector<BuildingRoof::RoofSample> &samples,
+                         const QVector<QgsPoint> &displayPoints, const std::function<bool ()> &canceled,
+                         const std::function<void ( double )> &progress )
+{
+  if ( footprint.isEmpty () || mesh.isEmpty () || samples.isEmpty ()
+       || ( !displayPoints.isEmpty () && displayPoints.size () != samples.size () ) )
+  {
+    Result result;
+    result.error = QObject::tr ( "缺少有效的屋顶模型或评价点云。" );
+    return result;
+  }
+  return measure ( mesh, preparePoints ( footprint, samples, displayPoints, canceled ), canceled, progress );
+}
 
 struct RoofAccuracy::Controller::Private
 {
+  struct Inputs
+  {
+    QgsGeometry footprint;
+    QVector<BuildingRoof::RoofSample> samples;
+    QVector<QgsPoint> display;
+    std::function<QgsPoint ( const QgsPoint & )> toMetric;
+  };
+  enum class CoordinateMode { LocalMeters, Geographic };
+
   Controller *owner;
   QPointer<QWidget> panel;
   Ui::roofedit &ui;
@@ -478,50 +607,72 @@ struct RoofAccuracy::Controller::Private
   QPointer<QgsVectorLayer> layer, displayLayer;
   QgsFeatureId fid = FID_NULL;
   RoofModelSettings::Selection selection;
+  BuildingRoof::Mesh previewMesh;
   Result result;
   QPointer<AccuracyTask> task;
-  QList<QPointer<AccuracyTask> > tasks;
+  QTimer timer;
+  bool pending = false;
+  bool preparing = false;
+  bool needsCoordinates = false;
+  quint64 inputRevision = 0, modelRevision = 0;
+  std::optional<Inputs> inputs;
+  std::shared_ptr<const EvaluationPoints> evaluationPoints;
   QList<QMetaObject::Connection> inputConnections;
-  QSet<QString> confirmedLocalMeters;
-  QString coordinateNote;
+  QHash<QString, CoordinateMode> coordinateModes;
+  QString coordinateNote, status;
+  QVector<QgsFeatureId> displayOrder;
+  QMetaObject::Connection displayDestroyed;
 
   Private ( Controller *owner, QWidget *panel, Ui::roofedit &ui, QgisInterface *iface )
       : owner ( owner ), panel ( panel ), ui ( ui ), iface ( iface )
   {
+    timer.setInterval ( 120 );
+    timer.setSingleShot ( true );
+    QObject::connect ( &timer, &QTimer::timeout, owner, [this] () { calculate ( false ); } );
   }
 
-  void
-  update ()
+  QgsPointCloudLayer *cloud () const
+  {
+    return qobject_cast<QgsPointCloudLayer *> ( QgsProject::instance ()->mapLayer ( selection.pointCloudLayerId ) );
+  }
+
+  bool canCalculate () const
+  {
+    const auto *source = cloud ();
+    return layer && fid != FID_NULL && selection.hasRoof () && source && source->isValid () && source->dataProvider ();
+  }
+
+  void update ()
   {
     if ( !panel )
       return;
-    const bool valid = !result.points.isEmpty () && result.error.isEmpty () && !result.canceled;
+    const bool valid = !result.points.isEmpty ();
     const QString empty = QStringLiteral ( "—" );
     ui.accuracyPointCountValueLabel->setText ( valid ? QString::number ( result.points.size () ) : empty );
     ui.accuracyMaeValueLabel->setText ( valid ? QString::number ( result.mae, 'f', 3 ) : empty );
     ui.accuracyRmseValueLabel->setText ( valid ? QString::number ( result.rmse, 'f', 3 ) : empty );
     ui.accuracyInlierRateValueLabel->setText (
         valid ? QString::number ( result.inlierRate ( ui.accuracyToleranceSpinBox->value () ), 'f', 2 ) : empty );
-    auto *cloud
-        = qobject_cast<QgsPointCloudLayer *> ( QgsProject::instance ()->mapLayer ( selection.pointCloudLayerId ) );
-    ui.calculateAccuracyButton->setEnabled ( task
-                                             || ( layer && fid != FID_NULL
-                                                  && selection.type != RoofModelSettings::Type::None && cloud
-                                                  && cloud->isValid () ) );
-    if ( !task )
-      ui.calculateAccuracyButton->setText ( QObject::tr ( "计算精度" ) );
-    ui.showAccuracyIn3DCheckBox->setEnabled ( valid && !task );
-    ui.accuracyGroupBox->setToolTip ( valid ? QObject::tr ( "%1\n逐点评价点云分割识别的 %2 个屋面点。误差为点到屋面的最短三维距离。" )
-                                                  .arg ( coordinateNote )
-                                                  .arg ( result.points.size () )
-                                            : QObject::tr ( "计算当前建筑物屋顶与所选点云的拟合误差。" ) );
+    const bool busy = pending || ( task && !task->isCanceled () );
+    ui.calculateAccuracyButton->setEnabled ( canCalculate () && !preparing );
+    ui.calculateAccuracyButton->setText ( busy ? QObject::tr ( "取消计算" )
+                                          : needsCoordinates ? QObject::tr ( "确认坐标并计算" ) : QObject::tr ( "计算精度" ) );
+    ui.showAccuracyIn3DCheckBox->setEnabled ( valid || ui.showAccuracyIn3DCheckBox->isChecked () );
+    QString note = valid ? QObject::tr ( "%1\n误差为点到屋面的最短三维距离。" ).arg ( coordinateNote )
+                         : QObject::tr ( "选定屋顶和点云后自动计算精度。" );
+    if ( busy && valid )
+      note += QObject::tr ( "\n正在更新精度，当前显示最近一次完成的结果。" );
+    if ( !status.isEmpty () )
+      note += QLatin1Char ( '\n' ) + status;
+    ui.accuracyGroupBox->setToolTip ( note );
+    ui.calculateAccuracyButton->setToolTip ( note );
   }
 
-  void
-  clearDisplay ()
+  void clearDisplay ()
   {
     if ( !displayLayer )
       return;
+    QObject::disconnect ( displayDestroyed );
     for ( auto *canvas : iface ? iface->mapCanvases3D () : QList<Qgs3DMapCanvas *> () )
     {
       if ( !canvas || !canvas->mapSettings () )
@@ -532,71 +683,98 @@ struct RoofAccuracy::Controller::Private
     }
     const QString id = displayLayer->id ();
     displayLayer = nullptr;
+    displayOrder.clear ();
     QgsProject::instance ()->removeMapLayer ( id );
   }
-  void
-  clear ()
+
+  void resetInputs ()
   {
+    ++inputRevision;
+    timer.stop ();
+    pending = false;
     if ( task )
-    {
-      QObject::disconnect ( task, nullptr, owner, nullptr );
       task->cancel ();
-      task = nullptr;
-    }
+    inputs.reset ();
+    evaluationPoints.reset ();
     result = Result ();
-    if ( panel )
-    {
-      const QSignalBlocker blocker ( ui.showAccuracyIn3DCheckBox );
-      ui.showAccuracyIn3DCheckBox->setChecked ( false );
-    }
+    coordinateNote.clear ();
+    status.clear ();
+    needsCoordinates = false;
     clearDisplay ();
+  }
+
+  void schedule ()
+  {
+    if ( canCalculate () && !needsCoordinates )
+    {
+      const bool alreadyScheduled = pending && ( task || timer.isActive () );
+      pending = true;
+      if ( !task && !timer.isActive () && !preparing )
+        timer.start ();
+      if ( alreadyScheduled )
+        return;
+    }
     update ();
   }
 
-  void
-  watchInputs ()
+  void watchInputs ()
   {
     for ( const auto &connection : inputConnections )
       QObject::disconnect ( connection );
     inputConnections.clear ();
-    for ( QgsMapLayer *input : { static_cast<QgsMapLayer *> ( layer.data () ),
-                                 QgsProject::instance ()->mapLayer ( selection.pointCloudLayerId ) } )
+    const auto refresh = [this] ()
+    {
+      previewMesh = {};
+      resetInputs ();
+      schedule ();
+    };
+    const auto removed = [this] ()
+    {
+      resetInputs ();
+      update ();
+    };
+    for ( QgsMapLayer *input : { static_cast<QgsMapLayer *> ( layer.data () ), static_cast<QgsMapLayer *> ( cloud () ) } )
     {
       if ( !input )
         continue;
-      inputConnections.append ( QObject::connect ( input, &QgsMapLayer::dataChanged, owner, [this] () { clear (); } ) );
-      inputConnections.append (
-          QObject::connect ( input, &QgsMapLayer::dataSourceChanged, owner, [this] () { clear (); } ) );
-      inputConnections.append ( QObject::connect ( input, &QgsMapLayer::crsChanged, owner, [this] () { clear (); } ) );
-      inputConnections.append ( QObject::connect ( input, &QObject::destroyed, owner, [this] () { clear (); } ) );
+      inputConnections.append ( QObject::connect ( input, &QgsMapLayer::dataChanged, owner, refresh ) );
+      inputConnections.append ( QObject::connect ( input, &QgsMapLayer::dataSourceChanged, owner, [this, refresh] ()
+      {
+        watchInputs ();
+        refresh ();
+      } ) );
+      inputConnections.append ( QObject::connect ( input, &QgsMapLayer::crsChanged, owner, refresh ) );
+      inputConnections.append ( QObject::connect ( input, &QObject::destroyed, owner, removed ) );
     }
     if ( layer )
     {
       inputConnections.append ( QObject::connect ( layer, &QgsVectorLayer::geometryChanged, owner,
-                                                   [this] ( QgsFeatureId changed, const QgsGeometry & )
+                                                   [this, refresh] ( QgsFeatureId changed, const QgsGeometry & )
                                                    {
                                                      if ( changed == fid )
-                                                       clear ();
+                                                       refresh ();
                                                    } ) );
       inputConnections.append ( QObject::connect ( layer, &QgsVectorLayer::featuresDeleted, owner,
-                                                   [this] ( const QgsFeatureIds &deleted )
+                                                   [this, removed] ( const QgsFeatureIds &deleted )
                                                    {
                                                      if ( deleted.contains ( fid ) )
                                                      {
                                                        fid = FID_NULL;
-                                                       clear ();
+                                                       removed ();
                                                      }
                                                    } ) );
     }
-    if ( auto *cloud
-         = qobject_cast<QgsPointCloudLayer *> ( QgsProject::instance ()->mapLayer ( selection.pointCloudLayerId ) ) )
-      inputConnections.append (
-          QObject::connect ( cloud, &QgsPointCloudLayer::subsetStringChanged, owner, [this] () { clear (); } ) );
+    if ( auto *source = cloud () )
+    {
+      inputConnections.append ( QObject::connect ( source, &QgsPointCloudLayer::subsetStringChanged, owner, refresh ) );
+      if ( source->dataProvider () )
+        inputConnections.append ( QObject::connect ( source->dataProvider (), &QgsPointCloudDataProvider::indexGenerationStateChanged,
+                                                     owner, refresh ) );
+    }
   }
 
   bool
-  metricInputs ( QgsPointCloudLayer *cloud, QgsGeometry &footprint, BuildingRoof::Mesh &mesh,
-                 QVector<BuildingRoof::RoofSample> &samples, QVector<QgsPoint> &display )
+  metricInputs ( QgsPointCloudLayer *cloud, Inputs &input, bool manual )
   {
     const auto vectorCrs = layer->crs (), cloudCrs = cloud->crs ();
     const bool shared = vectorCrs.isValid () && cloudCrs.isValid () && vectorCrs == cloudCrs;
@@ -618,13 +796,17 @@ struct RoofAccuracy::Controller::Private
       // A shared CRS label is not a reliable unit declaration for synthetic/local data.
       // Do not reject it just because the label says geographic or is missing.
       const QString key = cloud->id () + cloud->source () + cloudCrs.toWkt () + vectorCrs.toWkt ();
-      bool localMeters = confirmedLocalMeters.contains ( key );
+      auto mode = coordinateModes.constFind ( key );
       const QgsRectangle cloudExtent = cloud->extent ();
       const bool plausibleGeographic = shared && vectorCrs.isGeographic () && cloudExtent.xMinimum () >= -180
                                        && cloudExtent.xMaximum () <= 180 && cloudExtent.yMinimum () >= -90
                                        && cloudExtent.yMaximum () <= 90;
-      if ( !localMeters )
+      if ( mode == coordinateModes.cend () )
       {
+        needsCoordinates = true;
+        if ( !manual )
+          return false;
+        const quint64 revision = inputRevision;
         QMessageBox choice ( panel );
         choice.setWindowTitle ( QObject::tr ( "评价坐标单位" ) );
         choice.setText (
@@ -638,19 +820,21 @@ struct RoofAccuracy::Controller::Private
                                   : nullptr;
         choice.addButton ( QMessageBox::Cancel );
         choice.exec ();
-        if ( choice.clickedButton () == localButton )
-        {
-          localMeters = true;
-          confirmedLocalMeters.insert ( key );
-        }
-        else if ( !geographicButton || choice.clickedButton () != geographicButton )
+        if ( revision != inputRevision )
           return false;
+        if ( choice.clickedButton () == localButton )
+          mode = coordinateModes.insert ( key, CoordinateMode::LocalMeters );
+        else if ( geographicButton && choice.clickedButton () == geographicButton )
+          mode = coordinateModes.insert ( key, CoordinateMode::Geographic );
+        else
+          return false;
+        needsCoordinates = false;
       }
-      if ( localMeters )
+      if ( mode.value () == CoordinateMode::LocalMeters )
         coordinateNote = QObject::tr ( "本地坐标：X/Y/Z 按米计算，使用原始坐标对齐" );
       else
       {
-        const QgsPointXY center = footprint.boundingBox ().center ();
+        const QgsPointXY center = input.footprint.boundingBox ().center ();
         const QgsCoordinateTransform toWgs ( vectorCrs, QgsCoordinateReferenceSystem::fromEpsgId ( 4326 ),
                                              QgsProject::instance ()->transformContext () );
         const QgsPointXY anchor = toWgs.transform ( center );
@@ -668,148 +852,196 @@ struct RoofAccuracy::Controller::Private
     if ( !transform && xyFactor == 1 && zFactor == 1 )
       return true;
 
-    auto convert = [&] ( const QgsPoint &point )
+    input.toMetric = [transform, toMetric, xyFactor, zFactor] ( const QgsPoint &point )
     {
       const QgsPointXY xy = transform ? toMetric.transform ( QgsPointXY ( point.x (), point.y () ) )
                                       : QgsPointXY ( point.x (), point.y () );
       return QgsPoint ( xy.x () * xyFactor, xy.y () * xyFactor, point.z () * zFactor );
     };
     if ( transform || xyFactor != 1 )
-      footprint.transformVertices ( convert );
-    for ( auto &point : mesh.vertices )
-      point = convert ( point );
-    display.reserve ( samples.size () );
-    for ( auto &sample : samples )
-    {
-      display.append ( sample.point );
-      sample.point = convert ( sample.point );
-    }
+      input.footprint.transformVertices ( input.toMetric );
     return true;
   }
 
-  void
-  calculate ()
+  void reportError ( const QString &error, bool manual )
   {
-    if ( task )
-    {
-      clear ();
-      return;
-    }
-    if ( !layer || fid == FID_NULL )
-      return;
-    auto *cloud
-        = qobject_cast<QgsPointCloudLayer *> ( QgsProject::instance ()->mapLayer ( selection.pointCloudLayerId ) );
-    const QgsFeature feature = layer->getFeature ( fid );
-    if ( !cloud || !cloud->dataProvider () || !feature.isValid () )
-    {
-      clear ();
-      return;
-    }
-    clear ();
-    BuildingRoof::MeshResult model;
-    QVector<BuildingRoof::RoofSample> samples;
-    bool complete = false;
-    QApplication::setOverrideCursor ( Qt::WaitCursor );
-    try
-    {
-      model = RoofModelPipeline::build ( feature.geometry (), selection );
-      if ( model.success )
-        samples = RoofModelPipeline::collectSamples ( feature.geometry (), selection.pointCloudLayerId, &complete );
-    }
-    catch ( const QgsException &e )
-    {
-      model.success = false;
-      model.error = e.what ();
-    }
-    catch ( const std::exception &e )
-    {
-      model.success = false;
-      model.error = QString::fromUtf8 ( e.what () );
-    }
-    QApplication::restoreOverrideCursor ();
-    if ( !model.success || !complete || samples.isEmpty () )
-    {
-      QMessageBox::warning ( panel, QObject::tr ( "精度计算" ),
-                             !model.success ? model.error
-                             : !complete    ? QObject::tr ( "点云索引未就绪或读取不完整，请稍后重试。" )
-                                            : QObject::tr ( "建筑轮廓内未读到点云，请检查实际坐标范围是否重叠。" ) );
-      return;
-    }
-    QVector<QgsPoint> display;
-    QgsGeometry footprint = feature.geometry ();
-    try
-    {
-      if ( !metricInputs ( cloud, footprint, model.mesh, samples, display ) )
-        return;
-    }
-    catch ( const QgsException &e )
-    {
-      QMessageBox::warning ( panel, QObject::tr ( "坐标换算" ), e.what () );
-      return;
-    }
-    catch ( const std::exception &e )
-    {
-      QMessageBox::warning ( panel, QObject::tr ( "坐标换算" ), QString::fromUtf8 ( e.what () ) );
-      return;
-    }
-    auto *next = new AccuracyTask ( std::move ( footprint ), std::move ( model.mesh ), std::move ( samples ), std::move ( display ) );
-    next->setDependentLayers ( { layer.data (), cloud } );
-    tasks.erase (
-        std::remove_if ( tasks.begin (), tasks.end (), [] ( const QPointer<AccuracyTask> &t ) { return t.isNull (); } ),
-        tasks.end () );
-    tasks.append ( next );
-    task = next;
-    QObject::connect ( next, &QgsTask::progressChanged, owner,
-                       [this, next] ( double p )
-                       {
-                         if ( task == next && panel )
-                           ui.calculateAccuracyButton->setText (
-                               QObject::tr ( "取消计算（%1%）" ).arg ( qRound ( p ) ) );
-                       } );
-    QObject::connect ( next, &QgsTask::taskCompleted, owner,
-                       [this, next] ()
-                       {
-                         if ( task != next )
-                           return;
-                         result = next->result;
-                         task = nullptr;
-                         update ();
-                       } );
-    QObject::connect ( next, &QgsTask::taskTerminated, owner,
-                       [this, next] ()
-                       {
-                         if ( task != next )
-                           return;
-                         const auto error = next->result.error;
-                         task = nullptr;
-                         update ();
-                         if ( !error.isEmpty () )
-                           QMessageBox::warning ( panel, QObject::tr ( "精度计算" ), error );
-                       } );
-    ui.calculateAccuracyButton->setText ( QObject::tr ( "取消计算" ) );
+    status = error;
+    result = {};
+    clearDisplay ();
     update ();
-    QgsApplication::taskManager ()->addTask ( next );
+    if ( manual && panel && !error.isEmpty () )
+      QMessageBox::warning ( panel, QObject::tr ( "精度计算" ), error );
+  }
+
+  void calculate ( bool manual )
+  {
+    if ( preparing )
+      return;
+    if ( task || ( manual && pending ) )
+    {
+      if ( manual )
+      {
+        pending = false;
+        timer.stop ();
+        if ( task )
+          task->cancel ();
+        update ();
+      }
+      return;
+    }
+    timer.stop ();
+    pending = false;
+    if ( !canCalculate () )
+    {
+      update ();
+      return;
+    }
+
+    preparing = true;
+    const auto donePreparing = qScopeGuard ( [this] ()
+    {
+      preparing = false;
+      if ( pending )
+        schedule ();
+      else
+        update ();
+    } );
+    const quint64 revision = inputRevision;
+    status.clear ();
+    try
+    {
+      const QgsFeature feature = layer->getFeature ( fid );
+      if ( !feature.isValid () )
+      {
+        reportError ( QObject::tr ( "当前建筑不可用。" ), manual );
+        return;
+      }
+      if ( !inputs )
+      {
+        Inputs input;
+        input.footprint = feature.geometry ();
+        if ( !metricInputs ( cloud (), input, manual ) )
+          return;
+        bool complete = false;
+        input.samples = RoofModelPipeline::collectSamples ( feature.geometry (), selection.pointCloudLayerId, &complete );
+        if ( revision != inputRevision )
+          return;
+        if ( !complete || input.samples.isEmpty () )
+        {
+          reportError ( !complete ? QObject::tr ( "点云索引未就绪或读取不完整。" )
+                                 : QObject::tr ( "建筑轮廓内未读到点云。" ), manual );
+          return;
+        }
+        if ( input.toMetric )
+        {
+          input.display.reserve ( input.samples.size () );
+          for ( auto &sample : input.samples )
+          {
+            input.display.append ( sample.point );
+            sample.point = input.toMetric ( sample.point );
+          }
+        }
+        inputs = std::move ( input );
+      }
+      BuildingRoof::Mesh mesh = previewMesh;
+      if ( mesh.isEmpty () )
+      {
+        auto model = RoofModelPipeline::build ( feature.geometry (), selection );
+        if ( revision != inputRevision )
+          return;
+        if ( !model.success )
+        {
+          reportError ( model.error, manual );
+          return;
+        }
+        mesh = std::move ( model.mesh );
+      }
+      if ( inputs->toMetric )
+      {
+        for ( auto &point : mesh.vertices )
+          point = inputs->toMetric ( point );
+      }
+      auto *next = new AccuracyTask ( inputs->footprint, std::move ( mesh ), inputs->samples, inputs->display, evaluationPoints );
+      next->setDependentLayers ( { layer.data (), cloud () } );
+      task = next;
+      const quint64 evaluatedModel = modelRevision;
+      const auto finished = [this, next, revision, evaluatedModel, manual] ()
+      {
+        task = nullptr;
+        if ( revision == inputRevision && !next->isCanceled () )
+        {
+          evaluationPoints = next->prepared;
+          if ( !next->result.points.isEmpty () && next->result.error.isEmpty () )
+          {
+            result = std::move ( next->result );
+            if ( panel && ui.showAccuracyIn3DCheckBox->isChecked () )
+              show3D ( true );
+          }
+          else if ( evaluatedModel == modelRevision )
+            reportError ( next->result.error, manual );
+        }
+        if ( pending )
+          schedule ();
+        else
+          update ();
+      };
+      QObject::connect ( next, &QgsTask::taskCompleted, owner, finished );
+      QObject::connect ( next, &QgsTask::taskTerminated, owner, finished );
+      QgsApplication::taskManager ()->addTask ( next );
+    }
+    catch ( const QgsException &e )
+    {
+      reportError ( e.what (), manual );
+    }
+    catch ( const std::exception &e )
+    {
+      reportError ( QString::fromUtf8 ( e.what () ), manual );
+    }
   }
 
   void
-  show3D ( bool enabled )
+  show3D ( bool enabled, bool manual = false )
   {
     if ( !enabled )
     {
       clearDisplay ();
       return;
     }
-    if ( result.points.isEmpty () || !layer || !iface )
+    if ( result.points.isEmpty () || !evaluationPoints || !layer || !iface )
       return;
+    const auto &displayIndices = evaluationPoints->displayIndices;
+    const auto displayError = [this, manual] ( const QString &error )
+    {
+      const QSignalBlocker blocker ( ui.showAccuracyIn3DCheckBox );
+      ui.showAccuracyIn3DCheckBox->setChecked ( false );
+      status = error;
+      update ();
+      if ( manual )
+        QMessageBox::warning ( panel, QObject::tr ( "精度显示" ), error );
+    };
+    if ( displayLayer && displayLayer->dataProvider () && displayOrder.size () == displayIndices.size () )
+    {
+      QgsChangedAttributesMap changes;
+      const int field = displayLayer->fields ().lookupField ( QStringLiteral ( "distance_m" ) );
+      for ( qsizetype i = 0; i < displayOrder.size (); ++i )
+        changes[displayOrder[i]].insert ( field, result.points[displayIndices[i]].distance );
+      if ( field >= 0 && displayLayer->dataProvider ()->changeAttributeValues ( changes ) )
+      {
+        styleLayer ( displayLayer, result, displayIndices, ui.accuracyToleranceSpinBox->value () );
+        return;
+      }
+    }
+    clearDisplay ();
     auto points = std::make_unique<QgsVectorLayer> (
         QStringLiteral ( "PointZ?field=building_fid:long&field=distance_m:double" ), QObject::tr ( "屋顶精度误差点" ),
         QStringLiteral ( "memory" ) );
     points->setCrs ( layer->crs () );
     points->setCustomProperty ( QStringLiteral ( "building_edit_manager/accuracy_points" ), true );
     QgsFeatureList features;
-    features.reserve ( result.points.size () );
-    for ( const auto &p : result.points )
+    features.reserve ( displayIndices.size () );
+    for ( const qsizetype index : displayIndices )
     {
+      const auto &p = result.points[index];
       QgsFeature f ( points->fields () );
       f.setGeometry ( QgsGeometry::fromPoint ( p.point ) );
       f.setAttributes ( QgsAttributes () << fid << p.distance );
@@ -817,18 +1049,20 @@ struct RoofAccuracy::Controller::Private
     }
     if ( !points->isValid () || !points->dataProvider ()->addFeatures ( features ) )
     {
-      const QSignalBlocker blocker ( ui.showAccuracyIn3DCheckBox );
-      ui.showAccuracyIn3DCheckBox->setChecked ( false );
-      QMessageBox::warning ( panel, QObject::tr ( "精度显示" ), QObject::tr ( "无法生成误差点图层。" ) );
+      displayError ( QObject::tr ( "无法生成误差点图层。" ) );
       return;
     }
     points->updateExtents ();
-    styleLayer ( points.get (), result, ui.accuracyToleranceSpinBox->value () );
+    styleLayer ( points.get (), result, displayIndices, ui.accuracyToleranceSpinBox->value () );
+    displayOrder.reserve ( features.size () );
+    for ( const QgsFeature &feature : features )
+      displayOrder.append ( feature.id () );
     displayLayer = points.release ();
-    QObject::connect ( displayLayer, &QObject::destroyed, owner,
+    displayDestroyed = QObject::connect ( displayLayer, &QObject::destroyed, owner,
                        [this] ()
                        {
                          displayLayer = nullptr;
+                         displayOrder.clear ();
                          if ( panel )
                          {
                            const QSignalBlocker blocker ( ui.showAccuracyIn3DCheckBox );
@@ -860,7 +1094,7 @@ struct RoofAccuracy::Controller::Private
     if ( !shown )
     {
       clearDisplay ();
-      QMessageBox::warning ( panel, QObject::tr ( "精度显示" ), QObject::tr ( "请先打开三维视图后重试。" ) );
+      displayError ( QObject::tr ( "请先打开三维视图后重试。" ) );
     }
   }
 };
@@ -868,27 +1102,24 @@ struct RoofAccuracy::Controller::Private
 RoofAccuracy::Controller::Controller ( QWidget *panel, Ui::roofedit &ui, QgisInterface *iface, QObject *parent )
     : QObject ( parent ), d ( std::make_unique<Private> ( this, panel, ui, iface ) )
 {
-  connect ( ui.calculateAccuracyButton, &QPushButton::clicked, this, [this] () { d->calculate (); } );
+  connect ( ui.calculateAccuracyButton, &QPushButton::clicked, this, [this] () { d->calculate ( true ); } );
   connect ( ui.showAccuracyIn3DCheckBox, &QCheckBox::toggled, this,
-            [this] ( bool enabled ) { d->show3D ( enabled ); } );
+            [this] ( bool enabled ) { d->show3D ( enabled, true ); } );
   connect ( ui.accuracyToleranceSpinBox, qOverload<double> ( &QDoubleSpinBox::valueChanged ), this,
             [this] ( double tolerance )
             {
               d->update ();
-              if ( d->displayLayer )
-                styleLayer ( d->displayLayer, d->result, tolerance );
-            } );
-  connect ( BuildingEditPreviewBus::instance (), &BuildingEditPreviewBus::roofModelChanged, this,
-            [this] ( QgsVectorLayer *layer, QgsFeatureId fid )
-            {
-              if ( layer == d->layer && fid == d->fid )
-                d->clear ();
+              if ( d->displayLayer && d->evaluationPoints )
+                styleLayer ( d->displayLayer, d->result, d->evaluationPoints->displayIndices, tolerance );
             } );
   connect ( QgsProject::instance (), &QgsProject::layersRemoved, this,
             [this] ()
             {
-              if ( !QgsProject::instance ()->mapLayer ( d->selection.pointCloudLayerId ) )
-                d->clear ();
+              if ( !d->selection.pointCloudLayerId.isEmpty () && !d->cloud () )
+              {
+                d->resetInputs ();
+                d->update ();
+              }
             } );
   ui.accuracyPointCountLabel->setToolTip (
       tr ( "统计点云分割识别的屋面点，逐点计算到屋顶模型的距离。" ) );
@@ -899,35 +1130,52 @@ RoofAccuracy::Controller::Controller ( QWidget *panel, Ui::roofedit &ui, QgisInt
 
 RoofAccuracy::Controller::~Controller ()
 {
-  d->clear ();
-  const auto tasks = d->tasks;
-  for ( const auto &task : tasks )
-  {
-    if ( !task )
-      continue;
-    task->cancel ();
-    task->waitForFinished ( 0 );
-    if ( task )
-      QCoreApplication::sendPostedEvents ( task, QEvent::DeferredDelete );
-  }
+  if ( const auto task = d->task )
+    QObject::disconnect ( task, nullptr, this, nullptr );
+  clear ();
+  if ( d->task )
+    d->task->waitForFinished ( 0 );
 }
 
 void
 RoofAccuracy::Controller::setContext ( QgsVectorLayer *layer, QgsFeatureId fid,
-                                       const RoofModelSettings::Selection &selection )
+                                       const RoofModelSettings::Selection &selection, const BuildingRoof::Mesh *previewMesh )
 {
-  if ( d->layer != layer || d->fid != fid || d->selection.type != selection.type
-       || d->selection.pointCloudLayerId != selection.pointCloudLayerId )
-    d->clear ();
+  const bool inputChanged = d->layer != layer || d->fid != fid || d->selection.pointCloudLayerId != selection.pointCloudLayerId;
+  if ( !inputChanged && d->selection == selection )
+  {
+    if ( previewMesh && d->previewMesh.isEmpty () )
+      d->previewMesh = *previewMesh;
+    return;
+  }
+
+  if ( inputChanged )
+    d->resetInputs ();
   d->layer = layer;
   d->fid = fid;
   d->selection = selection;
-  d->watchInputs ();
-  d->update ();
+  ++d->modelRevision;
+  d->previewMesh = previewMesh ? *previewMesh : BuildingRoof::Mesh{};
+  if ( inputChanged )
+    d->watchInputs ();
+  if ( !d->canCalculate () && !inputChanged )
+    d->resetInputs ();
+  d->schedule ();
 }
 
 void
 RoofAccuracy::Controller::clear ()
 {
-  d->clear ();
+  d->resetInputs ();
+  d->layer = nullptr;
+  d->fid = FID_NULL;
+  d->selection = {};
+  d->previewMesh = {};
+  d->watchInputs ();
+  if ( d->panel )
+  {
+    const QSignalBlocker blocker ( d->ui.showAccuracyIn3DCheckBox );
+    d->ui.showAccuracyIn3DCheckBox->setChecked ( false );
+  }
+  d->update ();
 }

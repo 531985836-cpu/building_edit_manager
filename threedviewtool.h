@@ -18,6 +18,8 @@ class QgsMapLayer;
 class QgsMapCanvas;
 class QgsPointCloudLayer;
 class QgsRasterLayer;
+class Qgs3DMapScene;
+class Qgs3DMapSettings;
 class QgisInterface;
 namespace Qt3DCore
 {
@@ -39,11 +41,7 @@ struct MeshData
 {
     QVector<QgsPoint> vertices;
     QVector<int> indices;
-    bool flatTopWireframe = false;
-    bool curvedWireframe = false;
-    bool eaveWireframe = false;
-    QVector<QgsPoint> footprintRing;
-    QVector<QPair<QgsPoint, QgsPoint>> structureLines;
+    bool smoothRoof = false;
     bool isEmpty() const { return vertices.isEmpty(); }
 };
 
@@ -95,15 +93,17 @@ class ThreeDViewTool : public QgsMapTool
     void ensureRoofSegmentationLayer();
     void clearRoofSegmentationLayer();
     void updateRoofSegmentationLayer( QgsVectorLayer *layer, QgsFeatureId fid );
-    QgsFeatureList buildSimplifiedWireframeFromMesh( const MeshData &mesh, QgsFeatureId fid, bool flatTopWireframe, bool curvedWireframe, bool eaveWireframe ) const;
+    QgsFeatureList buildStructuralWireframe( const MeshData &mesh, QgsFeatureId fid ) const;
     void cleanup3DState();
     void refresh3DCanvases();
     void applyFeature3DUpdate( QgsFeatureId fid );
     void flushPendingFeatureUpdates();
     void removeTempFeatures( const QgsFeatureIds &fids );
     MeshData buildMeshForFeature( const QgsFeature &feature, double height );
-    void ensurePreviewEntity();
-    void updatePreviewEntity( QgsVectorLayer *layer, const QgsFeatureIds &fids, const QString &heightFieldName, double height );
+    void ensurePreviewEntity( Qgs3DMapScene *scene );
+    bool renderPreview( QgsVectorLayer *layer, const QgsFeatureIds &fids, const QVector<MeshData> &meshes, QgsFeatureId roofFid = FID_NULL );
+    QVector<float> previewVertexData( QgsVectorLayer *layer, const Qgs3DMapSettings &settings,
+                                      const QVector<MeshData> &meshes, bool wireframe ) const;
     void clearPreviewEntity();
 
   private slots:
@@ -116,6 +116,7 @@ class ThreeDViewTool : public QgsMapTool
     void onFeatureAdded( QgsFeatureId fid );
     void onHeightPreviewChanged( QgsVectorLayer *layer, const QgsFeatureIds &fids, const QString &heightFieldName, double height );
     void onHeightPreviewFinished( QgsVectorLayer *layer, const QgsFeatureIds &fids, const QString &heightFieldName, double height );
+    void onRoofPreviewChanged( QgsVectorLayer *layer, QgsFeatureId fid, const BuildingRoof::Mesh &mesh, bool dragging );
     void onRoofModelChanged( QgsVectorLayer *layer, QgsFeatureId fid );
     void onBuildingTriangleMeshModeChanged( QgsVectorLayer *layer, QgsFeatureId fid, bool enabled );
 
@@ -157,6 +158,7 @@ class ThreeDViewTool : public QgsMapTool
     QgsFeatureIds mPendingFeatureUpdates;
     QTimer *mFeatureUpdateTimer = nullptr;
     QgsFeatureIds mPreviewFids;
+    QgsFeatureId mRoofPreviewFid = FID_NULL;
     QPointer<Qt3DCore::QEntity> mPreviewEntity = nullptr;
     QPointer<Qt3DRender::QGeometryRenderer> mPreviewRenderer = nullptr;
     QPointer<Qt3DRender::QGeometry> mPreviewGeometry = nullptr;

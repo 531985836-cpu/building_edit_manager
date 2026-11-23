@@ -18,10 +18,14 @@
 #include <qgscoordinatetransform.h>
 #include <qgsprovidermetadata.h>
 #include <qgsproviderregistry.h>
+#include <qgsspatialindex.h>
+#include <qgsunittypes.h>
 #include <QMessageBox>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QKeyEvent>
+#include <algorithm>
+#include <array>
 #include <cmath>
 
 // 基础几何
@@ -56,12 +60,10 @@
 #include <qgslayertree.h>
 #include <qgslayertreeview.h>
 #include <QMap>
-#include <QHash>
-#include <QSet>
 #include <QVector3D>
-#include <QtMath>
 #include <limits>
 #include <map>
+#include <optional>
 #include <tuple>
 #include <Qt3DCore/QEntity>
 #include <Qt3DRender/QAttribute>
@@ -165,164 +167,6 @@ namespace
       return currentSubset;
     return QStringLiteral( "(%1) AND (%2)" ).arg( currentSubset, zFilter );
   }
-
-  QVector<QgsPoint> wireframeFootprintRing( const QgsGeometry &geometry )
-  {
-    QVector<QgsPoint> ring;
-    if ( geometry.isNull() || geometry.isEmpty() )
-      return ring;
-
-    QgsPolygonXY polygon = geometry.asPolygon();
-    if ( polygon.isEmpty() )
-    {
-      const QgsMultiPolygonXY multiPolygon = geometry.asMultiPolygon();
-      if ( !multiPolygon.isEmpty() )
-        polygon = multiPolygon.first();
-    }
-    if ( polygon.isEmpty() || polygon.first().size() < 3 )
-      return ring;
-
-    const QVector<QgsPointXY> exterior = polygon.first();
-    const int count = exterior.size() > 1 && exterior.first() == exterior.last() ? exterior.size() - 1 : exterior.size();
-    ring.reserve( count );
-    for ( int i = 0; i < count; ++i )
-      ring.append( QgsPoint( exterior.at( i ).x(), exterior.at( i ).y(), 0.0 ) );
-    return ring;
-  }
-
-  struct WireframeEdgeRecord
-  {
-      QgsPoint a;
-      QgsPoint b;
-      QVector3D normal;
-      int count = 0;
-      double minNormalDot = 1.0;
-  };
-
-  QString wireframeVertexKey( const QgsPoint &point )
-  {
-    return QStringLiteral( "%1,%2,%3" )
-      .arg( qRound64( point.x() * 1000.0 ) )
-      .arg( qRound64( point.y() * 1000.0 ) )
-      .arg( qRound64( point.z() * 1000.0 ) );
-  }
-
-  QString wireframeEdgeKey( const QgsPoint &a, const QgsPoint &b )
-  {
-    const QString ka = wireframeVertexKey( a );
-    const QString kb = wireframeVertexKey( b );
-    return ka < kb ? ka + QLatin1Char( '|' ) + kb : kb + QLatin1Char( '|' ) + ka;
-  }
-
-  QVector3D triangleNormal( const QgsPoint &a, const QgsPoint &b, const QgsPoint &c )
-  {
-    QVector3D u( b.x() - a.x(), b.y() - a.y(), b.z() - a.z() );
-    QVector3D v( c.x() - a.x(), c.y() - a.y(), c.z() - a.z() );
-    QVector3D n = QVector3D::crossProduct( u, v );
-    if ( n.lengthSquared() > 1e-12f )
-      n.normalize();
-    return n;
-  }
-
-  double wireframeCross2D( const QgsPoint &o, const QgsPoint &a, const QgsPoint &b )
-  {
-    return ( a.x() - o.x() ) * ( b.y() - o.y() ) - ( a.y() - o.y() ) * ( b.x() - o.x() );
-  }
-
-  double distancePointToSegment2D( double px, double py, const QgsPoint &a, const QgsPoint &b )
-  {
-    const double vx = b.x() - a.x();
-    const double vy = b.y() - a.y();
-    const double wx = px - a.x();
-    const double wy = py - a.y();
-    const double len2 = vx * vx + vy * vy;
-    if ( len2 < 1e-12 )
-      return std::hypot( px - a.x(), py - a.y() );
-
-    const double t = std::max( 0.0, std::min( 1.0, ( wx * vx + wy * vy ) / len2 ) );
-    const double projX = a.x() + t * vx;
-    const double projY = a.y() + t * vy;
-    return std::hypot( px - projX, py - projY );
-  }
-
-  double distancePointToHull2D( double px, double py, const QVector<QgsPoint> &hull )
-  {
-    if ( hull.size() < 2 )
-      return std::numeric_limits<double>::max();
-
-    double best = std::numeric_limits<double>::max();
-    for ( int i = 0; i < hull.size(); ++i )
-      best = std::min( best, distancePointToSegment2D( px, py, hull.at( i ), hull.at( ( i + 1 ) % hull.size() ) ) );
-    return best;
-  }
-
-  QVector<QgsPoint> convexHullByXY( QVector<QgsPoint> points )
-  {
-    if ( points.size() < 3 )
-      return points;
-
-    std::sort( points.begin(), points.end(), []( const QgsPoint &a, const QgsPoint &b ) {
-      if ( !qgsDoubleNear( a.x(), b.x(), 1e-9 ) )
-        return a.x() < b.x();
-      return a.y() < b.y();
-    } );
-
-    QVector<QgsPoint> uniquePoints;
-    uniquePoints.reserve( points.size() );
-    for ( const QgsPoint &point : std::as_const( points ) )
-    {
-      if ( uniquePoints.isEmpty() || !qgsDoubleNear( uniquePoints.last().x(), point.x(), 1e-6 ) || !qgsDoubleNear( uniquePoints.last().y(), point.y(), 1e-6 ) )
-        uniquePoints.append( point );
-    }
-
-    if ( uniquePoints.size() < 3 )
-      return uniquePoints;
-
-    QVector<QgsPoint> lower;
-    for ( const QgsPoint &point : std::as_const( uniquePoints ) )
-    {
-      while ( lower.size() >= 2 && wireframeCross2D( lower.at( lower.size() - 2 ), lower.last(), point ) <= 1e-9 )
-        lower.removeLast();
-      lower.append( point );
-    }
-
-    QVector<QgsPoint> upper;
-    for ( int i = uniquePoints.size() - 1; i >= 0; --i )
-    {
-      const QgsPoint &point = uniquePoints.at( i );
-      while ( upper.size() >= 2 && wireframeCross2D( upper.at( upper.size() - 2 ), upper.last(), point ) <= 1e-9 )
-        upper.removeLast();
-      upper.append( point );
-    }
-
-    lower.removeLast();
-    upper.removeLast();
-    lower += upper;
-    return lower;
-  }
-
-  void appendWireframeLine( QgsFeatureList &lines, QSet<QString> &emittedKeys, QgsFeatureId fid, const QgsPoint &a, const QgsPoint &b )
-  {
-    const double dx = a.x() - b.x();
-    const double dy = a.y() - b.y();
-    const double dz = a.z() - b.z();
-    if ( dx * dx + dy * dy + dz * dz < 1e-12 )
-      return;
-
-    const QString key = wireframeEdgeKey( a, b );
-    if ( emittedKeys.contains( key ) )
-      return;
-
-    emittedKeys.insert( key );
-    QgsLineString *line = new QgsLineString();
-    line->setPoints( QgsPointSequence() << a << b );
-
-    QgsFeature feature;
-    feature.setGeometry( QgsGeometry( line ) );
-    feature.setAttributes( QgsAttributes() << fid );
-    lines.append( feature );
-  }
-
 }
 
 ThreeDViewTool::ThreeDViewTool( QgsMapCanvas *canvas, QgisInterface *iface )
@@ -338,6 +182,7 @@ ThreeDViewTool::ThreeDViewTool( QgsMapCanvas *canvas, QgisInterface *iface )
   connect( mFeatureUpdateTimer, &QTimer::timeout, this, &ThreeDViewTool::flushPendingFeatureUpdates );
   connect( BuildingEditPreviewBus::instance(), &BuildingEditPreviewBus::heightPreviewChanged, this, &ThreeDViewTool::onHeightPreviewChanged );
   connect( BuildingEditPreviewBus::instance(), &BuildingEditPreviewBus::heightPreviewFinished, this, &ThreeDViewTool::onHeightPreviewFinished );
+  connect( BuildingEditPreviewBus::instance(), &BuildingEditPreviewBus::roofPreviewChanged, this, &ThreeDViewTool::onRoofPreviewChanged );
   connect( BuildingEditPreviewBus::instance(), &BuildingEditPreviewBus::roofModelChanged, this, &ThreeDViewTool::onRoofModelChanged );
   connect( BuildingEditPreviewBus::instance(), &BuildingEditPreviewBus::buildingTriangleMeshModeChanged, this, &ThreeDViewTool::onBuildingTriangleMeshModeChanged );
 
@@ -729,285 +574,149 @@ void ThreeDViewTool::updateRoofSegmentationLayer( QgsVectorLayer *layer, QgsFeat
   ensureLayerIn3DView( mRoofSegmentationLayer );
 }
 
-QgsFeatureList ThreeDViewTool::buildSimplifiedWireframeFromMesh( const MeshData &mesh, QgsFeatureId fid, bool flatTopWireframe, bool curvedWireframe, bool eaveWireframe ) const
+QgsFeatureList ThreeDViewTool::buildStructuralWireframe( const MeshData &mesh, QgsFeatureId fid ) const
 {
-  QgsFeatureList lines;
-  if ( mesh.vertices.isEmpty() || mesh.indices.size() < 3 )
-    return lines;
-
-  QSet<QString> emittedLineKeys;
-  QHash<QString, int> edgeIndex;
-  QVector<WireframeEdgeRecord> edges;
-  double minZ = std::numeric_limits<double>::max();
-  double maxZ = std::numeric_limits<double>::lowest();
-  double minX = std::numeric_limits<double>::max();
-  double minY = std::numeric_limits<double>::max();
-  double maxX = std::numeric_limits<double>::lowest();
-  double maxY = std::numeric_limits<double>::lowest();
-  QVector<QgsPoint> footprintCandidates;
-  QSet<QString> footprintKeys;
-
-  for ( const QgsPoint &point : mesh.vertices )
+  struct Edge
   {
-    minZ = std::min( minZ, point.z() );
-    maxZ = std::max( maxZ, point.z() );
-    minX = std::min( minX, point.x() );
-    minY = std::min( minY, point.y() );
-    maxX = std::max( maxX, point.x() );
-    maxY = std::max( maxY, point.y() );
-
-    const QString xyKey = QStringLiteral( "%1,%2" )
-      .arg( qRound64( point.x() * 1000.0 ) )
-      .arg( qRound64( point.y() * 1000.0 ) );
-    if ( !footprintKeys.contains( xyKey ) )
-    {
-      footprintKeys.insert( xyKey );
-      footprintCandidates.append( point );
-    }
-  }
-
-  const QVector<QgsPoint> footprintHull = mesh.footprintRing.size() >= 3 ? mesh.footprintRing : convexHullByXY( footprintCandidates );
-  const double footprintDiagonal = std::hypot( maxX - minX, maxY - minY );
-  const double footprintBoundaryTolerance = std::max( 0.05, footprintDiagonal * 0.015 );
-
-  auto addEdge = [&edgeIndex, &edges]( const QgsPoint &a, const QgsPoint &b, const QVector3D &normal ) {
-    const QString key = wireframeEdgeKey( a, b );
-    const int existingIndex = edgeIndex.value( key, -1 );
-    if ( existingIndex < 0 )
-    {
-      WireframeEdgeRecord record;
-      record.a = a;
-      record.b = b;
-      record.normal = normal;
-      record.count = 1;
-      edges.append( record );
-      edgeIndex.insert( key, edges.size() - 1 );
-      return;
-    }
-
-    WireframeEdgeRecord &record = edges[existingIndex];
-    record.count++;
-    if ( record.normal.lengthSquared() > 1e-12f && normal.lengthSquared() > 1e-12f )
-    {
-      const double dot = std::fabs( QVector3D::dotProduct( record.normal, normal ) );
-      record.minNormalDot = std::min( record.minNormalDot, dot );
-    }
+    QgsPoint start;
+    QgsPoint end;
+    QgsVector3D normal;
+    bool interior = false;
+    bool crease = false;
   };
 
+  const auto finite = []( const QgsPoint &point ) {
+    return std::isfinite( point.x() ) && std::isfinite( point.y() ) && std::isfinite( point.z() );
+  };
+
+  // Compare face angles in compatible horizontal and vertical units.
+  const double xyScale = mActiveLayer && mActiveLayer->crs().isValid()
+                         ? QgsUnitTypes::fromUnitToUnitFactor( mActiveLayer->crs().mapUnits(), Qgis::DistanceUnit::Meters ) : 1.0;
+  constexpr double tolerance = 1e-7;
+  using Vertex = std::tuple<double, double, double>;
+  const auto vertexKey = [xyScale]( const QgsPoint &point ) {
+    // Facets clipped independently may produce slightly different coordinates for the same corner.
+    return Vertex( std::round( point.x() * xyScale / tolerance ), std::round( point.y() * xyScale / tolerance ),
+                   std::round( point.z() / tolerance ) );
+  };
+  const auto offset = [xyScale]( const QgsPoint &from, const QgsPoint &to ) {
+    return QgsVector3D( ( to.x() - from.x() ) * xyScale, ( to.y() - from.y() ) * xyScale, to.z() - from.z() );
+  };
+  // Smooth roofs also suppress small dihedral angles caused by tessellating a curved surface.
+  const double normalThreshold = mesh.smoothRoof ? 0.9659258263 : 0.9999984769; // 15 degrees or 0.1 degrees
+  const auto continuousSurface = [normalThreshold]( const QgsVector3D &first, const QgsVector3D &second, double dot ) {
+    constexpr double verticalTolerance = 1e-8;
+    return std::abs( dot ) >= normalThreshold
+           && ( std::abs( first.z() ) <= verticalTolerance ) == ( std::abs( second.z() ) <= verticalTolerance );
+  };
+
+  std::map<std::pair<Vertex, Vertex>, Edge> edges;
   for ( int i = 0; i + 2 < mesh.indices.size(); i += 3 )
   {
-    const int ia = mesh.indices.at( i );
-    const int ib = mesh.indices.at( i + 1 );
-    const int ic = mesh.indices.at( i + 2 );
-    if ( ia < 0 || ib < 0 || ic < 0 || ia >= mesh.vertices.size() || ib >= mesh.vertices.size() || ic >= mesh.vertices.size() )
+    const int a = mesh.indices[i], b = mesh.indices[i + 1], c = mesh.indices[i + 2];
+    if ( a < 0 || b < 0 || c < 0 || a >= mesh.vertices.size() || b >= mesh.vertices.size() || c >= mesh.vertices.size() )
       continue;
 
-    const QgsPoint &a = mesh.vertices.at( ia );
-    const QgsPoint &b = mesh.vertices.at( ib );
-    const QgsPoint &c = mesh.vertices.at( ic );
-    const QVector3D normal = triangleNormal( a, b, c );
-    addEdge( a, b, normal );
-    addEdge( b, c, normal );
-    addEdge( c, a, normal );
-  }
-
-  const double zRange = maxZ - minZ;
-  const double topTolerance = std::max( 0.02, zRange * 0.02 );
-  QVector<QgsPoint> topPoints;
-  QSet<QString> topPointKeys;
-  bool hasFlatTopFace = false;
-  if ( flatTopWireframe )
-  {
-    for ( int i = 0; i + 2 < mesh.indices.size(); i += 3 )
-    {
-      const int ia = mesh.indices.at( i );
-      const int ib = mesh.indices.at( i + 1 );
-      const int ic = mesh.indices.at( i + 2 );
-      if ( ia < 0 || ib < 0 || ic < 0 || ia >= mesh.vertices.size() || ib >= mesh.vertices.size() || ic >= mesh.vertices.size() )
-        continue;
-
-      const QgsPoint &a = mesh.vertices.at( ia );
-      const QgsPoint &b = mesh.vertices.at( ib );
-      const QgsPoint &c = mesh.vertices.at( ic );
-      if ( maxZ - a.z() <= topTolerance && maxZ - b.z() <= topTolerance && maxZ - c.z() <= topTolerance )
-      {
-        const QVector3D normal = triangleNormal( a, b, c );
-        if ( std::fabs( normal.z() ) > 0.94 )
-        {
-          hasFlatTopFace = true;
-          break;
-        }
-      }
-    }
-  }
-
-  for ( const QgsPoint &point : mesh.vertices )
-  {
-    if ( maxZ - point.z() > topTolerance )
+    const std::array<const QgsPoint *, 3> points{ &mesh.vertices[a], &mesh.vertices[b], &mesh.vertices[c] };
+    if ( !finite( *points[0] ) || !finite( *points[1] ) || !finite( *points[2] ) )
+      continue;
+    const QgsVector3D normal = QgsVector3D::crossProduct( offset( *points[0], *points[1] ), offset( *points[0], *points[2] ) );
+    const double area = normal.length();
+    if ( area <= 0.0 || !std::isfinite( area ) )
       continue;
 
-    const QString key = wireframeVertexKey( point );
-    if ( topPointKeys.contains( key ) )
+    for ( int side = 0; side < 3; ++side )
+    {
+      const QgsPoint &a = *points[side], &b = *points[( side + 1 ) % 3];
+      const Vertex first = vertexKey( a ), last = vertexKey( b );
+      if ( first == last )
+        continue;
+      const bool forward = first < last;
+      // Orient the normal relative to the canonical edge direction. Adjacent coplanar triangles then face opposite ways.
+      const QgsVector3D orientedNormal = normal / ( forward ? area : -area );
+      const auto [it, inserted] = edges.try_emplace( forward ? std::make_pair( first, last ) : std::make_pair( last, first ),
+                                                   Edge{ forward ? a : b, forward ? b : a, orientedNormal } );
+      if ( inserted )
+        continue;
+      Edge &edge = it->second;
+      const double dot = QgsVector3D::dotProduct( edge.normal, orientedNormal );
+      if ( continuousSurface( edge.normal, orientedNormal, dot ) )
+        edge.interior |= dot < 0.0;
+      else
+        edge.crease = true;
+    }
+  }
+
+  QgsFeatureList lines;
+  const auto appendLine = [&lines, fid]( const QgsPoint &start, const QgsPoint &end ) {
+    QgsFeature line;
+    line.setGeometry( QgsGeometry( std::make_unique<QgsLineString>( start, end ) ) );
+    line.setAttributes( QgsAttributes() << fid );
+    lines.append( line );
+  };
+
+  // Independently triangulated regions can meet along one long edge on one side and several short edges on the other.
+  // Match the remaining collinear spans in 3D so those coplanar joins are also hidden.
+  QVector<const Edge *> openEdges;
+  QgsSpatialIndex index;
+  const auto bounds = []( const Edge &edge ) { return QgsRectangle( edge.start.x(), edge.start.y(), edge.end.x(), edge.end.y() ); };
+  for ( const auto &entry : edges )
+  {
+    const Edge &edge = entry.second;
+    if ( edge.crease )
+      appendLine( edge.start, edge.end );
+    else if ( !edge.interior )
+    {
+      index.addFeature( openEdges.size(), bounds( edge ) );
+      openEdges.append( &edge );
+    }
+  }
+
+  for ( int i = 0; i < openEdges.size(); ++i )
+  {
+    const Edge &edge = *openEdges[i];
+    const QgsVector3D axis = offset( edge.start, edge.end );
+    const double length = axis.length();
+    if ( length <= tolerance )
       continue;
-
-    topPointKeys.insert( key );
-    topPoints.append( point );
-  }
-
-  for ( const QPair<QgsPoint, QgsPoint> &line : mesh.structureLines )
-    appendWireframeLine( lines, emittedLineKeys, fid, line.first, line.second );
-
-  if ( !flatTopWireframe && mesh.structureLines.isEmpty() && topPoints.size() == 2 )
-    appendWireframeLine( lines, emittedLineKeys, fid, topPoints.at( 0 ), topPoints.at( 1 ) );
-
-  QVector<const WireframeEdgeRecord *> keptEdges;
-  keptEdges.reserve( edges.size() );
-  const double sharpEdgeDotThreshold = 0.86;
-  for ( const WireframeEdgeRecord &edge : edges )
-  {
-    if ( edge.count == 1 || edge.minNormalDot < sharpEdgeDotThreshold )
-      keptEdges.append( &edge );
-  }
-
-  const int maxWireframeEdges = 650;
-  const int stride = keptEdges.size() > maxWireframeEdges ? qCeil( static_cast<double>( keptEdges.size() ) / maxWireframeEdges ) : 1;
-  for ( int i = 0; i < keptEdges.size(); ++i )
-  {
-    if ( stride > 1 && i % stride != 0 )
-      continue;
-
-    const WireframeEdgeRecord *edge = keptEdges.at( i );
-    if ( edge->count == 1 )
+    const QgsVector3D direction = axis / length;
+    QgsRectangle nearby = bounds( edge );
+    nearby.grow( tolerance / xyScale );
+    QVector<std::pair<double, double>> covered;
+    for ( QgsFeatureId id : index.intersects( nearby ) )
     {
-      const double midX = ( edge->a.x() + edge->b.x() ) * 0.5;
-      const double midY = ( edge->a.y() + edge->b.y() ) * 0.5;
-      const bool nearFootprintBoundary = distancePointToHull2D( midX, midY, footprintHull ) <= footprintBoundaryTolerance;
-      const bool nearFlatTop = flatTopWireframe && hasFlatTopFace && maxZ - edge->a.z() <= topTolerance && maxZ - edge->b.z() <= topTolerance;
-      if ( curvedWireframe && !nearFootprintBoundary && !nearFlatTop )
+      if ( id == i )
         continue;
-    }
-    appendWireframeLine( lines, emittedLineKeys, fid, edge->a, edge->b );
-  }
-
-  if ( eaveWireframe && footprintHull.size() >= 3 )
-  {
-    QVector<QgsPoint> eaveHull;
-    eaveHull.reserve( footprintHull.size() );
-    const double xyTolerance = std::max( 0.02, footprintDiagonal * 0.003 );
-    const double wallTopTolerance = std::max( 0.02, zRange * 0.02 );
-
-    for ( const QgsPoint &hullPoint : footprintHull )
-    {
-      bool found = false;
-      QgsPoint eavePoint = hullPoint;
-      double bestZ = std::numeric_limits<double>::max();
-      for ( const QgsPoint &candidate : mesh.vertices )
-      {
-        if ( std::hypot( candidate.x() - hullPoint.x(), candidate.y() - hullPoint.y() ) > xyTolerance )
-          continue;
-        if ( candidate.z() <= minZ + wallTopTolerance )
-          continue;
-        if ( candidate.z() < bestZ )
-        {
-          found = true;
-          bestZ = candidate.z();
-          eavePoint = candidate;
-        }
-      }
-
-      if ( found )
-        eaveHull.append( eavePoint );
-    }
-
-    if ( eaveHull.size() >= 3 )
-    {
-      for ( int i = 0; i < eaveHull.size(); ++i )
-        appendWireframeLine( lines, emittedLineKeys, fid, eaveHull.at( i ), eaveHull.at( ( i + 1 ) % eaveHull.size() ) );
-    }
-
-    const QVector<QgsPoint> verticalSource = eaveHull.size() >= 3 ? eaveHull : footprintHull;
-    if ( verticalSource.size() >= 3 )
-    {
-      const int maxVerticalEdges = 12;
-      const int verticalStride = verticalSource.size() > maxVerticalEdges ? qCeil( static_cast<double>( verticalSource.size() ) / maxVerticalEdges ) : 1;
-      for ( int i = 0; i < verticalSource.size(); i += verticalStride )
-      {
-        const QgsPoint &topPoint = verticalSource.at( i );
-        appendWireframeLine( lines, emittedLineKeys, fid, QgsPoint( topPoint.x(), topPoint.y(), minZ ), topPoint );
-      }
-    }
-  }
-
-  if ( flatTopWireframe && hasFlatTopFace && topPoints.size() >= 3 && mesh.structureLines.isEmpty() )
-  {
-    const QVector<QgsPoint> topHull = convexHullByXY( topPoints );
-    for ( int i = 0; i < topHull.size(); ++i )
-      appendWireframeLine( lines, emittedLineKeys, fid, topHull.at( i ), topHull.at( ( i + 1 ) % topHull.size() ) );
-
-    if ( footprintHull.size() >= 3 && topHull.size() >= 3 )
-    {
-      for ( const QgsPoint &outerPoint2d : footprintHull )
-      {
-        QgsPoint outerPoint( outerPoint2d.x(), outerPoint2d.y(), maxZ );
-        double bestOuterDistance2 = std::numeric_limits<double>::max();
-        for ( const QgsPoint &candidate : mesh.vertices )
-        {
-          const double dx = candidate.x() - outerPoint2d.x();
-          const double dy = candidate.y() - outerPoint2d.y();
-          const double distance2 = dx * dx + dy * dy;
-          if ( candidate.z() > minZ + topTolerance && distance2 < bestOuterDistance2 )
-          {
-            bestOuterDistance2 = distance2;
-            outerPoint = candidate;
-          }
-        }
-
-        double bestDistance2 = std::numeric_limits<double>::max();
-        QgsPoint bestTopPoint;
-        for ( const QgsPoint &topPoint : topHull )
-        {
-          const double dx = topPoint.x() - outerPoint2d.x();
-          const double dy = topPoint.y() - outerPoint2d.y();
-          const double distance2 = dx * dx + dy * dy;
-          if ( distance2 < bestDistance2 )
-          {
-            bestDistance2 = distance2;
-            bestTopPoint = topPoint;
-          }
-        }
-
-        if ( std::isfinite( bestDistance2 ) )
-          appendWireframeLine( lines, emittedLineKeys, fid, outerPoint, bestTopPoint );
-      }
-    }
-  }
-
-  if ( topPoints.size() == 1 )
-  {
-    QVector<const WireframeEdgeRecord *> spokeEdges;
-    for ( const WireframeEdgeRecord &edge : edges )
-    {
-      const bool aIsTop = maxZ - edge.a.z() <= topTolerance;
-      const bool bIsTop = maxZ - edge.b.z() <= topTolerance;
-      if ( aIsTop == bIsTop )
+      const Edge &other = *openEdges[id];
+      const QgsVector3D first = offset( edge.start, other.start ), last = offset( edge.start, other.end );
+      const double from = QgsVector3D::dotProduct( direction, first ), to = QgsVector3D::dotProduct( direction, last );
+      const double overlapStart = std::max( 0.0, std::min( from, to ) ), overlapEnd = std::min( length, std::max( from, to ) );
+      if ( overlapEnd - overlapStart <= tolerance )
         continue;
-      if ( std::fabs( edge.a.z() - edge.b.z() ) < std::max( 0.05, zRange * 0.08 ) )
+      const double dot = QgsVector3D::dotProduct( edge.normal, from < to ? other.normal : -other.normal );
+      if ( dot >= 0.0 || !continuousSurface( edge.normal, other.normal, dot )
+           || QgsVector3D::crossProduct( direction, first ).length() > tolerance
+           || QgsVector3D::crossProduct( direction, last ).length() > tolerance )
         continue;
-      spokeEdges.append( &edge );
+      covered.append( { overlapStart, overlapEnd } );
     }
-
-    const int maxSpokeEdges = 2;
-    const int spokeStride = spokeEdges.size() > maxSpokeEdges ? qCeil( static_cast<double>( spokeEdges.size() ) / maxSpokeEdges ) : 1;
-    for ( int i = 0; i < spokeEdges.size(); ++i )
+    std::sort( covered.begin(), covered.end() );
+    const auto pointAt = [&edge, length]( double distance ) {
+      const double t = distance / length;
+      return QgsPoint( edge.start.x() + t * ( edge.end.x() - edge.start.x() ),
+                       edge.start.y() + t * ( edge.end.y() - edge.start.y() ),
+                       edge.start.z() + t * ( edge.end.z() - edge.start.z() ) );
+    };
+    double start = 0.0;
+    for ( const auto &[from, to] : covered )
     {
-      if ( spokeStride > 1 && i % spokeStride != 0 )
-        continue;
-
-      const WireframeEdgeRecord *edge = spokeEdges.at( i );
-      appendWireframeLine( lines, emittedLineKeys, fid, edge->a, edge->b );
+      if ( from - start > tolerance )
+        appendLine( pointAt( start ), pointAt( from ) );
+      start = std::max( start, to );
     }
+    if ( length - start > tolerance )
+      appendLine( pointAt( start ), edge.end );
   }
-
   return lines;
 }
 
@@ -1020,7 +729,7 @@ void ThreeDViewTool::updateWireframeLayerFromMesh( const MeshData &mesh, QgsFeat
   if ( !mWireframeLayer )
     return;
 
-  QgsFeatureList lines = buildSimplifiedWireframeFromMesh( mesh, fid, mesh.flatTopWireframe, mesh.curvedWireframe, mesh.eaveWireframe );
+  QgsFeatureList lines = buildStructuralWireframe( mesh, fid );
   mWireframeLayer->startEditing();
   mWireframeLayer->deleteFeatures( mWireframeLayer->allFeatureIds() );
   mWireframeLayer->addFeatures( lines );
@@ -1079,53 +788,25 @@ void ThreeDViewTool::removeTempFeatures( const QgsFeatureIds &fids )
 MeshData ThreeDViewTool::buildMeshForFeature( const QgsFeature &feature, double height )
 {
   const RoofModelSettings::Selection selection = RoofModelSettings::read( mActiveLayer, feature.id() );
-  const QVector<QgsPoint> footprintRing = wireframeFootprintRing( feature.geometry() );
-  if ( selection.type != RoofModelSettings::Type::None )
+  if ( selection.hasRoof() )
   {
     const BuildingRoof::MeshResult result = RoofModelPipeline::build( feature.geometry(), selection );
     if ( result.success )
     {
-      MeshData mesh{ result.mesh.vertices, result.mesh.indices };
-      mesh.flatTopWireframe = selection.type == RoofModelSettings::Type::Frustum;
-      mesh.curvedWireframe = selection.type == RoofModelSettings::Type::Barrel || selection.type == RoofModelSettings::Type::Dome;
-      mesh.eaveWireframe = mesh.curvedWireframe || selection.type == RoofModelSettings::Type::Apex;
-      mesh.footprintRing = footprintRing;
-      mesh.structureLines = result.mesh.structureLines;
-      return mesh;
+      const bool smoothRoof = selection.regions.isEmpty() && ( selection.type == RoofModelSettings::Type::Barrel
+                                                              || selection.type == RoofModelSettings::Type::Dome );
+      return { result.mesh.vertices, result.mesh.indices, smoothRoof };
     }
   }
 
-  MeshData mesh = BuildMesh::build( feature.geometry(), height );
-  mesh.eaveWireframe = true;
-  mesh.footprintRing = footprintRing;
-  return mesh;
+  return BuildMesh::build( feature.geometry(), height );
 }
 
-void ThreeDViewTool::ensurePreviewEntity()
+void ThreeDViewTool::ensurePreviewEntity( Qgs3DMapScene *scene )
 {
-  if ( mPreviewEntity )
+  if ( mPreviewEntity && mPreviewEntity->parent() == scene )
     return;
-  if ( !mIface )
-    return;
-
-  Qgs3DMapCanvas *activeCanvas3D = mIface->mapCanvases3D().isEmpty()
-                                     ? mIface->createNewMapCanvas3D( tr( "3D Preview" ) )
-                                     : mIface->mapCanvases3D().first();
-  if ( !activeCanvas3D || !activeCanvas3D->scene() )
-    return;
-
-  Qgs3DMapScene *scene = activeCanvas3D->scene();
-  connect( scene, &QObject::destroyed, this, [this]() {
-    mPreviewEntity = nullptr;
-    mPreviewRenderer = nullptr;
-    mPreviewGeometry = nullptr;
-    mPreviewVertexBuffer = nullptr;
-    mPreviewPositionAttribute = nullptr;
-    mPreviewNormalAttribute = nullptr;
-    mPreviewMaterial = nullptr;
-    mPreviewFids.clear();
-  }, Qt::UniqueConnection );
-
+  clearPreviewEntity();
   mPreviewEntity = new Qt3DCore::QEntity( scene );
   mPreviewRenderer = new Qt3DRender::QGeometryRenderer( mPreviewEntity );
   mPreviewGeometry = new Qt3DRender::QGeometry( mPreviewRenderer );
@@ -1167,104 +848,115 @@ void ThreeDViewTool::ensurePreviewEntity()
   mPreviewEntity->addComponent( mPreviewMaterial );
 }
 
-void ThreeDViewTool::updatePreviewEntity( QgsVectorLayer *layer, const QgsFeatureIds &fids, const QString &heightFieldName, double height )
+QVector<float> ThreeDViewTool::previewVertexData( QgsVectorLayer *layer, const Qgs3DMapSettings &settings,
+                                                   const QVector<MeshData> &meshes, bool wireframe ) const
+{
+  QgsCoordinateTransform layerToScene;
+  if ( layer->crs().isValid() && settings.crs().isValid() && layer->crs() != settings.crs() )
+    layerToScene = QgsCoordinateTransform( layer->crs(), settings.crs(), settings.transformContext() );
+
+  const auto worldPoint = [&]( const QgsPoint &point ) -> std::optional<QVector3D> {
+    QgsPointXY xy( point );
+    try
+    {
+      if ( layerToScene.isValid() )
+        xy = layerToScene.transform( xy );
+    }
+    catch ( const QgsCsException & )
+    {
+      return std::nullopt;
+    }
+    const auto world = settings.mapToWorldCoordinates( QgsVector3D( xy.x(), xy.y(), point.z() ) );
+    if ( !std::isfinite( world.x() ) || !std::isfinite( world.y() ) || !std::isfinite( world.z() ) )
+      return std::nullopt;
+    return QVector3D( world.x(), world.y(), world.z() );
+  };
+
+  QVector<float> raw;
+  const QVector3D up( 0.0f, 0.0f, 1.0f );
+  const auto append = [&]( const QVector3D &point, const QVector3D &normal ) {
+    raw << point.x() << point.y() << point.z() << normal.x() << normal.y() << normal.z();
+  };
+  for ( const auto &mesh : meshes )
+  {
+    if ( wireframe )
+    {
+      const auto lines = buildStructuralWireframe( mesh, FID_NULL );
+      for ( const QgsFeature &line : lines )
+      {
+        const QgsGeometry geometry = line.geometry();
+        const auto a = worldPoint( geometry.vertexAt( 0 ) ), b = worldPoint( geometry.vertexAt( 1 ) );
+        if ( a && b )
+        {
+          append( *a, up );
+          append( *b, up );
+        }
+      }
+      continue;
+    }
+
+    for ( int i = 0; i + 2 < mesh.indices.size(); i += 3 )
+    {
+      const int a = mesh.indices[i], b = mesh.indices[i + 1], c = mesh.indices[i + 2];
+      if ( a < 0 || b < 0 || c < 0 || a >= mesh.vertices.size() || b >= mesh.vertices.size() || c >= mesh.vertices.size() )
+        continue;
+      const auto p = worldPoint( mesh.vertices[a] ), q = worldPoint( mesh.vertices[b] ), r = worldPoint( mesh.vertices[c] );
+      if ( !p || !q || !r )
+        continue;
+      QVector3D normal = QVector3D::normal( *q - *p, *r - *p );
+      if ( normal.isNull() )
+        normal = up;
+      append( *p, normal );
+      append( *q, normal );
+      append( *r, normal );
+    }
+  }
+  return raw;
+}
+
+bool ThreeDViewTool::renderPreview( QgsVectorLayer *layer, const QgsFeatureIds &fids, const QVector<MeshData> &meshes, QgsFeatureId roofFid )
 {
   if ( !layer || !mIface || fids.isEmpty() )
-    return;
+    return false;
 
   Qgs3DMapCanvas *activeCanvas3D = mIface->mapCanvases3D().isEmpty()
                                      ? mIface->createNewMapCanvas3D( tr( "3D Preview" ) )
                                      : mIface->mapCanvases3D().first();
-  if ( !activeCanvas3D || !activeCanvas3D->mapSettings() )
-    return;
+  if ( !activeCanvas3D || !activeCanvas3D->mapSettings() || !activeCanvas3D->scene() )
+    return false;
 
-  ensurePreviewEntity();
-  if ( !mPreviewEntity || !mPreviewRenderer || !mPreviewVertexBuffer || !mPreviewPositionAttribute || !mPreviewNormalAttribute )
-    return;
+  const bool wireframe = roofFid != FID_NULL && mBuildingTriangleMeshMode && mWireframeFid == roofFid;
+  const QVector<float> raw = previewVertexData( layer, *activeCanvas3D->mapSettings(), meshes, wireframe );
+  if ( raw.isEmpty() )
+    return false;
 
-  if ( mPreviewFids != fids )
+  const QgsFeatureIds previous = mPreviewFids;
+  ensurePreviewEntity( activeCanvas3D->scene() );
+  if ( !mPreviewEntity || !mPreviewRenderer || !mPreviewVertexBuffer || !mPreviewPositionAttribute || !mPreviewNormalAttribute || !mPreviewMaterial )
+    return false;
+
+  mPreviewFids = fids;
+  mRoofPreviewFid = roofFid;
+  if ( previous != fids )
   {
-    if ( !mPreviewFids.isEmpty() )
-      refreshMemoryData();
-    mPreviewFids = fids;
-    removeTempFeatures( fids );
+    removeTempFeatures( fids - previous );
+    for ( QgsFeatureId fid : previous - fids )
+      applyFeature3DUpdate( fid );
   }
 
-  Qgs3DMapSettings *settings = activeCanvas3D->mapSettings();
-  QgsCoordinateTransform layerToSceneTransform;
-  const bool transformLayerCoordinates = layer->crs().isValid() && settings->crs().isValid() && layer->crs() != settings->crs();
-  if ( transformLayerCoordinates )
-    layerToSceneTransform = QgsCoordinateTransform( layer->crs(), settings->crs(), settings->transformContext() );
+  mPreviewRenderer->setPrimitiveType( wireframe ? Qt3DRender::QGeometryRenderer::Lines : Qt3DRender::QGeometryRenderer::Triangles );
+  mPreviewMaterial->setAmbient( wireframe ? QColor( 20, 20, 20 ) : QColor( 90, 70, 35 ) );
+  mPreviewMaterial->setDiffuse( wireframe ? QColor( 25, 25, 25 ) : QColor( 255, 180, 60, 230 ) );
+  mPreviewMaterial->setSpecular( wireframe ? Qt::black : QColor( 80, 80, 80 ) );
 
-  QByteArray vertexBufferData;
-  QVector<float> raw;
-
-  for ( QgsFeatureId fid : fids )
-  {
-    QgsFeature feat;
-    if ( !layer->getFeatures( QgsFeatureRequest( fid ) ).nextFeature( feat ) )
-      continue;
-
-    const MeshData mesh = buildMeshForFeature( feat, height );
-
-    auto appendMeshToPreview = [&]( const MeshData &mesh )
-    {
-      if ( mesh.isEmpty() )
-        return;
-
-      for ( int i = 0; i + 2 < mesh.indices.size(); i += 3 )
-      {
-        QVector3D tri[3];
-        bool skipTriangle = false;
-        for ( int j = 0; j < 3; ++j )
-        {
-          const QgsPoint &p = mesh.vertices[mesh.indices[i + j]];
-          QgsPointXY mapPoint( p.x(), p.y() );
-          if ( transformLayerCoordinates )
-          {
-            try
-            {
-              mapPoint = layerToSceneTransform.transform( mapPoint );
-            }
-            catch ( ... )
-            {
-              skipTriangle = true;
-              break;
-            }
-          }
-          QgsVector3D world = settings->mapToWorldCoordinates( QgsVector3D( mapPoint.x(), mapPoint.y(), p.z() ) );
-          tri[j] = QVector3D( static_cast<float>( world.x() ), static_cast<float>( world.y() ), static_cast<float>( world.z() ) );
-        }
-        if ( skipTriangle )
-          continue;
-
-        QVector3D normal = QVector3D::crossProduct( tri[1] - tri[0], tri[2] - tri[0] ).normalized();
-        if ( normal.isNull() )
-          normal = QVector3D( 0.0f, 0.0f, 1.0f );
-
-        for ( int j = 0; j < 3; ++j )
-        {
-          raw << tri[j].x() << tri[j].y() << tri[j].z()
-              << normal.x() << normal.y() << normal.z();
-        }
-      }
-    };
-
-    appendMeshToPreview( mesh );
-  }
-
-  vertexBufferData.resize( raw.size() * static_cast<int>( sizeof( float ) ) );
-  memcpy( vertexBufferData.data(), raw.constData(), vertexBufferData.size() );
+  const QByteArray vertices( reinterpret_cast<const char *>( raw.constData() ), raw.size() * sizeof( float ) );
   const int vertexCount = raw.size() / 6;
-
-  if ( !mPreviewEntity || !mPreviewRenderer || !mPreviewVertexBuffer || !mPreviewPositionAttribute || !mPreviewNormalAttribute )
-    return;
-
-  mPreviewVertexBuffer->setData( vertexBufferData );
+  mPreviewVertexBuffer->setData( vertices );
   mPreviewPositionAttribute->setCount( vertexCount );
   mPreviewNormalAttribute->setCount( vertexCount );
   mPreviewRenderer->setVertexCount( vertexCount );
-  mPreviewEntity->setEnabled( vertexCount > 0 );
+  mPreviewEntity->setEnabled( true );
+  return true;
 }
 
 void ThreeDViewTool::clearPreviewEntity()
@@ -1279,6 +971,7 @@ void ThreeDViewTool::clearPreviewEntity()
   mPreviewMaterial = nullptr;
   mPreviewEntity = nullptr;
   mPreviewFids.clear();
+  mRoofPreviewFid = FID_NULL;
 
   if ( entityToDelete )
   {
@@ -1985,7 +1678,7 @@ void ThreeDViewTool::clearDisplayedMeshCache()
 // 根据原始要素更新其对应的 3D 模型
 void ThreeDViewTool::updateFeature3D( const QgsFeature &originFeat )
 {
-  if ( !mTempLayer )
+  if ( !mTempLayer || mPreviewFids.contains( originFeat.id() ) )
     return;
 
   if ( mDisplayedMeshLayer != mTempLayer )
@@ -2085,6 +1778,8 @@ void ThreeDViewTool::flushPendingFeatureUpdates()
 // 响应要素删除
 void ThreeDViewTool::onFeaturesDeleted( const QgsFeatureIds &fids )
 {
+  if ( fids.contains( mRoofPreviewFid ) )
+    clearPreviewEntity();
   if ( !mTempLayer )
     return;
 
@@ -2128,7 +1823,15 @@ void ThreeDViewTool::onHeightPreviewChanged( QgsVectorLayer *layer, const QgsFea
     return;
 
   Q_UNUSED( heightFieldName )
-  updatePreviewEntity( layer, fids, heightFieldName, height );
+  QVector<MeshData> meshes;
+  meshes.reserve( fids.size() );
+  for ( QgsFeatureId fid : fids )
+  {
+    QgsFeature feature;
+    if ( layer->getFeatures( QgsFeatureRequest( fid ) ).nextFeature( feature ) )
+      meshes.append( buildMeshForFeature( feature, height ) );
+  }
+  renderPreview( layer, fids, meshes );
 }
 
 void ThreeDViewTool::onHeightPreviewFinished( QgsVectorLayer *layer, const QgsFeatureIds &fids, const QString &heightFieldName, double height )
@@ -2148,11 +1851,22 @@ void ThreeDViewTool::onHeightPreviewFinished( QgsVectorLayer *layer, const QgsFe
   refresh3DCanvases();
 }
 
+void ThreeDViewTool::onRoofPreviewChanged( QgsVectorLayer *layer, QgsFeatureId fid, const BuildingRoof::Mesh &mesh, bool dragging )
+{
+  if ( !layer || layer != mActiveLayer || !mTempLayer || fid == FID_NULL )
+    return;
+
+  if ( !renderPreview( layer, { fid }, { MeshData{ mesh.vertices, mesh.indices } }, fid ) && !dragging )
+    onRoofModelChanged( layer, fid );
+}
+
 void ThreeDViewTool::onRoofModelChanged( QgsVectorLayer *layer, QgsFeatureId fid )
 {
   if ( !layer || layer != mActiveLayer || !mTempLayer || fid == FID_NULL )
     return;
 
+  if ( mRoofPreviewFid == fid )
+    clearPreviewEntity();
   mPendingFeatureUpdates.remove( fid );
   if ( mFeatureUpdateTimer && mPendingFeatureUpdates.isEmpty() )
     mFeatureUpdateTimer->stop();
@@ -2172,8 +1886,11 @@ void ThreeDViewTool::onBuildingTriangleMeshModeChanged( QgsVectorLayer *layer, Q
   if ( mBuildingTriangleMeshMode )
   {
     hideActiveLayerForTriangleMesh();
-    updateWireframeLayer( layer, fid );
-    updateRoofSegmentationLayer( layer, fid );
+    if ( mRoofPreviewFid != fid )
+    {
+      updateWireframeLayer( layer, fid );
+      updateRoofSegmentationLayer( layer, fid );
+    }
   }
   else
   {
@@ -2197,6 +1914,8 @@ void ThreeDViewTool::refreshMemoryData()
 
   while ( it.nextFeature( f ) )
   {
+    if ( mPreviewFids.contains( f.id() ) )
+      continue;
     double h = f.attribute( mSelectedHeightField ).toDouble();
     if ( h <= 0 )
       h = 10.0;

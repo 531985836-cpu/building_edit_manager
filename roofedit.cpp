@@ -3,6 +3,7 @@
 #include "buildingeditpreviewbus.h"
 #include "roofmodelpipeline.h"
 #include "roofaccuracy.h"
+#include "roofinteraction.h"
 
 #include <qgisinterface.h>
 #include <qgs3dmapcanvas.h>
@@ -20,10 +21,13 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QEvent>
+#include <QKeySequence>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QSignalBlocker>
 #include <QTimer>
+#include <QWheelEvent>
+#include <QKeyEvent>
 #include <limits>
 
 RoofEditTool::RoofEditTool( QgsMapCanvas *canvas, QgisInterface *iface )
@@ -34,6 +38,7 @@ RoofEditTool::RoofEditTool( QgsMapCanvas *canvas, QgisInterface *iface )
   setCursor( Qt::CrossCursor );
   mRoofPreviewTimer = new QTimer( this );
   mRoofPreviewTimer->setSingleShot( true );
+  mRoofPreviewTimer->setTimerType( Qt::PreciseTimer );
   mRoofPreviewTimer->setInterval( 180 );
   connect( mRoofPreviewTimer, &QTimer::timeout, this, &RoofEditTool::previewRoofSelection );
 }
@@ -42,6 +47,7 @@ RoofEditTool::~RoofEditTool()
 {
   delete mAccuracy;
   mAccuracy = nullptr;
+  mInteraction.reset();
   setTriangleMeshModeEnabled( false );
   clearRoofPreview();
   if ( mWidget )
@@ -54,13 +60,30 @@ RoofEditTool::~RoofEditTool()
 void RoofEditTool::activate()
 {
   QgsMapTool::activate();
-  refreshLayerRefs();
+  if ( mCanvas )
+  {
+    mCanvas->installEventFilter( this );
+    mCanvas->viewport()->installEventFilter( this );
+  }
   hideLegacyPointLayers();
+  if ( mWidget && mInteraction && mInteraction->hasBuilding() )
+  {
+    refreshPointCloudCombo();
+    mWidget->show();
+    syncAccuracyContext();
+    scheduleRoofPreview();
+  }
 }
 
 void RoofEditTool::deactivate()
 {
+  if ( mCanvas )
+  {
+    mCanvas->removeEventFilter( this );
+    mCanvas->viewport()->removeEventFilter( this );
+  }
   if ( mAccuracy ) mAccuracy->clear();
+  if ( mInteraction ) mInteraction->cancelDrag();
   setTriangleMeshModeEnabled( false );
   clearRoofPreview();
   if ( mWidget )
@@ -70,13 +93,40 @@ void RoofEditTool::deactivate()
 
 bool RoofEditTool::eventFilter( QObject *object, QEvent *event )
 {
-  if ( object == mWidget && event && ( event->type() == QEvent::Hide || event->type() == QEvent::Close ) )
+  const bool onCanvas = mCanvas && ( object == mCanvas || object == mCanvas->viewport() );
+  if ( mInteraction && event )
   {
-    if ( mAccuracy ) mAccuracy->clear();
-    setTriangleMeshModeEnabled( false );
-    clearRoofPreview();
+    if ( event->type() == QEvent::ShortcutOverride || event->type() == QEvent::KeyPress )
+    {
+      auto *key = static_cast<QKeyEvent *>( event );
+      const bool undo = mInteraction->hasBuilding() && key->matches( QKeySequence::Undo );
+      const bool deselectRegion = key->key() == Qt::Key_Escape && mInteraction->hasSelectedRegion();
+      if ( event->type() == QEvent::ShortcutOverride && ( undo || deselectRegion ) )
+      {
+        event->accept();
+        return true;
+      }
+      if ( event->type() == QEvent::KeyPress && ( onCanvas || undo || deselectRegion ) && mInteraction->keyPress( key ) )
+        return true;
+    }
+    if ( onCanvas && event->type() == QEvent::FocusOut )
+      mInteraction->cancelDrag();
+    if ( mCanvas && object == mCanvas->viewport() )
+      mInteraction->canvasEvent( event );
+    if ( object == mWidget && event->type() == QEvent::Close )
+      endBuildingEdit();
   }
   return QgsMapTool::eventFilter( object, event );
+}
+
+void RoofEditTool::endBuildingEdit()
+{
+  if ( mAccuracy ) mAccuracy->clear();
+  if ( mInteraction ) mInteraction->cancelDrag();
+  setTriangleMeshModeEnabled( false );
+  clearRoofPreview();
+  if ( mInteraction ) mInteraction->reset();
+  mCurrentBuilding = QgsFeature();
 }
 
 void RoofEditTool::setupUi()
@@ -87,6 +137,10 @@ void RoofEditTool::setupUi()
   mWidget = new QWidget();
   mUI.setupUi( mWidget );
   mWidget->installEventFilter( this );
+  for ( QWidget *control : mWidget->findChildren<QWidget *>() )
+    control->installEventFilter( this );
+  mInteraction = std::make_unique<RoofInteraction>( mCanvas, mIface, mUI, mWidget,
+                 [this]() { scheduleRoofPreview(); }, [this]() { scheduleDragPreview(); } );
 
   using Type = RoofModelSettings::Type;
   mUI.roofTypeComboBox->addItem( tr( "双坡" ), RoofModelSettings::typeId( Type::Gabled ) );
@@ -107,58 +161,35 @@ void RoofEditTool::setupUi()
   connect( mUI.saveRoofButton, &QPushButton::clicked, this, &RoofEditTool::saveRoofModel );
   connect( mUI.triangleMeshCheckBox, &QCheckBox::toggled, this, [this]( bool checked ) {
     if ( checked )
-    {
-      previewRoofSelection();
       updateTriangleMeshModeForCurrentBuilding();
-    }
     else
       emit BuildingEditPreviewBus::instance()->buildingTriangleMeshModeChanged( mActiveLayer, FID_NULL, false );
+    previewRoofSelection();
   } );
 
-  connect( mUI.calculateAccuracyButton, &QPushButton::clicked, this, &RoofEditTool::previewRoofSelection );
   mAccuracy = new RoofAccuracy::Controller( mWidget, mUI, mIface, this );
-  refreshPointCloudCombo();
 }
 
-void RoofEditTool::refreshLayerRefs()
+QgsVectorLayer *RoofEditTool::buildingLayerForSearch() const
 {
   QgsVectorLayer *nextLayer = qobject_cast<QgsVectorLayer *>( mIface ? mIface->activeLayer() : nullptr );
-  if ( !isCandidateBuildingLayer( nextLayer ) )
-    nextLayer = isCandidateBuildingLayer( mActiveLayer ) ? mActiveLayer.data() : nullptr;
-  if ( !nextLayer )
-  {
-    const auto layers = QgsProject::instance()->layers<QgsVectorLayer *>();
-    for ( QgsVectorLayer *layer : layers )
-    {
-      if ( isCandidateBuildingLayer( layer ) && layer->isEditable() )
-      {
-        nextLayer = layer;
-        break;
-      }
-    }
-    if ( !nextLayer )
-    {
-      for ( QgsVectorLayer *layer : layers )
-      {
-        if ( isCandidateBuildingLayer( layer ) )
-        {
-          nextLayer = layer;
-          break;
-        }
-      }
-    }
-  }
+  if ( isCandidateBuildingLayer( nextLayer ) )
+    return nextLayer;
+  if ( isCandidateBuildingLayer( mActiveLayer ) )
+    return mActiveLayer;
 
-  if ( mActiveLayer != nextLayer )
+  QgsVectorLayer *fallback = nullptr;
+  const auto layers = QgsProject::instance()->layers<QgsVectorLayer *>();
+  for ( QgsVectorLayer *layer : layers )
   {
-    if ( mAccuracy ) mAccuracy->clear();
-    setTriangleMeshModeEnabled( false );
-    clearRoofPreview();
-    mCurrentBuilding = QgsFeature();
-    mActiveLayer = nextLayer;
+    if ( !isCandidateBuildingLayer( layer ) )
+      continue;
+    if ( layer->isEditable() )
+      return layer;
+    if ( !fallback )
+      fallback = layer;
   }
-  if ( mWidget )
-    refreshPointCloudCombo();
+  return fallback;
 }
 
 bool RoofEditTool::isCandidateBuildingLayer( QgsVectorLayer *layer ) const
@@ -191,7 +222,6 @@ void RoofEditTool::refreshPointCloudCombo()
   if ( index <= 0 && mUI.pointCloudComboBox->count() == 2 )
     index = 1;
   mUI.pointCloudComboBox->setCurrentIndex( index < 0 ? 0 : index );
-  syncAccuracyContext();
 }
 
 void RoofEditTool::hideLegacyPointLayers()
@@ -217,28 +247,70 @@ void RoofEditTool::hideLegacyPointLayers()
 
 void RoofEditTool::canvasPressEvent( QgsMapMouseEvent *event )
 {
-  if ( !event || event->button() != Qt::LeftButton )
+  if ( !event )
     return;
-  refreshLayerRefs();
+  if ( mInteraction && mInteraction->press( event ) )
+    return;
+  if ( event->button() != Qt::LeftButton )
+    return;
   if ( !selectBuildingAt( event->mapPoint() ) )
     return;
   setupUi();
+  refreshPointCloudCombo();
   loadRoofSelection();
   mWidget->show();
+  syncAccuracyContext();
   mWidget->raise();
   mWidget->activateWindow();
 }
 
+void RoofEditTool::canvasMoveEvent( QgsMapMouseEvent *event )
+{
+  if ( mInteraction ) mInteraction->move( event );
+}
+
+void RoofEditTool::canvasDoubleClickEvent( QgsMapMouseEvent *event )
+{
+  if ( mInteraction && mInteraction->doubleClick( event ) )
+    return;
+  QgsMapTool::canvasDoubleClickEvent( event );
+}
+
+void RoofEditTool::canvasReleaseEvent( QgsMapMouseEvent *event )
+{
+  if ( mInteraction && mInteraction->release( event ) )
+    return;
+  QgsMapTool::canvasReleaseEvent( event );
+}
+
+void RoofEditTool::wheelEvent( QWheelEvent *event )
+{
+  if ( mInteraction && mInteraction->wheel( event ) )
+    event->accept();
+  else
+    QgsMapTool::wheelEvent( event );
+}
+
+void RoofEditTool::keyPressEvent( QKeyEvent *event )
+{
+  if ( mInteraction && mInteraction->keyPress( event ) )
+    event->ignore(); // QgsMapCanvas treats ignored map-tool keys as consumed.
+  else
+    QgsMapTool::keyPressEvent( event );
+}
+
 bool RoofEditTool::selectBuildingAt( const QgsPointXY &point )
 {
-  if ( !mActiveLayer )
+  QgsVectorLayer *layer = buildingLayerForSearch();
+  if ( !layer )
     return false;
   const double tolerance = mCanvas ? mCanvas->mapUnitsPerPixel() * 8.0 : 1.0;
-  const QgsRectangle bounds( point.x() - tolerance, point.y() - tolerance, point.x() + tolerance, point.y() + tolerance );
-  QgsFeatureIterator it = mActiveLayer->getFeatures( QgsFeatureRequest( bounds ) );
+  const QgsRectangle mapBounds( point.x() - tolerance, point.y() - tolerance, point.x() + tolerance, point.y() + tolerance );
+  const QgsRectangle bounds = toLayerCoordinates( layer, mapBounds );
+  QgsFeatureIterator it = layer->getFeatures( QgsFeatureRequest( bounds ) );
   QgsFeature feature, bestFeature;
   double bestDistance = std::numeric_limits<double>::max();
-  const QgsGeometry clickGeometry = QgsGeometry::fromPointXY( point );
+  const QgsGeometry clickGeometry = QgsGeometry::fromPointXY( toLayerCoordinates( layer, point ) );
   while ( it.nextFeature( feature ) )
   {
     if ( !feature.hasGeometry() )
@@ -259,12 +331,14 @@ bool RoofEditTool::selectBuildingAt( const QgsPointXY &point )
   if ( !bestFeature.isValid() )
     return false;
 
-  if ( mCurrentBuilding.isValid() && mCurrentBuilding.id() == bestFeature.id()
-       && mWidget && mWidget->isVisible() )
+  if ( layer == mActiveLayer && mCurrentBuilding.isValid() && mCurrentBuilding.id() == bestFeature.id()
+       && mInteraction && mInteraction->hasBuilding() )
     return false;
 
+  if ( mAccuracy ) mAccuracy->clear();
   setTriangleMeshModeEnabled( false );
   clearRoofPreview();
+  mActiveLayer = layer;
   mCurrentBuilding = bestFeature;
   mActiveLayer->selectByIds( QgsFeatureIds() << bestFeature.id() );
   return true;
@@ -282,22 +356,37 @@ void RoofEditTool::loadRoofSelection()
     const int cloudIndex = mUI.pointCloudComboBox->findData( saved.pointCloudLayerId );
     mUI.pointCloudComboBox->setCurrentIndex( cloudIndex < 0 ? 0 : cloudIndex );
   }
-  syncAccuracyContext();
+  mInteraction->load( mActiveLayer, mCurrentBuilding, saved );
 }
 
 RoofModelSettings::Selection RoofEditTool::currentSelection() const
 {
   if ( !mWidget )
     return {};
-  return { RoofModelSettings::typeFromId( mUI.roofTypeComboBox->currentData().toString() ),
-           mUI.pointCloudComboBox->currentData().toString() };
+  RoofModelSettings::Selection selection{ RoofModelSettings::typeFromId( mUI.roofTypeComboBox->currentData().toString() ),
+                                          mUI.pointCloudComboBox->currentData().toString() };
+  if ( mInteraction ) mInteraction->addToSelection( selection );
+  return selection;
 }
 
 void RoofEditTool::scheduleRoofPreview()
 {
-  syncAccuracyContext();
+  if ( mInteraction && mInteraction->hasRegions() )
+  {
+    scheduleDragPreview();
+    return;
+  }
   if ( mWidget && mWidget->isVisible() && mActiveLayer && mCurrentBuilding.isValid() )
-    mRoofPreviewTimer->start();
+    mRoofPreviewTimer->start( 180 );
+}
+
+void RoofEditTool::scheduleDragPreview()
+{
+  // Render the latest position once per frame, even while input events keep arriving.
+  constexpr int frameInterval = 16;
+  if ( mWidget && mWidget->isVisible() && mActiveLayer && mCurrentBuilding.isValid()
+       && ( !mRoofPreviewTimer->isActive() || mRoofPreviewTimer->remainingTime() > frameInterval ) )
+    mRoofPreviewTimer->start( frameInterval );
 }
 
 void RoofEditTool::previewRoofSelection()
@@ -306,27 +395,47 @@ void RoofEditTool::previewRoofSelection()
   if ( !mWidget || !mWidget->isVisible() || !mActiveLayer || !mCurrentBuilding.isValid() )
     return;
   const RoofModelSettings::Selection selection = currentSelection();
-  if ( selection.type == RoofModelSettings::Type::None || selection.pointCloudLayerId.isEmpty() )
+  const bool removedRegions = mInteraction && mInteraction->hasRemovedSavedRegions();
+  if ( !removedRegions && ( !selection.hasRoof() || ( selection.regions.isEmpty() && selection.pointCloudLayerId.isEmpty() ) ) )
   {
+    syncAccuracyContext();
     clearRoofPreview();
     return;
   }
-  const RoofModelSettings::Selection previous = RoofModelSettings::read( mActiveLayer, mCurrentBuilding.id() );
-  if ( previous.type == selection.type && previous.pointCloudLayerId == selection.pointCloudLayerId )
-    return;
-  RoofModelSettings::setPreview( mActiveLayer, mCurrentBuilding.id(), selection );
-  notifyRoofModelChanged();
+  const bool changed = !( RoofModelSettings::read( mActiveLayer, mCurrentBuilding.id() ) == selection );
+  if ( changed )
+    RoofModelSettings::setPreview( mActiveLayer, mCurrentBuilding.id(), selection );
+  if ( !selection.regions.isEmpty() )
+  {
+    auto visibleSelection = selection;
+    const bool dragging = mInteraction && mInteraction->addDragToSelection( visibleSelection );
+    const auto result = RoofModelPipeline::build( mCurrentBuilding.geometry(), visibleSelection );
+    if ( result.success )
+    {
+      if ( mAccuracy )
+        mAccuracy->setContext( mActiveLayer, mCurrentBuilding.id(), visibleSelection, &result.mesh );
+      mLiveRoofPreview = true;
+      emit BuildingEditPreviewBus::instance()->roofPreviewChanged( mActiveLayer, mCurrentBuilding.id(), result.mesh, dragging );
+      return;
+    }
+    if ( dragging )
+      return; // Leave the last valid frame visible while a vertex crosses an invalid position.
+  }
+  syncAccuracyContext();
+  if ( changed || mLiveRoofPreview )
+    notifyRoofModelChanged();
 }
 
 void RoofEditTool::clearRoofPreview()
 {
   mRoofPreviewTimer->stop();
-  if ( RoofModelSettings::clearPreview( mActiveLayer, mCurrentBuilding.id() ) )
+  if ( RoofModelSettings::clearPreview( mActiveLayer, mCurrentBuilding.id() ) || mLiveRoofPreview )
     notifyRoofModelChanged();
 }
 
 void RoofEditTool::notifyRoofModelChanged()
 {
+  mLiveRoofPreview = false;
   if ( mActiveLayer && mCurrentBuilding.isValid() )
     emit BuildingEditPreviewBus::instance()->roofModelChanged( mActiveLayer, mCurrentBuilding.id() );
 }
@@ -358,12 +467,15 @@ void RoofEditTool::deleteRoofModel()
     return;
   }
   setTriangleMeshModeEnabled( false );
+  if ( mInteraction ) mInteraction->clearRegions();
+  mRoofPreviewTimer->stop();
   RoofModelSettings::save( mActiveLayer, mCurrentBuilding.id(), {} );
   RoofModelSettings::clearPreview( mActiveLayer, mCurrentBuilding.id() );
   {
     const QSignalBlocker blocker( mUI.roofTypeComboBox );
     mUI.roofTypeComboBox->setCurrentIndex( -1 );
   }
+  syncAccuracyContext();
   notifyRoofModelChanged();
   QMessageBox::information( mWidget, tr( "提示" ), tr( "已删除当前建筑物的屋顶模型。" ) );
 }
@@ -376,15 +488,21 @@ void RoofEditTool::saveRoofModel()
     QMessageBox::warning( mWidget, tr( "提示" ), tr( "请先选择建筑物。" ) );
     return;
   }
-  const RoofModelSettings::Selection selection = currentSelection();
-  if ( selection.type == RoofModelSettings::Type::None )
+  if ( mInteraction && mInteraction->hasUnfinishedEdit() )
   {
-    QMessageBox::warning( mWidget, tr( "提示" ), tr( "请先选择屋顶类型。" ) );
+    QMessageBox::warning( mWidget, tr( "提示" ), tr( "区域草图按 Enter 完成，屋脊草图用鼠标右键确认。拖动时请先松开鼠标，或按 Esc 取消。" ) );
+    return;
+  }
+  const RoofModelSettings::Selection selection = currentSelection();
+  const bool removedRoof = !selection.hasRoof() && mInteraction && mInteraction->hasRemovedSavedRegions();
+  if ( !selection.hasRoof() && !removedRoof )
+  {
+    QMessageBox::warning( mWidget, tr( "提示" ), tr( "请先绘制区域，或选择自动建模的屋顶类型。" ) );
     return;
   }
   QgsPointCloudLayer *cloud = qobject_cast<QgsPointCloudLayer *>(
     QgsProject::instance()->mapLayer( selection.pointCloudLayerId ) );
-  if ( !cloud || !cloud->dataProvider() )
+  if ( !removedRoof && selection.regions.isEmpty() && ( !cloud || !cloud->dataProvider() ) )
   {
     QMessageBox::warning( mWidget, tr( "提示" ), tr( "请先选择点云图层。" ) );
     return;
@@ -393,22 +511,25 @@ void RoofEditTool::saveRoofModel()
   mCurrentBuilding = mActiveLayer->getFeature( mCurrentBuilding.id() );
   if ( !mCurrentBuilding.isValid() )
     return;
-  const BuildingRoof::MeshResult result = RoofModelPipeline::build( mCurrentBuilding.geometry(), selection );
-  if ( !result.success )
+  if ( !removedRoof )
   {
-    clearRoofPreview();
-    QMessageBox::warning( mWidget, tr( "错误" ), result.error );
-    return;
+    const BuildingRoof::MeshResult result = RoofModelPipeline::build( mCurrentBuilding.geometry(), selection );
+    if ( !result.success )
+    {
+      clearRoofPreview();
+      QMessageBox::warning( mWidget, tr( "错误" ), result.error );
+      return;
+    }
   }
 
   RoofModelSettings::save( mActiveLayer, mCurrentBuilding.id(), selection );
   RoofModelSettings::clearPreview( mActiveLayer, mCurrentBuilding.id() );
   setTriangleMeshModeEnabled( false );
   notifyRoofModelChanged();
-  QMessageBox::information( mWidget, tr( "提示" ), tr( "屋顶模型已保存。" ) );
+  QMessageBox::information( mWidget, tr( "提示" ), removedRoof ? tr( "已保存区域删除。" ) : tr( "屋顶模型已保存。" ) );
   mActiveLayer->removeSelection();
   mWidget->hide();
-  mCurrentBuilding = QgsFeature();
+  endBuildingEdit();
 }
 
 void RoofEditTool::syncAccuracyContext()
